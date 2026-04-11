@@ -1,0 +1,25 @@
+[package]
+name = "cascade"
+version = "0.1.0"
+edition = "2021"
+description = "Structural cascade SAT solver — proof-first design"
+
+[lib]
+name = "cascade"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cascade"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1
+debug = true
+overflow-checks = true
