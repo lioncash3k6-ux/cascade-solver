@@ -1,0 +1,105 @@
+Instances: 91 (size 1K-2MB)
+Timeout: 30s per solver
+
+FILE                                                  SZ   KISSAT  KIS_T  CASCADE  CAS_T   WINNER
+----------------------------------------------------------------------------------------------------
+tseitin_n188_d3.cnf                                  10K        —  35.0s        —  31.2s         
+tseitin_grid_n12_m12.cnf                             16K        —  35.0s    UNSAT   7.8s  cascade
+x9-06068.sat.sanitized.cnf                           31K      SAT   0.3s      SAT   0.1s  cascade
+x9-06099.sat.sanitized.cnf                           31K      SAT   0.0s      SAT   0.0s  cascade
+x9-07092.sat.sanitized.cnf                           37K      SAT   0.0s      SAT   0.2s   kissat
+x9-10070.sat.sanitized.cnf                           54K      SAT  14.4s        —  30.0s   kissat
+case9.cnf                                            54K        —  35.0s      SAT  21.1s  cascade
+case17.normalised.cnf                                60K      SAT  17.3s        —  30.0s   kissat
+case6.normalised.cnf                                 65K        —  35.0s        —  30.0s         
+case7.normalised.cnf                                 65K        —  35.0s        —  30.0s         
+case16.normalised.cnf                                65K        —  35.0s        —  30.0s         
+case10.cnf                                           65K        —  35.0s        —  30.0s         
+lockchart-group3-L11-K23-p4d3j1.normalised.cnf       83K        —  35.0s        —  38.8s         
+cliquecolouring_n15_k7_c6.sanitized.cnf              90K        —  35.0s    UNSAT   0.2s  cascade
+lec_mult_CvW_11x10.sanitized.cnf                    102K        —  35.0s        —  30.0s         
+lockchart-group3-L13-K26-p4d3j1.normalised.cnf      112K        —  35.0s        —  42.8s         
+16_16_booth_dadda_origin_and_and_dadda_origin_bit28.cnf  123K        —  35.0s        —  30.0s         
+16_16_booth_dadda_origin_and_and_dadda_origin_bit29.cnf  125K        —  35.0s        —  30.0s         
+16_16_booth_dadda_origin_and_and_dadda_mapped_bit28.cnf  130K        —  35.0s        —  30.0s         
+16_16_booth_wallace_origin_and_and_dadda_mapped_bit28.cnf  132K        —  35.0s        —  30.0s         
+16_16_booth_wallace_origin_and_default_mapped_bit29.cnf  134K        —  35.0s        —  30.0s         
+16_2.cnf                                            135K        —  35.0s        —  30.0s         
+16_16_booth_dadda_mapped_and_and_wallace_origin_bit28.cnf  138K        —  35.0s        —  30.0s         
+16_16_booth_wallace_mapped_and_and_wallace_origin_bit28.cnf  139K        —  35.0s        —  30.0s         
+16_16_booth_wallace_mapped_and_default_origin_bit28.cnf  139K        —  35.0s        —  30.0s         
+16_16_and_wallace_origin_and_default_mapped_ultra_bit27.cnf  141K        —  35.0s        —  30.0s         
+simon-r17-1.sanitized.cnf                           144K      SAT   0.0s      SAT   0.0s   kissat
+16_16_booth_dadda_mapped_and_and_wallace_mapped_bit28.cnf  145K        —  35.0s        —  30.0s         
+lockchart-group3-L15-K29-p4d3j1.normalised.cnf      145K        —  35.0s        —  45.0s         
+ramsey_4_4_18.normalised.cnf                        148K        —  35.0s    UNSAT   3.0s  cascade
+16_16_default_mapped_ultra_and_and_dadda_mapped_bit28.cnf  148K        —  35.0s        —  30.0s         
+c7552.cnf                                           152K    UNSAT   0.3s    UNSAT   0.4s   kissat
+arles_thres20_p10_r7340.cnf                         152K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres20_p10_r7475.cnf                         152K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres20_p10_r7532.cnf                         153K    UNSAT   0.0s    UNSAT   0.1s   kissat
+16_16_booth_dadda_mapped_and_booth_wallace_mapped.cnf  154K        —  35.0s        —  30.0s         
+simon-r20-1.sanitized.cnf                           171K      SAT   0.0s      SAT   0.0s   kissat
+simon-r21-1.sanitized.cnf                           180K      SAT   0.0s      SAT   0.0s   kissat
+ramsey_4_4_19.normalised.cnf                        190K        —  35.0s    UNSAT   1.4s  cascade
+simon-r23-0.sanitized.cnf                           197K      SAT   0.0s      SAT   0.0s   kissat
+cliquecoloring_n32_k5_c4.cnf                        221K        —  35.0s    UNSAT   1.2s  cascade
+rphp_p25_r25.cnf                                    271K        —  35.0s    UNSAT   3.8s  cascade
+stb_664_50.apx_2_DC-ST.cnf                          275K        —  35.0s        —  30.0s         
+cliquecoloring_n26_k7_c6.cnf                        279K        —  35.0s    UNSAT   0.9s  cascade
+RoundRobin_n15_d13.cnf                              319K        —  35.0s        —  45.0s         
+case8.normalised.cnf                                351K        —  35.0s        —  30.0s         
+clqcl_30_7_6.normalised.cnf                         373K        —  35.0s    UNSAT   1.4s  cascade
+arles_thres10_p10_r7466.cnf                         373K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8142.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8175.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8180.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8185.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8186.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p10_r8188.cnf                         377K    UNSAT   0.0s    UNSAT   0.1s   kissat
+RoundRobin_n16_d13.cnf                              390K        —  35.0s        —  45.0s         
+st_659_37_25_686.normalised.cnf                     433K        —  35.0s        —  30.0s         
+RoundRobin_n16_d14.cnf                              433K        —  35.0s        —  45.0s         
+RoundRobin_n17_d13.cnf                              470K        —  35.0s        —  45.0s         
+case11.normalised.cnf                               502K        —  35.0s        —  30.0s         
+b14.cnf                                             503K    UNSAT   2.1s    UNSAT   4.3s   kissat
+clqcl_40_6_5.normalised.cnf                         508K        —  35.0s    UNSAT   3.2s  cascade
+RoundRobin_n17_d14.cnf                              521K        —  35.0s        —  45.0s         
+RoundRobin_n17_d15.cnf                              575K        —  35.0s        —  45.0s         
+arles_thres10_p20_r4305.cnf                         575K    UNSAT   0.0s    UNSAT   0.1s   kissat
+arles_thres10_p20_r4514.cnf                         577K    UNSAT   0.0s    UNSAT   0.1s   kissat
+lockchart-group2-rnd0.3-L18-K36-P8D4J1.cnf          603K        —  35.0s        —  45.0s         
+clqcl_30_9_8.normalised.cnf                         609K        —  35.0s    UNSAT   2.6s  cascade
+lockchart-group2-rnd0.3-L19-K38-P8D4J1_1.normalised.cnf  680K        —  35.0s        —  45.0s         
+RoundRobin_n18_d15.cnf                              682K        —  35.0s        —  45.0s         
+lockchart-group2-rnd0.3-L19-K38-P8D4J1_2.cnf        687K        —  35.0s        —  45.0s         
+lockchart-group2-rnd0.3-L19-K38-P8D4J1_3.cnf        687K        —  35.0s        —  45.0s         
+lockchart-group2-rnd0.3-L19-K38-P8D4J1_4.cnf        687K        —  35.0s        —  45.0s         
+case20.normalised.cnf                               706K        —  35.0s        —  30.1s         
+RoundRobin_n18_d16.cnf                              746K        —  35.0s        —  45.0s         
+s38417.cnf                                          771K    UNSAT   0.8s    UNSAT   1.1s   kissat
+b15.cnf                                             787K    UNSAT   1.9s    UNSAT   4.1s   kissat
+clqcl_50_6_5.normalised.cnf                         884K        —  35.0s    UNSAT   8.1s  cascade
+clqcl_30_11_10.normalised.cnf                       903K        —  35.0s        —  45.0s         
+ER_500_20_4.apx_1_DC-AD.cnf                         911K        —  35.0s        —  30.1s         
+b20_1.cnf                                           940K    UNSAT   3.3s    UNSAT   4.6s   kissat
+st_815_74_9_2860.normalised.cnf                     998K        —  35.0s        —  30.1s         
+s38584.cnf                                         1086K    UNSAT   1.2s    UNSAT   2.2s   kissat
+case13.normalised.cnf                              1100K      SAT  15.0s      SAT  10.5s  cascade
+b21.cnf                                            1155K    UNSAT   4.4s    UNSAT   6.0s   kissat
+ramsey_3_6_18.normalised.cnf                       1213K        —  35.0s    UNSAT   0.7s  cascade
+st_890_86_9_572.normalised.cnf                     1287K        —  35.0s        —  30.1s         
+gm16sparrc.cnf                                     1474K    UNSAT   0.1s    UNSAT   0.3s   kissat
+b22_1.cnf                                          1483K    UNSAT   5.9s    UNSAT   9.7s   kissat
+MVRoundRobin_n14_d10_v2.cnf                        1629K        —  35.0s        —  45.0s         
+b22.cnf                                            1745K    UNSAT   7.2s    UNSAT  10.9s   kissat
+ramsey_3_6_19.normalised.cnf                       1800K        —  35.0s    UNSAT   0.6s  cascade
+
+====================================================================================================
+RESULTS (91 instances, 30s timeout)
+  Kissat solved:     32  (total time on solved: 74.1s)
+  Cascade solved:    44  (total time on solved: 111.5s)
+  Both solved:       30  (kissat faster: 27, cascade faster: 3, tie: 0)
+  Kissat only:        2
+  Cascade only:      14
+  Disagreements:      0
