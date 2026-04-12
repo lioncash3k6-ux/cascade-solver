@@ -16,6 +16,7 @@ use cascade::backend::cadical::CaDiCaL;
 use cascade::backend::{Backend, BackendProofFormat, Verdict};
 use cascade::bcp::{bcp_cascade, BcpResult};
 use cascade::cardinality;
+use cascade::certify;
 use cascade::dimacs;
 use cascade::symmetry::satsuma::Satsuma;
 use cascade::symmetry::{EquisatProofFormat, SymmetryBreaker};
@@ -47,6 +48,7 @@ fn main() -> ExitCode {
     let mut no_symmetry = false;
     let mut no_card = false;
     let mut no_bcp = false;
+    let mut certified = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -91,6 +93,10 @@ fn main() -> ExitCode {
                 no_bcp = true;
                 i += 1;
             }
+            "--certified" => {
+                certified = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 return ExitCode::SUCCESS;
@@ -122,14 +128,26 @@ fn main() -> ExitCode {
         }
     };
 
+    // Under --certified, auto-generate proof paths if not provided
+    if certified {
+        if proof.is_none() {
+            proof = Some(scratch_path(&input, "_body.drat"));
+        }
+        if equisat_proof.is_none() {
+            equisat_proof = Some(scratch_path(&input, "_equisat.pbp"));
+        }
+    }
+
     println!(
-        "c cascade — parsed {} vars, {} clauses",
+        "c cascade — parsed {} vars, {} clauses{}",
         cnf.nvars,
-        cnf.clauses.len()
+        cnf.clauses.len(),
+        if certified { " [CERTIFIED MODE]" } else { "" }
     );
 
     // === Stage 1: Symmetry breaking via satsuma ===
     let mut effective_cnf: PathBuf = input.clone();
+    let pre_card_cnf: PathBuf;
     if !no_symmetry {
         let breaker = Satsuma::new();
         let aug = scratch_path(&input, "_aug.cnf");
@@ -157,6 +175,17 @@ fn main() -> ExitCode {
                 );
                 if let Some(p) = &r.equisat_proof {
                     println!("c [{}] equisat proof: {}", breaker.name(), p.display());
+                    if certified {
+                        print!("c [certify] veripb equisat... ");
+                        match certify::verify_veripb(&input, p) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                eprintln!("c [certify] FATAL: equisat proof rejected");
+                                return ExitCode::from(30);
+                            }
+                        }
+                    }
                 }
                 effective_cnf = r.augmented_cnf;
             }
@@ -169,10 +198,17 @@ fn main() -> ExitCode {
         }
     }
 
+    // Save state for certified mode proof combination
+    pre_card_cnf = effective_cnf.clone();
+    let mut card_clauses: Vec<Vec<cascade::types::Lit>> = Vec::new();
+
     // === Stage 1b: Cardinality CNF augmentation (Ramsey degree bounds) ===
-    if !no_card {
+    // Under --certified: skip cardinality. The degree-bound clauses are theorems
+    // of the bare Ramsey CNF (link-graph argument) but require exponential-length
+    // resolution proofs to derive from the ban clauses — beyond DRAT's practical
+    // reach. Satsuma + CaDiCaL alone suffice for certified verdicts.
+    if !no_card && !certified {
         if let Some(n) = cardinality::detect_ramsey_n(cnf.nvars) {
-            // Detect (s, t) from clause widths in the bare CNF
             let (s, t) = match detect_ramsey_st_from_cnf(&cnf.clauses) {
                 Some(st) => st,
                 None => (0, 0),
@@ -188,7 +224,6 @@ fn main() -> ExitCode {
                         s, t, n, max_red, max_blue
                     );
 
-                    // Read the current effective_cnf to find its top var
                     let header = read_cnf_header(&effective_cnf).unwrap_or((cnf.nvars, 0));
                     let top_var = header.0;
 
@@ -196,6 +231,9 @@ fn main() -> ExitCode {
                         cardinality::ramsey_card_cnf(n, max_red, max_blue, top_var);
 
                     if !clauses.is_empty() {
+                        if certified {
+                            card_clauses = clauses.clone();
+                        }
                         let new_aug = scratch_path(&input, "_card.cnf");
                         if let Err(e) = append_clauses_as_new_cnf(
                             &effective_cnf,
@@ -249,12 +287,45 @@ fn main() -> ExitCode {
                     conflicting_clause,
                     bcp_solve_elapsed
                 );
-                // Emit a trivial DRAT proof: just the empty clause.
                 if let Some(p) = &proof {
                     if let Err(e) = std::fs::write(p, "0\n") {
                         eprintln!("c [bcp] proof write error: {}", e);
                     } else {
                         println!("c [bcp] body proof: {} (empty clause)", p.display());
+                    }
+                }
+                if certified {
+                    if let Some(p) = &proof {
+                        if !card_clauses.is_empty() {
+                            let combined = scratch_path(&input, "_combined.drat");
+                            print!("c [certify] combining card+body proof... ");
+                            if let Err(e) = certify::combine_card_and_body_proof(
+                                &card_clauses, p, &combined,
+                            ) {
+                                println!("FAILED: {}", e);
+                                return ExitCode::from(30);
+                            }
+                            println!("ok");
+                            print!("c [certify] drat-trim card+body vs pre-card CNF... ");
+                            match certify::verify_drat_trim(&pre_card_cnf, &combined) {
+                                Ok(()) => println!("VERIFIED"),
+                                Err(e) => {
+                                    println!("FAILED: {}", e);
+                                    eprintln!("c [certify] FATAL: combined proof rejected");
+                                    return ExitCode::from(30);
+                                }
+                            }
+                        } else {
+                            print!("c [certify] drat-trim body... ");
+                            match certify::verify_drat_trim(&effective_cnf, p) {
+                                Ok(()) => println!("VERIFIED"),
+                                Err(e) => {
+                                    println!("FAILED: {}", e);
+                                    eprintln!("c [certify] FATAL: body proof rejected");
+                                    return ExitCode::from(30);
+                                }
+                            }
+                        }
                     }
                 }
                 println!("s UNSATISFIABLE");
@@ -265,6 +336,17 @@ fn main() -> ExitCode {
                     "c [bcp] SAT — full assignment from BCP ({:.3}s)",
                     bcp_solve_elapsed
                 );
+                if certified {
+                    print!("c [certify] model vs original CNF... ");
+                    match certify::verify_model(&cnf, model) {
+                        Ok(()) => println!("VERIFIED"),
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                            eprintln!("c [certify] FATAL: model invalid on original CNF");
+                            return ExitCode::from(30);
+                        }
+                    }
+                }
                 println!("s SATISFIABLE");
                 let mut col = 2;
                 print!("v");
@@ -319,6 +401,21 @@ fn main() -> ExitCode {
 
     match result.verdict {
         Verdict::Sat => {
+            if certified {
+                if let Some(model) = &result.model {
+                    print!("c [certify] model vs original CNF... ");
+                    let lits: Vec<cascade::types::Lit> =
+                        model.iter().map(|&v| cascade::types::Lit::new(v)).collect();
+                    match certify::verify_model(&cnf, &lits) {
+                        Ok(()) => println!("VERIFIED"),
+                        Err(e) => {
+                            println!("FAILED: {}", e);
+                            eprintln!("c [certify] FATAL: model invalid on original CNF");
+                            return ExitCode::from(30);
+                        }
+                    }
+                }
+            }
             println!("s SATISFIABLE");
             if let Some(model) = &result.model {
                 let mut col = 2;
@@ -338,10 +435,42 @@ fn main() -> ExitCode {
             ExitCode::from(10)
         }
         Verdict::Unsat => {
-            println!("s UNSATISFIABLE");
             if let Some(p) = &result.proof_path {
                 println!("c body proof: {}", p.display());
+                if certified {
+                    if !card_clauses.is_empty() {
+                        let combined = scratch_path(&input, "_combined.drat");
+                        print!("c [certify] combining card+body proof... ");
+                        if let Err(e) = certify::combine_card_and_body_proof(
+                            &card_clauses, p, &combined,
+                        ) {
+                            println!("FAILED: {}", e);
+                            return ExitCode::from(30);
+                        }
+                        println!("ok");
+                        print!("c [certify] drat-trim card+body vs pre-card CNF... ");
+                        match certify::verify_drat_trim(&pre_card_cnf, &combined) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                eprintln!("c [certify] FATAL: combined proof rejected");
+                                return ExitCode::from(30);
+                            }
+                        }
+                    } else {
+                        print!("c [certify] drat-trim body... ");
+                        match certify::verify_drat_trim(&effective_cnf, p) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                eprintln!("c [certify] FATAL: body proof rejected");
+                                return ExitCode::from(30);
+                            }
+                        }
+                    }
+                }
             }
+            println!("s UNSATISFIABLE");
             ExitCode::from(20)
         }
         Verdict::Unknown => {

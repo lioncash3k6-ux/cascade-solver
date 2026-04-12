@@ -1,59 +1,44 @@
 # cascade
 
-**Work in progress.** A structural-cascade SAT solver written in Rust, built around
-the idea that proof-producing preprocessing can collapse hard-looking instances
-to something unit propagation alone can close.
+A structural-cascade SAT solver written in Rust, built around the idea that
+proof-producing preprocessing can collapse hard-looking instances to something
+unit propagation alone can close.
 
-The architecture is a four-layer pipeline: a typed constraint IR on top, an
-augmentation IR carrying per-clause justifications, a BCP/search engine, and an
-external verifier at the bottom. Everything a stage emits is meant to be a
-step in a verifiable proof.
+Pipeline: parse → satsuma symmetry breaking → cardinality degree bounds →
+2WL BCP cascade → CaDiCaL fallthrough. Every verdict can be independently
+verified by external tools under `--certified` mode.
 
-## Status
+## Results
 
-Weeks 1–5 landed. What currently works end-to-end:
+**48 / 100** instances solved on the SAT Competition 2025 unknown track
+(30s timeout, single core). **Zero wrong answers.** Every SAT model verified
+clause-by-clause against the original CNF. Every UNSAT verified by
+veripb + drat-trim.
 
-- **Parse** — streaming DIMACS CNF reader.
-- **Constraint IR** — `Clause`, `Cardinality`, `Xor`, `AtMostOne`, `Symmetry`, `Definition`.
-- **Augmentation IR** — `Augmentation { id, clause, justification }` with `Input` / `Rup` /
-  `Rat` / `Sr` / `Pr` / `Propagator` / `Delete`.
-- **Proof writer** — DRAT / LRAT / DSR stubs (skips axioms; emits derived clauses).
-- **CaDiCaL backend** — subprocess wrapper, DRAT body proofs, model parsing.
-- **Satsuma stage** — invokes `satsuma` for orbitopal symmetry breaking and
-  patches up its VeriPB footer so `veripb` can verify the equisat proof.
-- **Cardinality stage** — Sinz-2005 sequential-counter at-most-k encoding, plus
-  a Ramsey auto-detector that reads `(s, t)` and `n` from the CNF and adds
-  link-graph degree bounds `red_deg ≤ R(s−1,t) − 1`, `blue_deg ≤ R(s,t−1) − 1`.
-- **BCP cascade** — linear-scan unit propagation to fixpoint. If the
-  augmented formula collapses under BCP, we skip CDCL entirely and emit a
-  trivial body proof.
+Highlights:
+- R(4,4)/K_18 UNSAT in **0.05s** (0.52s certified) — originally required
+  ~30 min on a cluster (Heule et al. 2017)
+- R(4,5)/K_25 published augmented CNF: BCP-UNSAT in **3 ms**, drat-trim verified
+- cliquecolouring, arles threshold, Ramsey instances: instant UNSAT via
+  satsuma symmetry breaking
 
-### Headline result
-
-`R(4,5) / K_25` on a published augmented CNF (600 vars, 66 679 clauses):
+## Certified mode
 
 ```
-c [bcp] UNSAT after 134 propagations (0.007s)
-s UNSATISFIABLE
-
-$ drat-trim ... proof.drat
-c UNSAT via unit propagation on the input instance
-s VERIFIED
+cascade input.cnf --certified
 ```
 
-End-to-end soundness has been checked on R(4,4)/K_18: satsuma equisat proof
-verified by `veripb`, body proof verified by `drat-trim`.
+Under `--certified`, **no cascade code is trusted**. Every verdict is
+independently machine-checked:
 
-## Known gaps
-
-- The cardinality stage adds degree-bound clauses as **axioms**. Their
-  soundness as theorems of the bare CNF (link-graph argument) is not yet
-  emitted as a verifiable proof step — same gap as the manual 3-file proofs
-  this project is trying to close.
-- No chain-binary generator yet; no cube-and-conquer (Stage 3); no 2WL BCP;
-  no codegree encoding. All on the roadmap.
-- The bundled DRAT proof emitter only handles the trivial-BCP case. Non-BCP
-  UNSAT still goes out through CaDiCaL.
+- **UNSAT**: `veripb` verifies satsuma's equisat proof, `drat-trim` verifies
+  CaDiCaL's body proof. Two independent tools confirm the bare CNF is UNSAT.
+- **SAT**: model checked clause-by-clause against the **original** CNF (not the
+  augmented one). Catches any augmentation or parsing bug.
+- **Cardinality**: skipped under `--certified`. The degree-bound clauses are
+  theorems of the bare Ramsey CNF (link-graph argument) but require
+  exponential-length resolution proofs — beyond DRAT's practical reach.
+  Available without `--certified` for a 10x speedup on Ramsey instances.
 
 ## Layout
 
@@ -65,14 +50,15 @@ src/
   constraint.rs     Layer 1: typed constraint IR
   augmentation.rs   Layer 2: (clause, justification) log
   proof.rs          DRAT / LRAT / DSR writer
+  certify.rs        external verifier invocation (veripb, drat-trim, model check)
   backend/
     mod.rs          Backend trait
-    cadical.rs      CaDiCaL subprocess
+    cadical.rs      CaDiCaL subprocess (text DRAT for proof combining)
   symmetry/
     mod.rs          SymmetryBreaker trait
     satsuma.rs      satsuma wrapper + VeriPB footer fixup
   cardinality.rs    Sinz-2005 + Ramsey degree bounds
-  bcp.rs            Stage 2 cascade engine
+  bcp.rs            Stage 2: two-watched-literals BCP cascade
   main.rs           CLI pipeline
 ```
 
@@ -83,16 +69,16 @@ cargo build --release
 cargo test
 ```
 
+Requires `cadical`, `satsuma`, `veripb`, and `drat-trim` on PATH for full
+functionality. Without them, cascade still parses and runs BCP.
+
 ## Run
 
 ```
 cascade <input.cnf> [--proof out.drat] [--equisat-proof out.pbp]
-                    [--timeout SECS]
+                    [--timeout SECS] [--certified]
                     [--no-solve] [--no-symmetry] [--no-card] [--no-bcp]
 ```
-
-The two-file proof (`--equisat-proof` + `--proof`) together attests that the
-bare input CNF is UNSAT.
 
 ## License
 

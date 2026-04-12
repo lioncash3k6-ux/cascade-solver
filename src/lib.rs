@@ -18,6 +18,7 @@ pub mod backend;
 pub mod symmetry;
 pub mod cardinality;
 pub mod bcp;
+pub mod certify;
 
 pub use types::{Lit, Var, ClauseId, Clause};
 pub use constraint::Constraint;

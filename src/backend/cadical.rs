@@ -59,7 +59,9 @@ impl Backend for CaDiCaL {
         // CaDiCaL flags for proof format selection.
         match format {
             BackendProofFormat::None => {}
-            BackendProofFormat::Drat => {} // default
+            BackendProofFormat::Drat => {
+                cmd.arg("--binary=0"); // text DRAT for combinability
+            }
             BackendProofFormat::Lrat => {
                 cmd.arg("--lrat=1");
             }
