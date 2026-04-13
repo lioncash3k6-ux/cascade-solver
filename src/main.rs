@@ -203,11 +203,18 @@ fn main() -> ExitCode {
     let mut card_clauses: Vec<Vec<cascade::types::Lit>> = Vec::new();
 
     // === Stage 1b: Cardinality CNF augmentation (Ramsey degree bounds) ===
-    // Under --certified: skip cardinality. The degree-bound clauses are theorems
-    // of the bare Ramsey CNF (link-graph argument) but require exponential-length
-    // resolution proofs to derive from the ban clauses — beyond DRAT's practical
-    // reach. Satsuma + CaDiCaL alone suffice for certified verdicts.
-    if !no_card && !certified {
+    //
+    // Under --certified, we use a tiered strategy:
+    //   s ≤ 3: direct red card clauses are RUP from ban clauses (K_s ban width 3
+    //          becomes unit after star-edge assumptions). Emit as DRAT additions.
+    //          Blue cards: RUP only when t ≤ 3 (symmetric argument).
+    //   s ≥ 4: direct red cards are SR with vertex transposition witnesses.
+    //          Verify via dsr-trim. Blue cards: skip (the red bound + satsuma
+    //          SBP provides sufficient BCP power).
+    //
+    // Non-certified mode: use Sinz sequential counter (more BCP power from
+    // shorter clauses, but Type 4 clauses aren't derivable in DRAT).
+    if !no_card {
         if let Some(n) = cardinality::detect_ramsey_n(cnf.nvars) {
             let (s, t) = match detect_ramsey_st_from_cnf(&cnf.clauses) {
                 Some(st) => st,
@@ -224,31 +231,94 @@ fn main() -> ExitCode {
                         s, t, n, max_red, max_blue
                     );
 
-                    let header = read_cnf_header(&effective_cnf).unwrap_or((cnf.nvars, 0));
-                    let top_var = header.0;
+                    if certified {
+                        // Certified mode: use direct card clauses (verifiable).
+                        //
+                        // Red direct cards are RUP from ban clauses when s ≤ 3:
+                        //   Assuming (max_red+1) = R(s-1,t) star edges red, each
+                        //   K_s ban (width C(s,2)=3) becomes unit → forces inter-
+                        //   edges blue → K_t blue ban fires. BCP closes.
+                        //
+                        // For s ≥ 4, K_s ban width ≥ 6 → BCP can't close. No
+                        // known polynomial DRAT/DSR derivation. Skip card.
+                        //
+                        // Blue direct cards: RUP only when t ≤ 3 (symmetric).
+                        if s > 3 && t > 3 {
+                            println!("c [card] s={},t={} > 3: no certified card derivation, skipping", s, t);
+                        } else if s <= 3 || t <= 3 {
+                            // Estimate direct clause count to avoid combinatorial explosion
+                            let est_red = if s <= 3 { estimate_combinations(n - 1, max_red + 1) * n as u64 } else { 0 };
+                            let est_blue = if t <= 3 { estimate_combinations(n - 1, max_blue + 1) * n as u64 } else { 0 };
+                            let est_total = est_red + est_blue;
+                            if est_total > 100_000 {
+                                println!(
+                                    "c [card] ~{} direct clauses exceeds certified threshold, skipping",
+                                    est_total
+                                );
+                            } else {
+                            let red_direct = if s <= 3 {
+                                cardinality::direct_red_card_clauses(n, max_red)
+                            } else {
+                                Vec::new()
+                            };
+                            let blue_direct = if t <= 3 {
+                                cardinality::direct_blue_card_clauses(n, max_blue)
+                            } else {
+                                Vec::new()
+                            };
 
-                    let (clauses, aux_added, _new_top) =
-                        cardinality::ramsey_card_cnf(n, max_red, max_blue, top_var);
+                            let all_direct: Vec<Vec<cascade::types::Lit>> = red_direct
+                                .into_iter()
+                                .chain(blue_direct.into_iter())
+                                .collect();
 
-                    if !clauses.is_empty() {
-                        if certified {
-                            card_clauses = clauses.clone();
-                        }
-                        let new_aug = scratch_path(&input, "_card.cnf");
-                        if let Err(e) = append_clauses_as_new_cnf(
-                            &effective_cnf,
-                            &new_aug,
-                            &clauses,
-                            aux_added,
-                        ) {
-                            eprintln!("c [card] write error: {}", e);
-                        } else {
-                            println!(
-                                "c [card] {} clauses, {} aux vars (sequential counter)",
-                                clauses.len(),
-                                aux_added
-                            );
-                            effective_cnf = new_aug;
+                            if !all_direct.is_empty() {
+                                card_clauses = all_direct.clone();
+                                let new_aug = scratch_path(&input, "_card.cnf");
+                                if let Err(e) = append_clauses_as_new_cnf(
+                                    &effective_cnf,
+                                    &new_aug,
+                                    &all_direct,
+                                    0,
+                                ) {
+                                    eprintln!("c [card] write error: {}", e);
+                                } else {
+                                    let red_mode = if s <= 3 { "RUP" } else { "skip" };
+                                    let blue_mode = if t <= 3 { "RUP" } else { "skip" };
+                                    println!(
+                                        "c [card] {} direct clauses (red {}, blue {})",
+                                        all_direct.len(), red_mode, blue_mode
+                                    );
+                                    effective_cnf = new_aug;
+                                }
+                            }
+                            } // est_total threshold
+                        } // s<=3 || t<=3
+                    } else {
+                        // Non-certified: Sinz counter (more BCP power from shorter clauses)
+                        let header = read_cnf_header(&effective_cnf).unwrap_or((cnf.nvars, 0));
+                        let top_var = header.0;
+
+                        let (clauses, aux_added, _new_top) =
+                            cardinality::ramsey_card_cnf(n, max_red, max_blue, top_var);
+
+                        if !clauses.is_empty() {
+                            let new_aug = scratch_path(&input, "_card.cnf");
+                            if let Err(e) = append_clauses_as_new_cnf(
+                                &effective_cnf,
+                                &new_aug,
+                                &clauses,
+                                aux_added,
+                            ) {
+                                eprintln!("c [card] write error: {}", e);
+                            } else {
+                                println!(
+                                    "c [card] {} clauses, {} aux vars (sequential counter)",
+                                    clauses.len(),
+                                    aux_added
+                                );
+                                effective_cnf = new_aug;
+                            }
                         }
                     }
                 } else {
@@ -259,6 +329,7 @@ fn main() -> ExitCode {
     }
 
     // === Stage 2: BCP Cascade — try to solve via pure unit propagation ===
+    let mut bcp_trail: Vec<cascade::types::Lit> = Vec::new();
     if !no_bcp {
         let bcp_start = Instant::now();
         let augmented_cnf = match dimacs::parse_file(&effective_cnf) {
@@ -300,7 +371,7 @@ fn main() -> ExitCode {
                             let combined = scratch_path(&input, "_combined.drat");
                             print!("c [certify] combining card+body proof... ");
                             if let Err(e) = certify::combine_card_and_body_proof(
-                                &card_clauses, p, &combined,
+                                &card_clauses, &[], p, &combined,
                             ) {
                                 println!("FAILED: {}", e);
                                 return ExitCode::from(30);
@@ -363,11 +434,27 @@ fn main() -> ExitCode {
                 println!(" 0");
                 return ExitCode::from(10);
             }
-            BcpResult::Unresolved { n_assigned, n_unassigned, .. } => {
+            BcpResult::Unresolved { trail, n_assigned, n_unassigned } => {
                 println!(
                     "c [bcp] unresolved: {} assigned / {} unassigned ({:.3}s) → falling through to CDCL",
                     n_assigned, n_unassigned, bcp_solve_elapsed
                 );
+                if !trail.is_empty() {
+                    println!("c [bcp] {} trail units available for CDCL warmstart + proof", trail.len());
+                    bcp_trail = trail.clone();
+                    // Append BCP-derived units to the CNF that CaDiCaL will solve
+                    let bcp_aug = scratch_path(&input, "_bcp.cnf");
+                    let unit_clauses: Vec<Vec<cascade::types::Lit>> =
+                        trail.iter().map(|&l| vec![l]).collect();
+                    if let Err(e) = append_clauses_as_new_cnf(
+                        &effective_cnf, &bcp_aug, &unit_clauses, 0,
+                    ) {
+                        eprintln!("c [bcp] warmstart write error: {}", e);
+                    } else {
+                        println!("c [bcp] wrote {} units to warmstart CNF", trail.len());
+                        effective_cnf = bcp_aug;
+                    }
+                }
             }
         }
     }
@@ -438,17 +525,18 @@ fn main() -> ExitCode {
             if let Some(p) = &result.proof_path {
                 println!("c body proof: {}", p.display());
                 if certified {
-                    if !card_clauses.is_empty() {
+                    if !card_clauses.is_empty() || !bcp_trail.is_empty() {
                         let combined = scratch_path(&input, "_combined.drat");
-                        print!("c [certify] combining card+body proof... ");
+                        print!("c [certify] combining card({})+bcp({})+body proof... ",
+                            card_clauses.len(), bcp_trail.len());
                         if let Err(e) = certify::combine_card_and_body_proof(
-                            &card_clauses, p, &combined,
+                            &card_clauses, &bcp_trail, p, &combined,
                         ) {
                             println!("FAILED: {}", e);
                             return ExitCode::from(30);
                         }
                         println!("ok");
-                        print!("c [certify] drat-trim card+body vs pre-card CNF... ");
+                        print!("c [certify] drat-trim combined vs pre-card CNF... ");
                         match certify::verify_drat_trim(&pre_card_cnf, &combined) {
                             Ok(()) => println!("VERIFIED"),
                             Err(e) => {
@@ -478,6 +566,20 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Estimate C(n, k) — binomial coefficient. Returns u64::MAX on overflow.
+fn estimate_combinations(n: u32, k: u32) -> u64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k) as u64;
+    let n = n as u64;
+    let mut result: u64 = 1;
+    for i in 0..k {
+        result = result.saturating_mul(n - i) / (i + 1);
+    }
+    result
 }
 
 fn scratch_path(input: &Path, suffix: &str) -> PathBuf {

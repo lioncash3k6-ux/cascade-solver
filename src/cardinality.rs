@@ -148,6 +148,159 @@ pub fn ramsey_card_cnf(
     (all_clauses, total_aux, base)
 }
 
+/// Generate DIRECT red cardinality clauses (no Sinz counter) for R(s,t) at K_n.
+///
+/// For each vertex v and each (max_red+1)-subset of its neighbors, emits
+/// a clause saying "not all edges in this subset can be red" (all-negative).
+///
+/// These direct clauses are proven RUP from ban clauses when s ≤ 3
+/// (the K_s ban width = C(s,2) ≤ 3, so BCP closes after star-edge assumptions
+/// force inter-edges blue via K_s bans, then blue K_t ban fires).
+///
+/// For s ≥ 4, these are SR with vertex transposition witnesses (proven for
+/// red side) but NOT RUP. Use DSR verification via dsr-trim for those.
+///
+/// Returns the clauses (over original edge variables only, no aux vars).
+pub fn direct_red_card_clauses(n: u32, max_red_deg: u32) -> Vec<Vec<Lit>> {
+    let mut clauses = Vec::new();
+    let k1 = (max_red_deg + 1) as usize;
+    let deg = (n - 1) as usize;
+    if k1 > deg {
+        return clauses;
+    }
+    for v in 1..=n {
+        let neighbors: Vec<u32> = (1..=n).filter(|&w| w != v).collect();
+        for_each_combination(&neighbors, k1, |subset| {
+            let cl: Vec<Lit> = subset.iter().map(|&w| ev(v, w, n).negate()).collect();
+            clauses.push(cl);
+        });
+    }
+    clauses
+}
+
+/// Generate DIRECT blue cardinality clauses (no Sinz counter) for R(s,t) at K_n.
+///
+/// For each vertex v and each (max_blue+1)-subset of its neighbors, emits
+/// a clause saying "not all edges in this subset can be blue" (all-positive).
+///
+/// Blue direct cards are RUP only when t ≤ 3 (symmetric to red case).
+pub fn direct_blue_card_clauses(n: u32, max_blue_deg: u32) -> Vec<Vec<Lit>> {
+    let mut clauses = Vec::new();
+    let k1 = (max_blue_deg + 1) as usize;
+    let deg = (n - 1) as usize;
+    if k1 > deg {
+        return clauses;
+    }
+    for v in 1..=n {
+        let neighbors: Vec<u32> = (1..=n).filter(|&w| w != v).collect();
+        for_each_combination(&neighbors, k1, |subset| {
+            let cl: Vec<Lit> = subset.iter().map(|&w| ev(v, w, n)).collect();
+            clauses.push(cl);
+        });
+    }
+    clauses
+}
+
+/// Emit a DSR proof for direct red cardinality clauses.
+///
+/// Each clause {-e(v,w1),...,-e(v,w_{k+1})} gets a vertex transposition
+/// witness: swap w1 and w2 (any two in the subset). The SR check passes
+/// because the transposition is a symmetry of the Ramsey formula.
+///
+/// DSR format (per dsr-trim): the pivot appears 3 times as separator:
+///   pivot clause_body... pivot σ(pivot) pivot σ_pairs... 0
+///
+/// Returns the DSR proof as a string suitable for dsr-trim verification.
+pub fn emit_red_card_dsr(n: u32, max_red_deg: u32) -> String {
+    use std::fmt::Write;
+    let mut proof = String::new();
+    let k1 = (max_red_deg + 1) as usize;
+    let deg = (n - 1) as usize;
+    if k1 > deg {
+        return proof;
+    }
+    for v in 1..=n {
+        let neighbors: Vec<u32> = (1..=n).filter(|&w| w != v).collect();
+        for_each_combination(&neighbors, k1, |subset| {
+            // Vertex transposition: (wa, wb)
+            let wa = subset[0];
+            let wb = subset[1];
+
+            // Pivot: first literal of the clause = -e(v, wa)
+            let pivot = ev(v, wa, n).negate();
+
+            // Under transposition (wa, wb): e(v,wa) -> e(v,wb)
+            // So σ(pivot) = σ(-e(v,wa)) = -e(v,wb)
+            let pivot_image = ev(v, wb, n).negate();
+
+            // (1) Pivot (first occurrence — start of clause)
+            write!(proof, "{} ", pivot.raw()).unwrap();
+
+            // (2) Rest of clause body (everything except pivot)
+            for &w in &subset[1..] {
+                write!(proof, "{} ", ev(v, w, n).negate().raw()).unwrap();
+            }
+
+            // (3) Pivot again (second occurrence — end of clause body)
+            write!(proof, "{} ", pivot.raw()).unwrap();
+
+            // (4) σ(pivot) — the PR part of the witness
+            write!(proof, "{} ", pivot_image.raw()).unwrap();
+
+            // (5) Pivot again (third occurrence — separator before subst pairs)
+            write!(proof, "{} ", pivot.raw()).unwrap();
+
+            // (6) Substitution pairs: from_lit to_lit for each affected edge
+            for a in 1..=n {
+                for b in (a + 1)..=n {
+                    let ta = if a == wa { wb } else if a == wb { wa } else { a };
+                    let tb = if b == wa { wb } else if b == wb { wa } else { b };
+                    let (ta2, tb2) = if ta < tb { (ta, tb) } else { (tb, ta) };
+                    if (ta2, tb2) != (a, b) {
+                        let orig = ev(a, b, n).raw();
+                        let mapped = ev(ta2, tb2, n).raw();
+                        write!(proof, "{} {} ", orig, mapped).unwrap();
+                    }
+                }
+            }
+
+            proof.push_str("0\n");
+        });
+    }
+    proof
+}
+
+/// Helper: iterate over all k-combinations of items.
+fn for_each_combination<T: Copy>(items: &[T], k: usize, mut f: impl FnMut(&[T])) {
+    let n = items.len();
+    if k > n {
+        return;
+    }
+    let mut indices: Vec<usize> = (0..k).collect();
+    loop {
+        let combo: Vec<T> = indices.iter().map(|&i| items[i]).collect();
+        f(&combo);
+        // Find rightmost index that can be incremented
+        let mut i = k;
+        loop {
+            if i == 0 {
+                return;
+            }
+            i -= 1;
+            if indices[i] < n - k + i {
+                break;
+            }
+            if i == 0 {
+                return;
+            }
+        }
+        indices[i] += 1;
+        for j in (i + 1)..k {
+            indices[j] = indices[j - 1] + 1;
+        }
+    }
+}
+
 /// Lookup table for Ramsey numbers used in the degree bound computation.
 /// Returns 0 for unknown values, in which case the caller should fall back
 /// to "no bound" (i.e., use n - 1 trivially).

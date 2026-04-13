@@ -32,6 +32,26 @@ impl std::fmt::Display for CertifyError {
     }
 }
 
+/// Find a tool by name, checking PATH first, then fallback locations.
+fn find_tool(name: &str, fallbacks: &[&str]) -> Result<String, CertifyError> {
+    // Check if the tool is in PATH
+    if let Ok(output) = Command::new("which").arg(name).output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Ok(path);
+            }
+        }
+    }
+    // Check fallback locations
+    for &path in fallbacks {
+        if std::path::Path::new(path).exists() {
+            return Ok(path.to_string());
+        }
+    }
+    Err(CertifyError::ToolNotFound(name.into()))
+}
+
 pub fn verify_veripb(bare_cnf: &Path, proof: &Path) -> Result<(), CertifyError> {
     let output = Command::new("veripb")
         .arg(bare_cnf)
@@ -80,6 +100,31 @@ pub fn verify_drat_trim(cnf: &Path, proof: &Path) -> Result<(), CertifyError> {
     } else {
         Err(CertifyError::DratTrimFailed(
             combined.lines().last().unwrap_or("unknown error").to_string(),
+        ))
+    }
+}
+
+pub fn verify_dsr_trim(cnf: &Path, proof: &Path) -> Result<(), CertifyError> {
+    let cmd = find_tool("dsr-trim", &[
+        "/root/dsr-trim/dsr-trim",
+        "/root/dsr-trim/bin/dsr-trim",
+    ])?;
+    let output = Command::new(&cmd)
+        .arg("-f")
+        .arg(cnf)
+        .arg(proof)
+        .output()
+        .map_err(|e| CertifyError::IoError(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    if combined.contains("s VERIFIED") || combined.contains("s VALID") {
+        Ok(())
+    } else {
+        Err(CertifyError::DratTrimFailed(
+            format!("dsr-trim: {}", combined.lines().last().unwrap_or("unknown error")),
         ))
     }
 }
@@ -137,10 +182,12 @@ pub fn write_card_drat_proof(
     Ok(())
 }
 
-/// Prepend cardinality DRAT additions to a body proof, creating a combined
-/// proof that drat-trim can verify end-to-end against the pre-cardinality CNF.
+/// Prepend cardinality DRAT additions and BCP trail units to a body proof,
+/// creating a combined proof that drat-trim can verify end-to-end against the
+/// pre-cardinality CNF.
 pub fn combine_card_and_body_proof(
     card_clauses: &[Vec<Lit>],
+    bcp_trail: &[Lit],
     body_proof: &Path,
     combined_proof: &Path,
 ) -> Result<(), CertifyError> {
@@ -155,6 +202,11 @@ pub fn combine_card_and_body_proof(
                 .map_err(|e| CertifyError::IoError(e.to_string()))?;
         }
         writeln!(out, "0").map_err(|e| CertifyError::IoError(e.to_string()))?;
+    }
+    // Write BCP trail units as RUP (trivially verified — they're BCP consequences)
+    for &lit in bcp_trail {
+        writeln!(out, "{} 0", lit.raw())
+            .map_err(|e| CertifyError::IoError(e.to_string()))?;
     }
     // Append body proof
     let mut body = std::fs::File::open(body_proof)
