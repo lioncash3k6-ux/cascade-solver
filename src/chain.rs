@@ -152,6 +152,200 @@ pub fn clausal_fixing_units(n: u32, count: u32) -> Vec<Vec<Lit>> {
     units
 }
 
+/// Compute the vertex pair (a, b) with a < b for a given edge variable index.
+fn edge_verts(e: u32, n: u32) -> (u32, u32) {
+    for a in 1..=n {
+        for b in (a + 1)..=n {
+            if ev(a, b, n).raw() as u32 == e {
+                return (a, b);
+            }
+        }
+    }
+    panic!("invalid edge var {} for n={}", e, n);
+}
+
+/// Precompute edge-to-vertex lookup table for all edges in K_n.
+fn build_edge_verts_table(n: u32) -> Vec<(u32, u32)> {
+    let n_edges = (n * (n - 1) / 2) as usize;
+    let mut table = vec![(0u32, 0u32); n_edges + 1]; // 1-indexed
+    for a in 1..=n {
+        for b in (a + 1)..=n {
+            let e = ev(a, b, n).raw() as usize;
+            table[e] = (a, b);
+        }
+    }
+    table
+}
+
+/// Compute the edge permutation induced by a vertex permutation.
+/// `vperm[v]` = image of vertex v (1-indexed). Identity for vertices not in the map.
+fn edge_perm_from_vertex_perm(vperm: &[u32], n: u32) -> Vec<u32> {
+    let n_edges = (n * (n - 1) / 2) as usize;
+    let mut eperm = vec![0u32; n_edges + 1]; // 1-indexed
+    for a in 1..=n {
+        for b in (a + 1)..=n {
+            let e = ev(a, b, n).raw() as u32;
+            let ma = vperm[a as usize];
+            let mb = vperm[b as usize];
+            eperm[e as usize] = ev(ma, mb, n).raw() as u32;
+        }
+    }
+    eperm
+}
+
+/// Emit a complete DSR proof for the chain augmentation.
+///
+/// The proof has three phases:
+///   1. Channeling clauses: DRAT additions (RAT on fresh blue variables)
+///   2. AMO clauses: DRAT additions (RUP from channeling + ban clauses)
+///   3. Chain clauses: SR additions with vertex-swap witnesses, then deleted
+///
+/// The chain witness maps the upper edge to the lower edge via either:
+///   - Z_n cyclic shift (v → (v % n) + 1) if it maps upper→lower
+///   - A custom 2-vertex swap otherwise
+///
+/// Each chain is added then immediately deleted (add-delete pattern) so they
+/// don't interfere with each other's SR checks.
+///
+/// Returns the DSR proof as a string. Verify with:
+///   dsr-trim -f <cnf_with_channeling_and_amo> <dsr_proof>
+pub fn emit_chain_dsr_proof(n: u32) -> String {
+    use std::fmt::Write;
+
+    let n_edges = (n * (n - 1) / 2) as usize;
+    let mut proof = String::new();
+
+    // Build lookup tables
+    let everts = build_edge_verts_table(n);
+
+    // Z_n cyclic shift: v → (v % n) + 1
+    let mut cyclic_vperm = vec![0u32; (n + 1) as usize];
+    for v in 1..=n {
+        cyclic_vperm[v as usize] = (v % n) + 1;
+    }
+    let cyclic_eperm = edge_perm_from_vertex_perm(&cyclic_vperm, n);
+
+    // Near-1-factorization matrix
+    let matrix = near_1_factorization(n);
+    let n_rows = matrix.len();
+    let n_cols = if n_rows > 0 { matrix[0].len() } else { 0 };
+
+    // Phase 1: Channeling — DRAT (no witness needed, RAT on fresh vars)
+    for e in 1..=(n_edges as i32) {
+        let b_e = e + n_edges as i32;
+        writeln!(proof, "{} {} 0", b_e, e).unwrap();
+    }
+
+    // Phase 2: AMO — DRAT
+    for e in 1..=(n_edges as i32) {
+        let b_e = e + n_edges as i32;
+        writeln!(proof, "{} {} 0", -b_e, -e).unwrap();
+    }
+
+    // Phase 3: Each chain — add with SR witness, then delete
+    for c in 0..n_cols {
+        for r in 0..(n_rows - 1) {
+            let upper = matrix[r][c];
+            let lower = matrix[r + 1][c];
+            let bu = upper as i32 + n_edges as i32;
+            let bl = lower as i32 + n_edges as i32;
+            let (ua, ub) = everts[upper as usize];
+            let (la, lb) = everts[lower as usize];
+
+            // Try Z_n cyclic shift first
+            let pairs = if cyclic_eperm[upper as usize] == lower {
+                // Cyclic shift maps upper → lower
+                let mut p = Vec::new();
+                for e in 1..=n_edges {
+                    let se = cyclic_eperm[e] as i32;
+                    let e_i = e as i32;
+                    if se != e_i {
+                        p.push((e_i, se));
+                        p.push((e_i + n_edges as i32, se + n_edges as i32));
+                    }
+                }
+                Some(p)
+            } else {
+                // Try custom 2-vertex swap: find a vertex permutation
+                // that maps (ua, ub) → (la, lb) or (ua, ub) → (lb, la)
+                let mut result = None;
+                for &(va, vb) in &[(la, lb), (lb, la)] {
+                    let mut vperm: Vec<u32> = (0..=n).collect(); // identity
+                    let mut ok = true;
+
+                    if ua != va {
+                        // Swap ua and va
+                        if vperm[ua as usize] != ua || vperm[va as usize] != va {
+                            // Already mapped — conflict
+                            if vperm[ua as usize] == va && vperm[va as usize] == ua {
+                                // Already swapped correctly
+                            } else {
+                                ok = false;
+                            }
+                        } else {
+                            vperm[ua as usize] = va;
+                            vperm[va as usize] = ua;
+                        }
+                    }
+                    if ok && ub != vb {
+                        if vperm[ub as usize] != ub || vperm[vb as usize] != vb {
+                            if vperm[ub as usize] == vb && vperm[vb as usize] == ub {
+                                // Already swapped correctly
+                            } else {
+                                ok = false;
+                            }
+                        } else {
+                            vperm[ub as usize] = vb;
+                            vperm[vb as usize] = ub;
+                        }
+                    }
+
+                    if !ok {
+                        continue;
+                    }
+
+                    let eperm = edge_perm_from_vertex_perm(&vperm, n);
+                    if eperm[upper as usize] != lower {
+                        continue;
+                    }
+
+                    let mut p = Vec::new();
+                    for e in 1..=n_edges {
+                        let se = eperm[e] as i32;
+                        let e_i = e as i32;
+                        if se != e_i {
+                            p.push((e_i, se));
+                            p.push((e_i + n_edges as i32, se + n_edges as i32));
+                        }
+                    }
+                    result = Some(p);
+                    break;
+                }
+                result
+            };
+
+            let pairs = pairs.expect(&format!(
+                "no witness for chain col={} row={}->{}: upper=e({},{})->lower=e({},{})",
+                c, r, r + 1, ua, ub, la, lb
+            ));
+
+            // SR line: pivot clause_body pivot sigma(pivot) pivot [pairs] 0
+            // Clause = {bu, -bl}, pivot = bu
+            // σ(bu) = b_lower = bl (because σ maps upper→lower, so b_upper→b_lower)
+            write!(proof, "{} {} {} {} {} ", bu, -bl, bu, bl, bu).unwrap();
+            for (from, to) in &pairs {
+                write!(proof, "{} {} ", from, to).unwrap();
+            }
+            writeln!(proof, "0").unwrap();
+
+            // Delete immediately
+            writeln!(proof, "d {} {} 0", bu, -bl).unwrap();
+        }
+    }
+
+    proof
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

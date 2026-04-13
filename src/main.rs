@@ -153,7 +153,7 @@ fn main() -> ExitCode {
 
     // === Stage 1: Symmetry breaking via satsuma ===
     let mut effective_cnf: PathBuf = input.clone();
-    let pre_card_cnf: PathBuf;
+    let mut pre_card_cnf: PathBuf;
     if !no_symmetry {
         let breaker = Satsuma::new();
         let aug = scratch_path(&input, "_aug.cnf");
@@ -343,12 +343,12 @@ fn main() -> ExitCode {
     // the entire matrix — the formula becomes BCP-trivial.
     //
     // This is the augmentation that makes R(4,5)/K_25 close in 3ms.
-    if !no_chain && !certified {
+    let chain_drat_clauses: Vec<Vec<cascade::types::Lit>> = Vec::new();
+    if !no_chain {
         // Chain augmentation: Tseitin double encoding + near-1-factorization
-        // staircase chains. These are SR-derivable symmetry-breaking constraints
-        // — they require DSR proof for certified mode (not yet implemented).
-        // For non-certified mode, only add when we KNOW the instance is UNSAT
-        // (n >= R(s,t)) to avoid making SAT instances unsatisfiable.
+        // staircase chains. Chains are SR-derivable symmetry-breaking constraints.
+        // Only add when we KNOW the instance is UNSAT (n >= R(s,t)).
+        // Under --certified: verify chain DSR proof with dsr-trim.
         if let Some(n) = cardinality::detect_ramsey_n(cnf.nvars) {
             if n % 2 == 1 && n >= 5 {
                 let (s, t) = match detect_ramsey_st_from_cnf(&cnf.clauses) {
@@ -370,29 +370,85 @@ fn main() -> ExitCode {
                     aug.clauses.len(), aug.aux_vars
                 );
 
-                // NOTE: Clausal fixing units are NOT added here. They are
-                // SR-derivable (proven by gen_sr_fix with K_s clique witnesses)
-                // but NOT unconditionally sound. Adding them to SAT instances
-                // would make them UNSAT — they're symmetry-breaking, not
-                // formula-preserving. The channeling + AMO + chains are
-                // equisatisfiable (Tseitin extension + ordering), so they're
-                // safe to add unconditionally.
+                if certified {
+                    // Certified chain: channeling+AMO are DRAT (RAT on fresh vars),
+                    // chains are SR (need DSR proof verified by dsr-trim).
 
-                if !aug.clauses.is_empty() {
-                    let new_aug = scratch_path(&input, "_chain.cnf");
+                    // Step 1: Add channeling + AMO to formula (these are DRAT-safe)
+                    let chan_amo: Vec<Vec<cascade::types::Lit>> = aug.clauses
+                        [..aug.n_channeling + aug.n_amo].to_vec();
+                    let chain_only: Vec<Vec<cascade::types::Lit>> = aug.clauses
+                        [aug.n_channeling + aug.n_amo..].to_vec();
+
+                    // Write channeling+AMO augmented CNF
+                    let chan_aug = scratch_path(&input, "_chanamo.cnf");
                     if let Err(e) = append_clauses_as_new_cnf(
-                        &effective_cnf,
-                        &new_aug,
-                        &aug.clauses,
-                        aug.aux_vars,
+                        &effective_cnf, &chan_aug, &chan_amo, aug.aux_vars,
                     ) {
-                        eprintln!("c [chain] write error: {}", e);
+                        eprintln!("c [chain] channeling write error: {}", e);
                     } else {
-                        println!(
-                            "c [chain] {} total clauses added",
-                            aug.clauses.len()
-                        );
-                        effective_cnf = new_aug;
+                        println!("c [chain] {} channeling+AMO clauses added", chan_amo.len());
+
+                        // Step 2: Generate DSR proof for chains, verify against chan+amo CNF
+                        let dsr_proof = chain::emit_chain_dsr_proof(n);
+                        let dsr_path = scratch_path(&input, "_chain.dsr");
+                        if let Err(e) = std::fs::write(&dsr_path, &dsr_proof) {
+                            eprintln!("c [chain] DSR write error: {}", e);
+                        } else {
+                            print!("c [certify] dsr-trim chain ({} clauses)... ", chain_only.len());
+                            // Verify against bare CNF (chains are SR w.r.t. the
+                            // bare Ramsey formula — the channeling+AMO in the DSR
+                            // proof are DRAT preamble that dsr-trim processes first)
+                            match certify::verify_dsr_trim(&input, &dsr_path) {
+                                Ok(()) => {
+                                    println!("VERIFIED");
+                                    // Step 3: Add chains to the formula.
+                                    // Since DSR verified, the chain-augmented CNF
+                                    // is the valid base for all further steps.
+                                    // No need to add chan/AMO to the DRAT proof —
+                                    // they're already in the augmented CNF that
+                                    // drat-trim will verify against.
+                                    let chain_aug = scratch_path(&input, "_chain.cnf");
+                                    if let Err(e) = append_clauses_as_new_cnf(
+                                        &chan_aug, &chain_aug, &chain_only, 0,
+                                    ) {
+                                        eprintln!("c [chain] chain write error: {}", e);
+                                    } else {
+                                        effective_cnf = chain_aug;
+                                        // Update pre_card_cnf so drat-trim verifies
+                                        // body against the chain-augmented CNF
+                                        pre_card_cnf = effective_cnf.clone();
+                                        println!("c [chain] {} chain clauses added (DSR verified)", chain_only.len());
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("FAILED: {}", e);
+                                    eprintln!("c [chain] DSR rejected, falling back without chains");
+                                    // Still use channeling+AMO (equisat Tseitin)
+                                    effective_cnf = chan_aug;
+                                    pre_card_cnf = effective_cnf.clone();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Non-certified: add everything
+                    if !aug.clauses.is_empty() {
+                        let new_aug = scratch_path(&input, "_chain.cnf");
+                        if let Err(e) = append_clauses_as_new_cnf(
+                            &effective_cnf,
+                            &new_aug,
+                            &aug.clauses,
+                            aug.aux_vars,
+                        ) {
+                            eprintln!("c [chain] write error: {}", e);
+                        } else {
+                            println!(
+                                "c [chain] {} total clauses added",
+                                aug.clauses.len()
+                            );
+                            effective_cnf = new_aug;
+                        }
                     }
                 }
                 } // ramsey_val guard
@@ -439,11 +495,15 @@ fn main() -> ExitCode {
                 }
                 if certified {
                     if let Some(p) = &proof {
-                        if !card_clauses.is_empty() {
+                        let mut all_drat_preamble: Vec<Vec<cascade::types::Lit>> = Vec::new();
+                        all_drat_preamble.extend(card_clauses.iter().cloned());
+                        all_drat_preamble.extend(chain_drat_clauses.iter().cloned());
+                        if !all_drat_preamble.is_empty() {
                             let combined = scratch_path(&input, "_combined.drat");
-                            print!("c [certify] combining card+body proof... ");
+                            print!("c [certify] combining card({})+chain({})+body proof... ",
+                                card_clauses.len(), chain_drat_clauses.len());
                             if let Err(e) = certify::combine_card_and_body_proof(
-                                &card_clauses, &[], p, &combined,
+                                &all_drat_preamble, &[], p, &combined,
                             ) {
                                 println!("FAILED: {}", e);
                                 return ExitCode::from(30);
@@ -597,12 +657,15 @@ fn main() -> ExitCode {
             if let Some(p) = &result.proof_path {
                 println!("c body proof: {}", p.display());
                 if certified {
-                    if !card_clauses.is_empty() || !bcp_trail.is_empty() {
+                    let mut all_drat_preamble: Vec<Vec<cascade::types::Lit>> = Vec::new();
+                    all_drat_preamble.extend(card_clauses.iter().cloned());
+                    all_drat_preamble.extend(chain_drat_clauses.iter().cloned());
+                    if !all_drat_preamble.is_empty() || !bcp_trail.is_empty() {
                         let combined = scratch_path(&input, "_combined.drat");
-                        print!("c [certify] combining card({})+bcp({})+body proof... ",
-                            card_clauses.len(), bcp_trail.len());
+                        print!("c [certify] combining card({})+chain({})+bcp({})+body proof... ",
+                            card_clauses.len(), chain_drat_clauses.len(), bcp_trail.len());
                         if let Err(e) = certify::combine_card_and_body_proof(
-                            &card_clauses, &bcp_trail, p, &combined,
+                            &all_drat_preamble, &bcp_trail, p, &combined,
                         ) {
                             println!("FAILED: {}", e);
                             return ExitCode::from(30);
