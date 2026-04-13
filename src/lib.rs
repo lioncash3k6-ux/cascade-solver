@@ -17,6 +17,7 @@ pub mod proof;
 pub mod backend;
 pub mod symmetry;
 pub mod cardinality;
+pub mod chain;
 pub mod bcp;
 pub mod certify;
 
