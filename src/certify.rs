@@ -78,6 +78,34 @@ pub fn verify_veripb(bare_cnf: &Path, proof: &Path) -> Result<(), CertifyError> 
     }
 }
 
+/// Verify a VeriPB proof against a DIMACS CNF file (uses --cnf flag).
+pub fn verify_veripb_cnf(cnf: &Path, proof: &Path) -> Result<(), CertifyError> {
+    let output = Command::new("veripb")
+        .arg("--cnf")
+        .arg(cnf)
+        .arg(proof)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CertifyError::ToolNotFound("veripb".into())
+            } else {
+                CertifyError::IoError(e.to_string())
+            }
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    if combined.contains("VERIFIED") {
+        Ok(())
+    } else {
+        Err(CertifyError::VeripbFailed(
+            combined.lines().last().unwrap_or("unknown error").to_string(),
+        ))
+    }
+}
+
 pub fn verify_drat_trim(cnf: &Path, proof: &Path) -> Result<(), CertifyError> {
     let output = Command::new("drat-trim")
         .arg(cnf)

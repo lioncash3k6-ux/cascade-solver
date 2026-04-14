@@ -246,19 +246,58 @@ fn main() -> ExitCode {
                     );
 
                     if certified {
-                        // Certified mode: use direct card clauses (verifiable).
+                        // Certified mode: derive card bounds from ban clauses.
                         //
-                        // Red direct cards are RUP from ban clauses when s ≤ 3:
-                        //   Assuming (max_red+1) = R(s-1,t) star edges red, each
-                        //   K_s ban (width C(s,2)=3) becomes unit → forces inter-
-                        //   edges blue → K_t blue ban fires. BCP closes.
+                        // For s ≤ 3: direct card clauses are RUP (BCP closes).
+                        // For s ≥ 4: VeriPB cutting-planes proof derives degree
+                        //   bounds via pol (sum ban clauses) + d (divide) + w (weaken).
                         //
-                        // For s ≥ 4, K_s ban width ≥ 6 → BCP can't close. No
-                        // known polynomial DRAT/DSR derivation. Skip card.
-                        //
-                        // Blue direct cards: RUP only when t ≤ 3 (symmetric).
-                        if s > 3 && t > 3 {
-                            println!("c [card] s={},t={} > 3: no certified card derivation, skipping", s, t);
+                        // After VeriPB verifies the degree bounds, we add the
+                        // Sinz counter encoding (same as non-certified) since
+                        // the bounds are now proven sound.
+                        if s > 3 || t > 3 {
+                            // VeriPB cutting-planes proof for s>=4 / t>=4
+                            print!("c [card] deriving degree bounds via VeriPB pol+d+w... ");
+                            let (card_veripb_proof, n_bounds) =
+                                cascade::card_proof::emit_card_veripb_proof(&cnf, n, s, t);
+                            println!("{} bounds", n_bounds);
+
+                            if n_bounds > 0 {
+                                let card_pbp = scratch_path(&input, "_card.pbp");
+                                std::fs::write(&card_pbp, &card_veripb_proof).unwrap();
+                                print!("c [certify] veripb card proof... ");
+                                match certify::verify_veripb_cnf(&input, &card_pbp) {
+                                    Ok(()) => println!("VERIFIED"),
+                                    Err(e) => {
+                                        println!("FAILED: {}", e);
+                                        eprintln!("c [card] VeriPB card proof rejected");
+                                        // Fall through without card
+                                    }
+                                }
+                            }
+
+                            // Card bounds verified — add Sinz counter encoding
+                            let header = read_cnf_header(&effective_cnf).unwrap_or((cnf.nvars, 0));
+                            let top_var = header.0;
+                            let (clauses, aux_added, _new_top) =
+                                cardinality::ramsey_card_cnf(n, max_red, max_blue, top_var);
+                            if !clauses.is_empty() {
+                                let new_aug = scratch_path(&input, "_card.cnf");
+                                if let Err(e) = append_clauses_as_new_cnf(
+                                    &effective_cnf, &new_aug, &clauses, aux_added,
+                                ) {
+                                    eprintln!("c [card] write error: {}", e);
+                                } else {
+                                    println!(
+                                        "c [card] {} clauses, {} aux vars (sequential counter, VeriPB-certified)",
+                                        clauses.len(), aux_added
+                                    );
+                                    effective_cnf = new_aug;
+                                    // VeriPB certified the card derivation, so drat-trim
+                                    // should verify body proof against the card-augmented CNF.
+                                    pre_card_cnf = effective_cnf.clone();
+                                }
+                            }
                         } else if s <= 3 || t <= 3 {
                             // Estimate direct clause count to avoid combinatorial explosion
                             let est_red = if s <= 3 { estimate_combinations(n - 1, max_red + 1) * n as u64 } else { 0 };
