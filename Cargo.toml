@@ -19,6 +19,9 @@ codegen-units = 1
 debug = 1
 overflow-checks = false
 
+[build-dependencies]
+cc = "1"
+
 [profile.dev]
 opt-level = 1
 debug = true

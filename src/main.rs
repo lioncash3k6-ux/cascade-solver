@@ -15,10 +15,13 @@
 use cascade::backend::cadical::CaDiCaL;
 use cascade::backend::{Backend, BackendProofFormat, Verdict};
 use cascade::bcp::{bcp_cascade, BcpResult};
+use cascade::biclique;
+use cascade::cadical as cadical_ffi;
 use cascade::cardinality;
 use cascade::chain;
 use cascade::certify;
 use cascade::dimacs;
+use cascade::propagator::BicliquePropagator;
 use cascade::symmetry::satsuma::Satsuma;
 use cascade::symmetry::{EquisatProofFormat, SymmetryBreaker};
 use std::io::{BufRead, BufReader, Write};
@@ -51,6 +54,7 @@ fn main() -> ExitCode {
     let mut no_chain = false;
     let mut no_bcp = false;
     let mut certified = false;
+    let mut use_biclique = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -101,6 +105,10 @@ fn main() -> ExitCode {
             }
             "--certified" => {
                 certified = true;
+                i += 1;
+            }
+            "--biclique" => {
+                use_biclique = true;
                 i += 1;
             }
             "-h" | "--help" => {
@@ -594,6 +602,175 @@ fn main() -> ExitCode {
     if no_solve {
         println!("c --no-solve: skipping backend invocation");
         return ExitCode::SUCCESS;
+    }
+
+    // === Stage 4a: Biclique propagator backend (in-process CaDiCaL) ===
+    if use_biclique {
+        if let Some(n) = cardinality::detect_ramsey_n(cnf.nvars) {
+            let (s, t) = match detect_ramsey_st_from_cnf(&cnf.clauses) {
+                Some(st) => st,
+                None => {
+                    eprintln!("c [biclique] cannot detect Ramsey (s,t) parameters");
+                    return ExitCode::from(1);
+                }
+            };
+
+            println!("c [biclique] R({},{}) on K_{}", s, t, n);
+
+            let bicl_start = Instant::now();
+            // Use ban-clause decomposition: each ban clause becomes a group.
+            // Reason clauses = ban clauses → trivially RUP for drat-trim.
+            let decomp = biclique::decompose_from_cnf(&cnf, n, s, t);
+            println!(
+                "c [biclique] {} red ban groups, {} blue ban groups",
+                decomp.red_groups.len(),
+                decomp.blue_groups.len(),
+            );
+
+            let observed = (1..=cnf.nvars as i32).collect::<Vec<_>>();
+            let prop = BicliquePropagator::new(decomp);
+
+            let mut solver = cadical_ffi::Solver::new();
+
+            // Enable proof tracing if requested
+            let biclique_proof_path = if proof.is_some() || certified {
+                let p = scratch_path(&input, "_biclique.drat");
+                solver.set("binary", 0); // text DRAT for drat-trim compatibility
+                solver.trace_proof(&p);
+                Some(p)
+            } else {
+                None
+            };
+
+            // Feed ONLY the satsuma SBP clauses — NOT the ban clauses.
+            // The propagator handles all ban constraints.
+            let sbp_cnf = if effective_cnf != input {
+                // effective_cnf includes satsuma + card + chain augmentations
+                // We want just satsuma SBP. Re-read and filter.
+                match dimacs::parse_file(&effective_cnf) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("c [biclique] parse error: {}", e);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                cnf.clone()
+            };
+
+            // Add all clauses from the augmented CNF to the solver.
+            // This includes satsuma SBP + card + chain + BCP warmstart.
+            // The propagator supplements these with ban-constraint propagation.
+            for clause in sbp_cnf.clauses.iter() {
+                for lit in clause.lits() {
+                    solver.add(lit.raw());
+                }
+                solver.add(0);
+            }
+
+            // Add BCP trail units
+            for &unit in &bcp_trail {
+                solver.add(unit.raw());
+                solver.add(0);
+            }
+
+            // Connect propagator — observes all original edge variables
+            solver.connect_propagator(Box::new(prop), &observed);
+
+            println!("c [biclique] solving with in-process CaDiCaL + propagator...");
+            let result = solver.solve();
+            let bicl_elapsed = bicl_start.elapsed().as_secs_f64();
+            let conflicts = solver.conflicts();
+
+            println!(
+                "c [biclique] {:?} in {:.2}s, {} conflicts",
+                result, bicl_elapsed, conflicts
+            );
+
+            match result {
+                cadical_ffi::SolveResult::Sat => {
+                    // Extract model
+                    let mut model = Vec::new();
+                    for v in 1..=cnf.nvars as i32 {
+                        model.push(solver.val(v));
+                    }
+                    if certified {
+                        let lits: Vec<cascade::types::Lit> =
+                            model.iter().map(|&v| cascade::types::Lit::new(v)).collect();
+                        print!("c [certify] model vs original CNF... ");
+                        match certify::verify_model(&cnf, &lits) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                return ExitCode::from(30);
+                            }
+                        }
+                    }
+                    println!("s SATISFIABLE");
+                    let mut col = 2;
+                    print!("v");
+                    for &lit in &model {
+                        let s = format!(" {}", lit);
+                        if col + s.len() > 78 { println!(); print!("v"); col = 1; }
+                        print!("{}", s);
+                        col += s.len();
+                    }
+                    println!(" 0");
+                    return ExitCode::from(10);
+                }
+                cadical_ffi::SolveResult::Unsat => {
+                    if biclique_proof_path.is_some() {
+                        solver.close_proof();
+                    }
+                    if certified {
+                        if let Some(bp) = &biclique_proof_path {
+                            // Combine preamble (card+chain) + biclique body proof
+                            let mut all_preamble: Vec<Vec<cascade::types::Lit>> = Vec::new();
+                            all_preamble.extend(card_clauses.iter().cloned());
+                            all_preamble.extend(chain_drat_clauses.iter().cloned());
+
+                            if !all_preamble.is_empty() || !bcp_trail.is_empty() {
+                                let combined = scratch_path(&input, "_combined.drat");
+                                print!("c [certify] combining preamble + biclique proof... ");
+                                if let Err(e) = certify::combine_card_and_body_proof(
+                                    &all_preamble, &bcp_trail, bp, &combined,
+                                ) {
+                                    println!("FAILED: {}", e);
+                                    return ExitCode::from(30);
+                                }
+                                println!("ok");
+                                print!("c [certify] drat-trim combined vs pre-card CNF... ");
+                                match certify::verify_drat_trim(&pre_card_cnf, &combined) {
+                                    Ok(()) => println!("VERIFIED"),
+                                    Err(e) => {
+                                        println!("FAILED: {}", e);
+                                        return ExitCode::from(30);
+                                    }
+                                }
+                            } else {
+                                print!("c [certify] drat-trim biclique proof... ");
+                                match certify::verify_drat_trim(&effective_cnf, bp) {
+                                    Ok(()) => println!("VERIFIED"),
+                                    Err(e) => {
+                                        println!("FAILED: {}", e);
+                                        return ExitCode::from(30);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    println!("s UNSATISFIABLE");
+                    return ExitCode::from(20);
+                }
+                cadical_ffi::SolveResult::Unknown => {
+                    println!("s UNKNOWN");
+                    return ExitCode::from(0);
+                }
+            }
+        } else {
+            eprintln!("c [biclique] not a Ramsey instance (nvars={} is not triangular)", cnf.nvars);
+            return ExitCode::from(1);
+        }
     }
 
     // === Stage 4: CDCL backend (CaDiCaL subprocess) ===

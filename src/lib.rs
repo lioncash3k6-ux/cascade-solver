@@ -20,6 +20,10 @@ pub mod cardinality;
 pub mod chain;
 pub mod bcp;
 pub mod certify;
+pub mod cadical;
+pub mod biclique;
+pub mod propagator;
+pub mod card_proof;
 
 pub use types::{Lit, Var, ClauseId, Clause};
 pub use constraint::Constraint;

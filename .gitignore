@@ -1,1 +1,4 @@
 /target
+cadical_ffi.o
+libcadical.a
+target/
