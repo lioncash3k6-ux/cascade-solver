@@ -24,6 +24,8 @@ pub mod cadical;
 pub mod biclique;
 pub mod propagator;
 pub mod card_proof;
+pub mod cuber;
+pub mod conquer;
 
 pub use types::{Lit, Var, ClauseId, Clause};
 pub use constraint::Constraint;

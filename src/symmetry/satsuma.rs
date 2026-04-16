@@ -8,6 +8,7 @@
 //! end pseudo-Boolean proof;` lines — we append them after the subprocess
 //! returns so `veripb` will accept the file.
 
+use super::generators::{parse_veripb_proof, GeneratorSet};
 use super::{BreakResult, EquisatProofFormat, SymmetryBreaker};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -36,6 +37,46 @@ impl Satsuma {
 impl Default for Satsuma {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Satsuma {
+    /// Run satsuma on `cnf_path` and return the detected `GeneratorSet`.
+    ///
+    /// Internally: invokes satsuma with `--proof-file` pointed at a
+    /// scratch location, parses the resulting VeriPB proof for `dom`
+    /// lines and the `load_order` declaration. The augmented CNF and
+    /// the scratch proof file are left on disk at `scratch_dir` for
+    /// the caller to reuse (e.g., feeding the augmented CNF to CaDiCaL
+    /// in hybrid mode, or composing the proof).
+    ///
+    /// `n_vars` is the number of variables in the **original** CNF (not
+    /// including satsuma's auxiliary SBP vars). Generators always act
+    /// on the original variables; any image referencing an aux var is
+    /// filtered out during parsing.
+    pub fn extract_generators(
+        &self,
+        cnf_path: &Path,
+        scratch_dir: &Path,
+        n_vars: u32,
+    ) -> std::io::Result<(GeneratorSet, PathBuf, PathBuf)> {
+        std::fs::create_dir_all(scratch_dir)?;
+        let stem = cnf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("satsuma");
+        let aug_path = scratch_dir.join(format!("{}_aug.cnf", stem));
+        let proof_path = scratch_dir.join(format!("{}.veripb", stem));
+
+        let _ = self.break_symmetries(
+            cnf_path,
+            &aug_path,
+            Some(&proof_path),
+            EquisatProofFormat::VeriPb,
+        )?;
+
+        let gs = parse_veripb_proof(&proof_path, n_vars)?;
+        Ok((gs, aug_path, proof_path))
     }
 }
 

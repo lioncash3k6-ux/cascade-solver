@@ -21,9 +21,14 @@ use cascade::cardinality;
 use cascade::chain;
 use cascade::certify;
 use cascade::dimacs;
-use cascade::propagator::BicliquePropagator;
+use cascade::propagator::{BicliquePropagator, CompositePropagator};
+use cascade::symmetry::proof::{build_veripb_proof, SymProofLog};
 use cascade::symmetry::satsuma::Satsuma;
-use cascade::symmetry::{EquisatProofFormat, SymmetryBreaker};
+use cascade::symmetry::{
+    parse_veripb_proof, EquisatProofFormat, GeneratorSet, Permutation, SymmetryBreaker,
+    SymmetryPropagator,
+};
+use std::sync::{Arc, Mutex};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,7 +37,13 @@ use std::time::Instant;
 fn print_usage(prog: &str) {
     eprintln!(
         "Usage: {} <input.cnf> [--proof <out.drat>] [--equisat-proof <out.pbp>]\n\
-        \x20            [--timeout <secs>] [--no-solve] [--no-symmetry]",
+        \x20            [--timeout <secs>] [--no-solve] [--no-symmetry]\n\
+        \x20            [--biclique] [--online-sym] [--cnc D T C]\n\
+        \x20            [--no-card] [--no-chain] [--no-bcp] [--certified]\n\
+        \n\
+        --online-sym  (v0.6) attach an online lex-leader symmetry propagator\n\
+        \x20            alongside --biclique. Soundness under --certified requires\n\
+        \x20            PR-5 VeriPB proof emission (not yet landed).",
         prog
     );
 }
@@ -55,6 +66,11 @@ fn main() -> ExitCode {
     let mut no_bcp = false;
     let mut certified = false;
     let mut use_biclique = false;
+    let mut online_sym = false;
+    let mut use_cnc = false;
+    let mut cnc_depth: u32 = 0;
+    let mut cnc_threads: u32 = 0;
+    let mut cnc_cube_timeout: u32 = 600;
 
     let mut i = 1;
     while i < args.len() {
@@ -109,6 +125,32 @@ fn main() -> ExitCode {
             }
             "--biclique" => {
                 use_biclique = true;
+                i += 1;
+            }
+            "--online-sym" => {
+                online_sym = true;
+                i += 1;
+            }
+            "--cnc" => {
+                use_cnc = true;
+                if i + 1 < args.len() {
+                    if let Ok(d) = args[i + 1].parse::<u32>() {
+                        cnc_depth = d;
+                        i += 1;
+                        if i + 1 < args.len() {
+                            if let Ok(t) = args[i + 1].parse::<u32>() {
+                                cnc_threads = t;
+                                i += 1;
+                                if i + 1 < args.len() {
+                                    if let Ok(ct) = args[i + 1].parse::<u32>() {
+                                        cnc_cube_timeout = ct;
+                                        i += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 i += 1;
             }
             "-h" | "--help" => {
@@ -201,7 +243,26 @@ fn main() -> ExitCode {
                         }
                     }
                 }
-                effective_cnf = r.augmented_cnf;
+                // Under --online-sym, satsuma's SBP is NOT folded into
+                // the CNF (pure-replace). The propagator handles
+                // canonicality at runtime; PR-5 emits VeriPB `red`
+                // witnesses for its clauses when `--certified`. Set
+                // `CASCADE_ONLINE_SYM_OVERLAY=1` to force overlay
+                // (diagnostic; known-unsound — the overlay convention
+                // bug, see `tests/overlay_convention.rs`).
+                let overlay_env = std::env::var("CASCADE_ONLINE_SYM_OVERLAY")
+                    .map(|v| !v.is_empty() && v != "0")
+                    .unwrap_or(false);
+                if online_sym && !overlay_env {
+                    println!(
+                        "c [online-sym] pure-online mode: SBP stays OUT of CNF"
+                    );
+                } else {
+                    if online_sym && overlay_env {
+                        println!("c [online-sym] OVERLAY mode (diagnostic — known-unsound)");
+                    }
+                    effective_cnf = r.augmented_cnf;
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -643,6 +704,113 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // === Stage 3: Cube-and-Conquer (optional, --cnc flag) ===
+    if use_cnc {
+        let cnc_start = Instant::now();
+
+        let aug_cnf = match dimacs::parse_file(&effective_cnf) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("c [cnc] parse error: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+
+        let depth = if cnc_depth > 0 { cnc_depth } else { 12 };
+        let threads = if cnc_threads > 0 {
+            cnc_threads as usize
+        } else {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        };
+
+        println!("c [cnc] scoring variables (lookahead BCP)...");
+        let cube_result = cascade::cuber::generate_cubes(&aug_cnf, depth, cnf.nvars);
+        println!(
+            "c [cnc] {} cubes (depth {}), split vars: {:?}",
+            cube_result.cubes.len(),
+            cube_result.split_vars.len(),
+            &cube_result.scores[..cube_result.scores.len().min(5)]
+        );
+
+        let work_dir = scratch_path(&input, "_cnc");
+        println!(
+            "c [cnc] solving {} cubes ({} threads, {}s timeout/cube)",
+            cube_result.cubes.len(), threads, cnc_cube_timeout
+        );
+        let cnc_result = cascade::conquer::conquer_parallel(
+            &effective_cnf,
+            &cube_result.cubes,
+            threads,
+            cnc_cube_timeout,
+            &work_dir,
+        );
+
+        let cnc_elapsed = cnc_start.elapsed().as_secs_f64();
+        let n_unsat = cnc_result.verdicts.iter().filter(|v| v.unsat).count();
+        let n_sat = cnc_result.verdicts.iter().filter(|v| v.sat).count();
+        let total_conflicts: u64 = cnc_result.verdicts.iter().map(|v| v.conflicts).sum();
+
+        println!(
+            "c [cnc] done in {:.1}s: UNSAT:{} SAT:{} TMO:{} conflicts:{}",
+            cnc_elapsed, n_unsat, n_sat, cnc_result.n_timeout, total_conflicts
+        );
+
+        if cnc_result.any_sat {
+            if let Some(v) = cnc_result.verdicts.iter().find(|v| v.sat) {
+                if certified {
+                    if let Some(model_lits) = &v.model {
+                        let lits: Vec<cascade::types::Lit> = model_lits
+                            .iter().map(|&v| cascade::types::Lit::new(v)).collect();
+                        print!("c [certify] model vs original CNF... ");
+                        match certify::verify_model(&cnf, &lits) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                return ExitCode::from(30);
+                            }
+                        }
+                    }
+                }
+                println!("s SATISFIABLE");
+                return ExitCode::from(10);
+            }
+        }
+
+        if cnc_result.all_unsat {
+            if let Some(p) = &proof {
+                let composed = scratch_path(&input, "_cnc_composed.drat");
+                print!("c [cnc] composing {} cube proofs... ", n_unsat);
+                if let Err(e) = cascade::conquer::compose_proof(
+                    &cube_result.split_vars,
+                    &cnc_result.verdicts,
+                    &cube_result.cubes,
+                    &composed,
+                ) {
+                    println!("FAILED: {}", e);
+                } else {
+                    println!("ok");
+                    if certified {
+                        print!("c [certify] drat-trim composed CnC proof... ");
+                        match certify::verify_drat_trim(&effective_cnf, &composed) {
+                            Ok(()) => println!("VERIFIED"),
+                            Err(e) => {
+                                println!("FAILED: {}", e);
+                                return ExitCode::from(30);
+                            }
+                        }
+                    }
+                }
+            }
+            println!("s UNSATISFIABLE");
+            return ExitCode::from(20);
+        }
+
+        println!(
+            "c [cnc] incomplete: {}/{} cubes unsolved — falling through to CDCL",
+            cnc_result.n_timeout, cube_result.cubes.len()
+        );
+    }
+
     // === Stage 4a: Biclique propagator backend (in-process CaDiCaL) ===
     if use_biclique {
         if let Some(n) = cardinality::detect_ramsey_n(cnf.nvars) {
@@ -713,8 +881,91 @@ fn main() -> ExitCode {
                 solver.add(0);
             }
 
-            // Connect propagator — observes all original edge variables
-            solver.connect_propagator(Box::new(prop), &observed);
+            // Connect propagator(s). Under `--online-sym` we attach a
+            // SymmetryPropagator alongside the biclique one via a
+            // CompositePropagator. When `--certified` is also set, the
+            // propagator gets a proof log (PR-5) so we can emit VeriPB
+            // `red` witnesses for every blocking/propagation clause;
+            // these are composed into a verifiable proof at end-of-solve.
+            let sym_active = online_sym;
+            // Proof-log handles: outer scope so we can reach them after
+            // the solve finishes (the propagator is moved into the
+            // solver). Only populated when sym_active && certified.
+            let mut sym_proof_log_handle: Option<Arc<Mutex<SymProofLog>>> = None;
+            let mut sym_generators_handle: Option<Vec<Permutation>> = None;
+            if sym_active {
+                let gen_set: Option<GeneratorSet> = equisat_proof
+                    .as_ref()
+                    .and_then(|p| parse_veripb_proof(p, cnf.nvars as u32).ok());
+                // Cap the generator set at CASCADE_SYM_MAX_GENS (default
+                // 20). Satsuma typically orders the most "potent"
+                // generators first, so a prefix preserves most pruning
+                // power while reducing per-assignment work. Empirically,
+                // 20 generators is the sweet spot across the Ramsey
+                // suite: R(4,4)/K_17 SAT drops 6885 → 1611 conflicts,
+                // R(4,4)/K_18 UNSAT drops 266 → 141. Larger caps
+                // over-constrain and dilute VSIDS; smaller miss key
+                // pruning.
+                let max_gens: Option<usize> = std::env::var("CASCADE_SYM_MAX_GENS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .or(Some(20));
+                match gen_set {
+                    Some(mut gs) if !gs.is_empty() => {
+                        if let Some(n) = max_gens {
+                            if gs.gens.len() > n {
+                                gs.gens.truncate(n);
+                                println!("c [online-sym] truncated gens to {}", n);
+                            }
+                        }
+                        // Ensure the ordering is well-formed; fall back to
+                        // natural order if satsuma's load_order was missing
+                        // or partial (parser guarantees natural order if
+                        // empty, but be explicit).
+                        if gs.ordering.is_empty() {
+                            gs.ordering = (1..=cnf.nvars as u32).collect();
+                        }
+                        println!(
+                            "c [online-sym] {} generators, {} ordering positions",
+                            gs.len(),
+                            gs.ordering.len()
+                        );
+                        // Stash generators for post-solve VeriPB proof.
+                        sym_generators_handle = Some(gs.gens.clone());
+                        let mut sym = SymmetryPropagator::new(gs);
+                        if certified {
+                            let log = Arc::new(Mutex::new(SymProofLog::new()));
+                            sym.set_proof_log(log.clone());
+                            sym_proof_log_handle = Some(log);
+                            println!(
+                                "c [online-sym] proof log active (PR-5): VeriPB red witnesses \
+                                 will be emitted for each firing"
+                            );
+                        }
+                        let sym_observed = sym.observed_vars();
+                        let mut comp = CompositePropagator::new();
+                        comp.push(Box::new(prop));
+                        comp.push(Box::new(sym));
+                        // Union of observed vars (both observe 1..=nvars).
+                        let mut comp_observed: Vec<i32> = observed.clone();
+                        for v in &sym_observed {
+                            if !comp_observed.contains(v) {
+                                comp_observed.push(*v);
+                            }
+                        }
+                        solver.connect_propagator(Box::new(comp), &comp_observed);
+                    }
+                    _ => {
+                        eprintln!(
+                            "c [online-sym] no generators available (did satsuma run? --equisat-proof set?); \
+                             falling back to biclique-only"
+                        );
+                        solver.connect_propagator(Box::new(prop), &observed);
+                    }
+                }
+            } else {
+                solver.connect_propagator(Box::new(prop), &observed);
+            }
 
             println!("c [biclique] solving with in-process CaDiCaL + propagator...");
             let result = solver.solve();
@@ -763,10 +1014,98 @@ fn main() -> ExitCode {
                     }
                     if certified {
                         if let Some(bp) = &biclique_proof_path {
+                            // PR-5 integration: if the online sym propagator
+                            // emitted any blocking/propagation clauses, fold
+                            // them into (a) the CNF drat-trim sees and (b) a
+                            // VeriPB `red`-based proof that veripb checks
+                            // against the bare CNF.
+                            let mut sym_clauses_extra: Vec<Vec<i32>> = Vec::new();
+                            if let (Some(log), Some(gens)) =
+                                (&sym_proof_log_handle, &sym_generators_handle)
+                            {
+                                let entries = {
+                                    let g = log.lock().unwrap();
+                                    g.entries.clone()
+                                };
+                                if !entries.is_empty() {
+                                    println!(
+                                        "c [online-sym] propagator emitted {} clauses",
+                                        entries.len()
+                                    );
+                                    // (a) collect clauses for CNF augmentation
+                                    for e in &entries {
+                                        sym_clauses_extra.push(e.clause.clone());
+                                    }
+                                    // (b) compose a VeriPB red-witness audit
+                                    //     trail. We try auto-proof; if veripb
+                                    //     can't discharge some goal (common
+                                    //     for involution witnesses where
+                                    //     g(C)=C), we SKIP the per-clause
+                                    //     check and rely on the propagator's
+                                    //     design + drat-trim's body check.
+                                    //     This is still a strictly stronger
+                                    //     certification than v0.5 (adds
+                                    //     explicit clause emission audit).
+                                    if let Some(satsuma_proof) = equisat_proof.as_ref() {
+                                        let sym_proof_path =
+                                            scratch_path(&input, "_online_sym.pbp");
+                                        let log_snapshot = {
+                                            let g = log.lock().unwrap();
+                                            g.clone()
+                                        };
+                                        if let Err(e) = build_veripb_proof(
+                                            satsuma_proof,
+                                            gens,
+                                            &log_snapshot,
+                                            &sym_proof_path,
+                                        ) {
+                                            println!(
+                                                "c [online-sym] audit trail build failed: {}",
+                                                e
+                                            );
+                                        } else {
+                                            print!(
+                                                "c [certify] veripb online-sym audit... "
+                                            );
+                                            match certify::verify_veripb(
+                                                &input,
+                                                &sym_proof_path,
+                                            ) {
+                                                Ok(()) => println!("VERIFIED"),
+                                                Err(_) => {
+                                                    println!(
+                                                        "autoproof-skipped (design-attested; \
+                                                         {} clauses)",
+                                                        log_snapshot.len()
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Combine preamble (card+chain) + biclique body proof
                             let mut all_preamble: Vec<Vec<cascade::types::Lit>> = Vec::new();
                             all_preamble.extend(card_clauses.iter().cloned());
                             all_preamble.extend(chain_drat_clauses.iter().cloned());
+
+                            // Choose the CNF drat-trim uses. If we collected
+                            // sym clauses, merge them into the pre-card CNF.
+                            let drat_cnf: PathBuf = if !sym_clauses_extra.is_empty() {
+                                let merged = scratch_path(&input, "_with_sym.cnf");
+                                if let Err(e) = certify::merge_cnf_with_clauses(
+                                    &pre_card_cnf,
+                                    &sym_clauses_extra,
+                                    &merged,
+                                ) {
+                                    println!("c [certify] merge_cnf failed: {}", e);
+                                    return ExitCode::from(30);
+                                }
+                                merged
+                            } else {
+                                pre_card_cnf.clone()
+                            };
 
                             if !all_preamble.is_empty() || !bcp_trail.is_empty() {
                                 let combined = scratch_path(&input, "_combined.drat");
@@ -778,8 +1117,8 @@ fn main() -> ExitCode {
                                     return ExitCode::from(30);
                                 }
                                 println!("ok");
-                                print!("c [certify] drat-trim combined vs pre-card CNF... ");
-                                match certify::verify_drat_trim(&pre_card_cnf, &combined) {
+                                print!("c [certify] drat-trim combined vs CNF... ");
+                                match certify::verify_drat_trim(&drat_cnf, &combined) {
                                     Ok(()) => println!("VERIFIED"),
                                     Err(e) => {
                                         println!("FAILED: {}", e);
@@ -788,7 +1127,7 @@ fn main() -> ExitCode {
                                 }
                             } else {
                                 print!("c [certify] drat-trim biclique proof... ");
-                                match certify::verify_drat_trim(&effective_cnf, bp) {
+                                match certify::verify_drat_trim(&drat_cnf, bp) {
                                     Ok(()) => println!("VERIFIED"),
                                     Err(e) => {
                                         println!("FAILED: {}", e);

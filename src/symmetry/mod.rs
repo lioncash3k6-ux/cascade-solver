@@ -10,7 +10,16 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod generators;
+pub mod lex;
+pub mod online;
+pub mod proof;
 pub mod satsuma;
+
+pub use generators::{parse_veripb_proof, GeneratorSet, Permutation};
+pub use lex::{CmpStatus, Lbool, LexComparator, StepOutcome};
+pub use online::SymmetryPropagator;
+pub use proof::{build_veripb_proof, LoggedClause, SymProofLog};
 
 #[derive(Debug)]
 pub struct BreakResult {

@@ -210,6 +210,67 @@ pub fn write_card_drat_proof(
     Ok(())
 }
 
+/// Append extra clauses to an existing DIMACS CNF file, emitting a new
+/// CNF file with an updated header. Used under `--online-sym
+/// --certified` to fold the online symmetry propagator's blocking
+/// clauses into the CNF that drat-trim verifies the body proof
+/// against. Each added clause is justified separately in VeriPB
+/// (`symmetry::proof::build_veripb_proof`) as a symmetry-derivable
+/// red step.
+pub fn merge_cnf_with_clauses(
+    base_cnf: &Path,
+    extra_clauses: &[Vec<i32>],
+    out_cnf: &Path,
+) -> Result<(), CertifyError> {
+    use std::io::{BufRead, BufReader, Write};
+    let f = std::fs::File::open(base_cnf)
+        .map_err(|e| CertifyError::IoError(e.to_string()))?;
+    let reader = BufReader::new(f);
+    let mut nvars: u32 = 0;
+    let mut base_nclauses: u32 = 0;
+    let mut base_clause_lines: Vec<String> = Vec::new();
+    let mut header_seen = false;
+    for line in reader.lines() {
+        let line = line.map_err(|e| CertifyError::IoError(e.to_string()))?;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('c') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("p cnf ") {
+            let mut it = rest.split_whitespace();
+            nvars = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            base_nclauses = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            header_seen = true;
+            continue;
+        }
+        base_clause_lines.push(line);
+    }
+    if !header_seen {
+        return Err(CertifyError::IoError(
+            "base CNF missing 'p cnf' header".into(),
+        ));
+    }
+    let total = base_nclauses + extra_clauses.len() as u32;
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(out_cnf)
+            .map_err(|e| CertifyError::IoError(e.to_string()))?,
+    );
+    writeln!(out, "p cnf {} {}", nvars, total)
+        .map_err(|e| CertifyError::IoError(e.to_string()))?;
+    for l in &base_clause_lines {
+        writeln!(out, "{}", l).map_err(|e| CertifyError::IoError(e.to_string()))?;
+    }
+    for cl in extra_clauses {
+        for l in cl {
+            write!(out, "{} ", l)
+                .map_err(|e| CertifyError::IoError(e.to_string()))?;
+        }
+        writeln!(out, "0").map_err(|e| CertifyError::IoError(e.to_string()))?;
+    }
+    out.flush().map_err(|e| CertifyError::IoError(e.to_string()))?;
+    Ok(())
+}
+
 /// Prepend cardinality DRAT additions and BCP trail units to a body proof,
 /// creating a combined proof that drat-trim can verify end-to-end against the
 /// pre-cardinality CNF.
