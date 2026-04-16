@@ -12,6 +12,7 @@
 pub mod types;
 pub mod dimacs;
 pub mod constraint;
+pub mod algebra;
 pub mod augmentation;
 pub mod proof;
 pub mod backend;
