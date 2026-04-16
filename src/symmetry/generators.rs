@@ -116,6 +116,24 @@ impl Permutation {
         false
     }
 
+    /// Compose two permutations: `self ∘ other` means "apply other first,
+    /// then self." I.e., `(self.compose(other)).apply_lit(l) ==
+    /// self.apply_lit(other.apply_lit(l))`.
+    pub fn compose(&self, other: &Self) -> Self {
+        assert_eq!(self.n_vars, other.n_vars);
+        let n = self.n_vars;
+        let mut image = vec![0i32; n as usize + 1];
+        image[0] = 0;
+        for v in 1..=n {
+            // other maps +v to some signed literal; self maps that further.
+            let intermediate = other.apply_var(v);
+            let result = self.apply_lit(intermediate);
+            // result is the signed image of +v under (self ∘ other).
+            image[v as usize] = result;
+        }
+        Self { image, n_vars: n }
+    }
+
     /// Apply this permutation elementwise to every literal in a clause,
     /// returning the image clause. Invariants: the image clause has the
     /// same length, and `apply_clause(¬C) = ¬apply_clause(C)` literal-by-

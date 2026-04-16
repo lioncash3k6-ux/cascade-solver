@@ -15,6 +15,7 @@ pub mod lex;
 pub mod online;
 pub mod proof;
 pub mod satsuma;
+pub mod schreier_sims;
 
 pub use generators::{parse_veripb_proof, GeneratorSet, Permutation};
 pub use lex::{CmpStatus, Lbool, LexComparator, StepOutcome};
