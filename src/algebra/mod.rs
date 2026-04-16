@@ -36,7 +36,9 @@
 pub mod poly;
 pub mod ns;
 pub mod tseitin;
+pub mod propagator;
 
 pub use poly::{Monomial, Poly, F2};
 pub use ns::{find_ns_certificate, NsResult, NsCertificate};
 pub use tseitin::tseitin_encode_certificate;
+pub use propagator::AlgebraicPropagator;
