@@ -68,6 +68,7 @@ fn main() -> ExitCode {
     let mut use_biclique = false;
     let mut online_sym = false;
     let mut alg_preprocess_degree: Option<usize> = None;
+    let mut alg_propagate = false;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
     let mut cnc_threads: u32 = 0;
@@ -143,6 +144,10 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
                 i += 2;
+            }
+            "--alg-propagate" => {
+                alg_propagate = true;
+                i += 1;
             }
             "--cnc" => {
                 use_cnc = true;
@@ -1012,7 +1017,22 @@ fn main() -> ExitCode {
                         let mut comp = CompositePropagator::new();
                         comp.push(Box::new(prop));
                         comp.push(Box::new(sym));
-                        // Union of observed vars (both observe 1..=nvars).
+                        if alg_propagate {
+                            let orig_clauses: Vec<Vec<i32>> = cnf
+                                .clauses
+                                .iter()
+                                .map(|c| c.lits().iter().map(|l| l.raw()).collect())
+                                .collect();
+                            let alg = cascade::algebra::AlgebraicPropagator::new(
+                                orig_clauses,
+                                cnf.nvars as u32,
+                            );
+                            println!(
+                                "c [alg-prop] wired into composite bus (fire every N levels)"
+                            );
+                            comp.push(Box::new(alg));
+                        }
+                        // Union of observed vars.
                         let mut comp_observed: Vec<i32> = observed.clone();
                         for v in &sym_observed {
                             if !comp_observed.contains(v) {
@@ -1029,6 +1049,22 @@ fn main() -> ExitCode {
                         solver.connect_propagator(Box::new(prop), &observed);
                     }
                 }
+            } else if alg_propagate {
+                // --alg-propagate without --online-sym: biclique + alg.
+                let mut comp = CompositePropagator::new();
+                comp.push(Box::new(prop));
+                let orig_clauses: Vec<Vec<i32>> = cnf
+                    .clauses
+                    .iter()
+                    .map(|c| c.lits().iter().map(|l| l.raw()).collect())
+                    .collect();
+                let alg = cascade::algebra::AlgebraicPropagator::new(
+                    orig_clauses,
+                    cnf.nvars as u32,
+                );
+                println!("c [alg-prop] wired into composite bus (biclique + alg)");
+                comp.push(Box::new(alg));
+                solver.connect_propagator(Box::new(comp), &observed);
             } else {
                 solver.connect_propagator(Box::new(prop), &observed);
             }

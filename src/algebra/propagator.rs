@@ -95,14 +95,18 @@ struct PendingClause {
 
 impl AlgebraicPropagator {
     pub fn new(cnf: Vec<Vec<i32>>, n_vars: u32) -> Self {
+        // Conservative defaults: NS probes add real cost (~ms to seconds
+        // depending on instance size and degree). Default is "rarely and
+        // shallowly" so enabling `--alg-propagate` doesn't blow up small
+        // instances. Tune via env vars on workloads that need it.
         let fire_every: u64 = std::env::var("CASCADE_ALG_FIRE_EVERY")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+            .unwrap_or(512);
         let max_degree: usize = std::env::var("CASCADE_ALG_MAX_DEGREE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+            .unwrap_or(2);
         Self::new_with_config(cnf, n_vars, fire_every, max_degree)
     }
 
