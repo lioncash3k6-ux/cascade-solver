@@ -67,6 +67,7 @@ fn main() -> ExitCode {
     let mut certified = false;
     let mut use_biclique = false;
     let mut online_sym = false;
+    let mut alg_preprocess_degree: Option<usize> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
     let mut cnc_threads: u32 = 0;
@@ -130,6 +131,18 @@ fn main() -> ExitCode {
             "--online-sym" => {
                 online_sym = true;
                 i += 1;
+            }
+            "--alg-preprocess" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--alg-preprocess needs a degree");
+                    return ExitCode::from(2);
+                }
+                alg_preprocess_degree = args[i + 1].parse().ok();
+                if alg_preprocess_degree.is_none() {
+                    eprintln!("--alg-preprocess degree must be an integer");
+                    return ExitCode::from(2);
+                }
+                i += 2;
             }
             "--cnc" => {
                 use_cnc = true;
@@ -200,6 +213,59 @@ fn main() -> ExitCode {
         cnf.clauses.len(),
         if certified { " [CERTIFIED MODE]" } else { "" }
     );
+
+    // === Stage 0: Algebraic preprocess (GAPS leg 4) ===
+    //
+    // If `--alg-preprocess D` was specified, attempt a degree-D
+    // Nullstellensatz-lite refutation over 𝔽₂ before running CDCL. If
+    // a certificate is found, the instance is UNSAT; short-circuit.
+    // If not, fall through to normal solving.
+    //
+    // Degree d is the total degree of `∑ pᵢ · Pᵢ ≡ 1`. Memory cost is
+    // ≈ n_unknowns * n_monomials bits; keep d small for large n.
+    if let Some(d) = alg_preprocess_degree {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let clause_vecs: Vec<Vec<i32>> = cnf
+            .clauses
+            .iter()
+            .map(|c| c.lits().iter().map(|l| l.raw()).collect())
+            .collect();
+        println!(
+            "c [alg] Nullstellensatz-lite probe: n_vars={} n_clauses={} degree={}",
+            cnf.nvars,
+            clause_vecs.len(),
+            d
+        );
+        match cascade::algebra::find_ns_certificate(&clause_vecs, cnf.nvars as u32, d) {
+            cascade::algebra::NsResult::Unsat(cert) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let n_clauses_used = cert.terms.len();
+                // Verify the certificate before trusting it.
+                if cascade::algebra::ns::verify_certificate(&cert, &clause_vecs) {
+                    println!(
+                        "c [alg] found degree-{} certificate in {:.3}s, {} clause(s) involved — \
+                         UNSAT",
+                        d, elapsed, n_clauses_used
+                    );
+                    println!("s UNSATISFIABLE");
+                    return ExitCode::from(20);
+                } else {
+                    eprintln!(
+                        "c [alg] WARNING: find_ns_certificate returned a cert that failed \
+                         verification (internal inconsistency); ignoring and continuing"
+                    );
+                }
+            }
+            cascade::algebra::NsResult::NoCertificate => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                println!(
+                    "c [alg] no degree-{} certificate found in {:.3}s — falling through to CDCL",
+                    d, elapsed
+                );
+            }
+        }
+    }
 
     // === Stage 1: Symmetry breaking via satsuma ===
     let mut effective_cnf: PathBuf = input.clone();
