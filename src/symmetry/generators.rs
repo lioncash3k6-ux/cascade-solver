@@ -116,6 +116,14 @@ impl Permutation {
         false
     }
 
+    /// Apply this permutation elementwise to every literal in a clause,
+    /// returning the image clause. Invariants: the image clause has the
+    /// same length, and `apply_clause(¬C) = ¬apply_clause(C)` literal-by-
+    /// literal. Used for orbit-closed learning (RFC-0002).
+    pub fn apply_clause(&self, clause: &[i32]) -> Vec<i32> {
+        clause.iter().map(|&l| self.apply_lit(l)).collect()
+    }
+
     /// Compute the inverse permutation.
     ///
     /// For a permutation where `apply_var(v)` returns the forward image
@@ -354,6 +362,19 @@ mod tests {
         assert!(!p.is_identity());
         assert_eq!(p.support(), vec![1, 2]);
         assert!(!p.has_polarity_flip());
+    }
+
+    #[test]
+    fn apply_clause_preserves_length_and_signs() {
+        // Swap (1 2)(3 4). Clause [-1, 3, -4] → [-2, 4, -3].
+        let p = Permutation::from_mapping(4, &[(1, 2), (2, 1), (3, 4), (4, 3)]);
+        assert_eq!(p.apply_clause(&[-1, 3, -4]), vec![-2, 4, -3]);
+        // Polarity-flip generator: x_i -> ~x_i. Clause [+1, -2] → [-1, +2].
+        let pf = Permutation::from_mapping(2, &[(1, -1), (2, -2)]);
+        assert_eq!(pf.apply_clause(&[1, -2]), vec![-1, 2]);
+        // Fixed-point identity returns input.
+        let id = Permutation::identity(5);
+        assert_eq!(id.apply_clause(&[1, -2, 3]), vec![1, -2, 3]);
     }
 
     #[test]

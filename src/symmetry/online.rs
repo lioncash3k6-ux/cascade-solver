@@ -72,6 +72,14 @@ pub struct SymmetryPropagator {
     /// every blocking/propagation clause is logged with its witnessing
     /// generator index for later VeriPB `red` emission.
     proof_log: Option<Arc<Mutex<SymProofLog>>>,
+    /// Orbit-closed clause learning cap (RFC-0002). When > 0, every
+    /// blocking/propagation clause our propagator emits is amplified
+    /// by computing its images under the first `orbit_closure_k`
+    /// generators and enqueuing each. Each image is sound (same
+    /// soundness argument as the original, with its own generator as
+    /// witness). 0 disables. Controlled by `CASCADE_SYM_ORBIT_K` env
+    /// var (default 0 for now — tune empirically per instance).
+    orbit_closure_k: usize,
 
     /// Assignment mirror. Index 0 is padding; indices 1..=n_vars valid.
     assign: Vec<Lbool>,
@@ -98,6 +106,7 @@ pub struct Stats {
     pub assignments_processed: u64,
     pub conflicts_emitted: u64,
     pub propagations_emitted: u64,
+    pub orbit_images_emitted: u64,
     pub violations_by_gen: Vec<u64>,
     pub propagations_by_gen: Vec<u64>,
 }
@@ -126,6 +135,10 @@ impl SymmetryPropagator {
         let violations_enabled = std::env::var("CASCADE_SYM_NO_VIOLATIONS")
             .map(|v| v.is_empty() || v == "0")
             .unwrap_or(true);
+        let orbit_closure_k: usize = std::env::var("CASCADE_SYM_ORBIT_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             gen_set,
             ordering,
@@ -133,6 +146,7 @@ impl SymmetryPropagator {
             propagation_enabled,
             violations_enabled,
             proof_log: None,
+            orbit_closure_k,
             assign: vec![Lbool::Undef; n_vars as usize + 1],
             trail: Vec::new(),
             level_start: Vec::new(),
@@ -166,6 +180,98 @@ impl SymmetryPropagator {
     /// composing the final VeriPB proof.
     pub fn generators(&self) -> &[Permutation] {
         &self.gen_set.gens
+    }
+
+    /// Orbit-closed amplification (RFC-0002 first attempt — **currently
+    /// UNSOUND, DISABLED BY DEFAULT**).
+    ///
+    /// The naive claim "if `F` implies `C` via symmetry witness `g_i`,
+    /// then `F` implies `g_j(C)` via witness `g_j`" does NOT hold in
+    /// general. The red rule's soundness depends on the specific
+    /// structure of the lex-comparison at a specific position under
+    /// the witnessing generator — not just on F being G-invariant.
+    /// Applying a different generator `g_j` to the literals of `C`
+    /// produces a clause whose red justification requires a different
+    /// (possibly non-trivial) witness.
+    ///
+    /// Empirical confirmation: `CASCADE_SYM_ORBIT_K=20` on R(4,4)/K_17
+    /// (SAT) returns false UNSAT in 163 conflicts.
+    ///
+    /// The infrastructure stays in place for future research: with a
+    /// correct witness construction (e.g., stabilizer-chain derivation)
+    /// this code path can be re-enabled. Default `orbit_closure_k=0`
+    /// is a no-op.
+    fn amplify_via_orbit(&mut self, source: &[i32], source_gen_idx: usize) {
+        if self.orbit_closure_k == 0 {
+            return;
+        }
+        let k = self.orbit_closure_k.min(self.gen_set.gens.len());
+        let mut seen: HashSet<Vec<i32>> = HashSet::new();
+        seen.insert({
+            let mut canon = source.to_vec();
+            canon.sort();
+            canon
+        });
+        for j in 0..k {
+            if j == source_gen_idx {
+                continue;
+            }
+            let g_j = &self.gen_set.gens[j];
+            let image = g_j.apply_clause(source);
+            let mut canon = image.clone();
+            canon.sort();
+            if !seen.insert(canon) {
+                continue; // duplicate orbit image
+            }
+            if image.is_empty() {
+                continue;
+            }
+            // CaDiCaL's external-clause handler requires that the
+            // propagated lit be the ONLY non-False lit in the clause
+            // (every other lit must be False; otherwise `val(pos1) < 0`
+            // asserts). So:
+            //   * Count currently-True lits. If any, the clause is
+            //     already satisfied OR has multiple watches we can't
+            //     maintain — skip.
+            //   * Count Undef lits. If 0 → every lit is False → pure
+            //     conflict, pick any lit. If 1 → unit-propagation case,
+            //     pick that Undef lit. If ≥2 → underdetermined; CaDiCaL
+            //     can't use it as a reason cleanly, skip.
+            let mut true_count = 0usize;
+            let mut undef_lits: Vec<i32> = Vec::new();
+            for &l in &image {
+                match lit_value(l, &self.assign) {
+                    Lbool::True => true_count += 1,
+                    Lbool::Undef => undef_lits.push(l),
+                    Lbool::False => {}
+                }
+            }
+            if true_count > 0 {
+                continue; // already satisfied — skip
+            }
+            let propagated: i32 = match undef_lits.len() {
+                0 => *image.last().unwrap(), // pure conflict
+                1 => undef_lits[0],          // unit propagation
+                _ => continue,               // underdetermined
+            };
+            let mut reason = vec![propagated];
+            for &l in &image {
+                if l != propagated {
+                    reason.push(l);
+                }
+            }
+            if let Some(log) = &self.proof_log {
+                if let Ok(mut g) = log.lock() {
+                    g.push(image.clone(), j);
+                }
+            }
+            self.pending.push(PendingConflict {
+                lit: propagated,
+                clause: reason,
+                gen_idx: j,
+            });
+            self.stats.orbit_images_emitted += 1;
+        }
     }
 
     /// All variables this propagator needs notifications for.
@@ -294,9 +400,6 @@ impl SymmetryPropagator {
                         if blocking.is_empty() {
                             break;
                         }
-                        // Log for VeriPB `red` emission. The witness is
-                        // the comparator's generator (not the reordering
-                        // of the clause below).
                         let gen_idx_for_log = self.comparators[idx].gen_idx;
                         if let Some(log) = &self.proof_log {
                             if let Ok(mut g) = log.lock() {
@@ -315,6 +418,8 @@ impl SymmetryPropagator {
                             clause: reason,
                             gen_idx: idx,
                         });
+                        // RFC-0002: orbit-closed amplification.
+                        self.amplify_via_orbit(&blocking, gen_idx_for_log);
                         break;
                     }
                     StepOutcome::Propagate(lit) => {
@@ -329,9 +434,11 @@ impl SymmetryPropagator {
                             }
                             self.pending.push(PendingConflict {
                                 lit,
-                                clause: reason,
+                                clause: reason.clone(),
                                 gen_idx: idx,
                             });
+                            // RFC-0002: orbit-closed amplification.
+                            self.amplify_via_orbit(&reason, gen_idx_for_log);
                         }
                         break;
                     }
@@ -477,11 +584,14 @@ impl Drop for SymmetryPropagator {
     fn drop(&mut self) {
         if std::env::var("CASCADE_SYM_STATS").is_ok() {
             eprintln!(
-                "c [sym-stats] assignments={} propagations={} conflicts={} prop_enabled={}",
+                "c [sym-stats] assignments={} propagations={} conflicts={} orbit_images={} \
+                 prop_enabled={} orbit_k={}",
                 self.stats.assignments_processed,
                 self.stats.propagations_emitted,
                 self.stats.conflicts_emitted,
-                self.propagation_enabled
+                self.stats.orbit_images_emitted,
+                self.propagation_enabled,
+                self.orbit_closure_k,
             );
             let top_violators: Vec<(usize, u64)> = self.stats.violations_by_gen
                 .iter().enumerate().map(|(i, &c)| (i, c))
