@@ -69,6 +69,8 @@ fn main() -> ExitCode {
     let mut online_sym = false;
     let mut alg_preprocess_degree: Option<usize> = None;
     let mut alg_propagate = false;
+    let mut alg_prime: u8 = 2;
+    let mut alg_php_functional: Option<(u32, u32)> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
     let mut cnc_threads: u32 = 0;
@@ -148,6 +150,47 @@ fn main() -> ExitCode {
             "--alg-propagate" => {
                 alg_propagate = true;
                 i += 1;
+            }
+            "--alg-p" => {
+                if i + 1 >= args.len() {
+                    eprintln!("--alg-p needs a small prime (2, 3, 5, 7, ...)");
+                    return ExitCode::from(2);
+                }
+                match args[i + 1].parse::<u8>() {
+                    Ok(p) if p >= 2 => {
+                        alg_prime = p;
+                    }
+                    _ => {
+                        eprintln!("--alg-p must be a prime >= 2");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--alg-php" => {
+                // --alg-php P H: treat input as functional PHP_{P,H}.
+                // Uses linear totality + AMO axioms + orbit-reduced 𝔽_p search
+                // (requires --alg-p with p prime, p ∤ P!·H!).
+                if i + 2 >= args.len() {
+                    eprintln!("--alg-php needs P and H (e.g. --alg-php 5 4)");
+                    return ExitCode::from(2);
+                }
+                let pp: u32 = match args[i + 1].parse() {
+                    Ok(v) if v >= 2 => v,
+                    _ => {
+                        eprintln!("--alg-php: P must be >= 2");
+                        return ExitCode::from(2);
+                    }
+                };
+                let hh: u32 = match args[i + 2].parse() {
+                    Ok(v) if v >= 1 => v,
+                    _ => {
+                        eprintln!("--alg-php: H must be >= 1");
+                        return ExitCode::from(2);
+                    }
+                };
+                alg_php_functional = Some((pp, hh));
+                i += 3;
             }
             "--cnc" => {
                 use_cnc = true;
@@ -231,17 +274,87 @@ fn main() -> ExitCode {
     if let Some(d) = alg_preprocess_degree {
         use std::time::Instant;
         let t0 = Instant::now();
+
+        // Path A: --alg-php P H → functional PHP axioms + orbit-reduced 𝔽_p.
+        // This is the session-17 breakthrough path.
+        if let Some((pp, hh)) = alg_php_functional {
+            println!(
+                "c [alg] functional PHP_{{{},{}}} orbit-reduced 𝔽_{} probe: degree={}",
+                pp, hh, alg_prime, d
+            );
+            let php = cascade::algebra::php_orbit::Php::new(pp, hh);
+            let res = cascade::algebra::php_orbit::find_php_functional_orbit_cert_fp(
+                &php, d, alg_prime,
+            );
+            let elapsed = t0.elapsed().as_secs_f64();
+            match res {
+                Some(mults) => {
+                    println!(
+                        "c [alg] orbit 𝔽_{} cert at degree {} in {:.3}s, {} axioms — UNSAT",
+                        alg_prime,
+                        d,
+                        elapsed,
+                        mults.len()
+                    );
+                    println!("s UNSATISFIABLE");
+                    return ExitCode::from(20);
+                }
+                None => {
+                    println!(
+                        "c [alg] no orbit 𝔽_{} cert at degree {} in {:.3}s — falling through",
+                        alg_prime, d, elapsed
+                    );
+                }
+            }
+            return ExitCode::from(0);
+        }
+
         let clause_vecs: Vec<Vec<i32>> = cnf
             .clauses
             .iter()
             .map(|c| c.lits().iter().map(|l| l.raw()).collect())
             .collect();
         println!(
-            "c [alg] Nullstellensatz-lite probe: n_vars={} n_clauses={} degree={}",
+            "c [alg] Nullstellensatz-lite probe: n_vars={} n_clauses={} degree={} field=𝔽_{}",
             cnf.nvars,
             clause_vecs.len(),
-            d
+            d,
+            alg_prime
         );
+
+        // Path B: 𝔽_p dense NS over CNF clauses, p >= 3.
+        if alg_prime > 2 {
+            match cascade::algebra::ns_fp::find_ns_p_certificate(
+                &clause_vecs,
+                cnf.nvars as u32,
+                d,
+                alg_prime,
+            ) {
+                cascade::algebra::NsResult::Unsat(cert) => {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    println!(
+                        "c [alg] 𝔽_{} cert at degree {} in {:.3}s, {} clauses — UNSAT",
+                        alg_prime,
+                        d,
+                        elapsed,
+                        cert.terms.len()
+                    );
+                    println!("s UNSATISFIABLE");
+                    return ExitCode::from(20);
+                }
+                cascade::algebra::NsResult::NoCertificate => {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    println!(
+                        "c [alg] no 𝔽_{} cert at degree {} in {:.3}s — falling through to CDCL",
+                        alg_prime, d, elapsed
+                    );
+                }
+            }
+            // Fall through to normal CDCL.
+        }
+
+        // Path C: 𝔽₂ bit-packed NS (original).
+        if alg_prime == 2 {
         match cascade::algebra::find_ns_certificate(&clause_vecs, cnf.nvars as u32, d) {
             cascade::algebra::NsResult::Unsat(cert) => {
                 let elapsed = t0.elapsed().as_secs_f64();
@@ -269,6 +382,7 @@ fn main() -> ExitCode {
                     d, elapsed
                 );
             }
+        }
         }
     }
 
