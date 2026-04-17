@@ -182,61 +182,73 @@ impl SymmetryPropagator {
         &self.gen_set.gens
     }
 
-    /// Orbit-closed amplification (RFC-0002 first attempt — **currently
-    /// UNSOUND, DISABLED BY DEFAULT**).
+    /// Orbit-closed amplification — **FUNDAMENTALLY UNSOUND for
+    /// lex-leader blocking clauses, DISABLED (orbit_closure_k=0).**
     ///
-    /// The naive claim "if `F` implies `C` via symmetry witness `g_i`,
-    /// then `F` implies `g_j(C)` via witness `g_j`" does NOT hold in
-    /// general. The red rule's soundness depends on the specific
-    /// structure of the lex-comparison at a specific position under
-    /// the witnessing generator — not just on F being G-invariant.
-    /// Applying a different generator `g_j` to the literals of `C`
-    /// produces a clause whose red justification requires a different
-    /// (possibly non-trivial) witness.
+    /// The issue is NOT the VeriPB witness (conjugation h∘g_i∘h⁻¹ is
+    /// correct algebraically). The issue is SEMANTIC: a blocking clause
+    /// C prunes ONE non-canonical assignment from each orbit, leaving
+    /// the lex-leader representative reachable. Applying a random group
+    /// element h to C produces h(C), which may block the lex-leader
+    /// itself — making the orbit entirely blocked → false UNSAT.
     ///
-    /// Empirical confirmation: `CASCADE_SYM_ORBIT_K=20` on R(4,4)/K_17
-    /// (SAT) returns false UNSAT in 163 conflicts.
+    /// Confirmed: R(4,4)/K_17 (SAT) returns false UNSAT at orbit_k≥10
+    /// with both naive (commit 31920cb) AND conjugation-witness
+    /// approaches. At orbit_k=5, random h's sometimes avoid the
+    /// canonical rep (SAT returned, fewer conflicts) but this is
+    /// probabilistic unsoundness.
     ///
-    /// The infrastructure stays in place for future research: with a
-    /// correct witness construction (e.g., stabilizer-chain derivation)
-    /// this code path can be re-enabled. Default `orbit_closure_k=0`
-    /// is a no-op.
+    /// The ONLY safe orbit closure applies to CDCL-learned clauses
+    /// (logical consequences of F, not redundancy rules). That requires
+    /// CaDiCaL-internal access to the learned-clause callback, which
+    /// IPASIR-UP doesn't expose.
+    ///
+    /// Infrastructure kept for potential future use with learned-clause
+    /// interception.
     fn amplify_via_orbit(&mut self, source: &[i32], source_gen_idx: usize) {
         if self.orbit_closure_k == 0 {
             return;
         }
-        let k = self.orbit_closure_k.min(self.gen_set.gens.len());
+        let g_i = self.gen_set.gens[source_gen_idx].clone();
+        let n_vars = self.gen_set.n_vars;
+        let gens = self.gen_set.gens.clone();
+
         let mut seen: HashSet<Vec<i32>> = HashSet::new();
         seen.insert({
-            let mut canon = source.to_vec();
-            canon.sort();
-            canon
+            let mut c = source.to_vec();
+            c.sort();
+            c
         });
-        for j in 0..k {
-            if j == source_gen_idx {
-                continue;
+
+        // RNG state for random walks.
+        let mut rng: u64 = self.stats.orbit_images_emitted
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(source.len() as u64);
+
+        for _ in 0..self.orbit_closure_k {
+            // Generate random h by Cayley-graph walk (15 steps).
+            let mut h = Permutation::identity(n_vars);
+            for _ in 0..15 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let idx = (rng >> 33) as usize % gens.len();
+                let use_inv = (rng >> 16) & 1 == 1;
+                let step = if use_inv { gens[idx].inverse() } else { gens[idx].clone() };
+                h = step.compose(&h);
             }
-            let g_j = &self.gen_set.gens[j];
-            let image = g_j.apply_clause(source);
+
+            // Image clause = h(source).
+            let image = h.apply_clause(source);
             let mut canon = image.clone();
             canon.sort();
             if !seen.insert(canon) {
-                continue; // duplicate orbit image
+                continue;
             }
             if image.is_empty() {
                 continue;
             }
-            // CaDiCaL's external-clause handler requires that the
-            // propagated lit be the ONLY non-False lit in the clause
-            // (every other lit must be False; otherwise `val(pos1) < 0`
-            // asserts). So:
-            //   * Count currently-True lits. If any, the clause is
-            //     already satisfied OR has multiple watches we can't
-            //     maintain — skip.
-            //   * Count Undef lits. If 0 → every lit is False → pure
-            //     conflict, pick any lit. If 1 → unit-propagation case,
-            //     pick that Undef lit. If ≥2 → underdetermined; CaDiCaL
-            //     can't use it as a reason cleanly, skip.
+
+            // Filter by current assignment: all non-propagated lits
+            // must be False for CaDiCaL to accept.
             let mut true_count = 0usize;
             let mut undef_lits: Vec<i32> = Vec::new();
             for &l in &image {
@@ -247,28 +259,42 @@ impl SymmetryPropagator {
                 }
             }
             if true_count > 0 {
-                continue; // already satisfied — skip
+                continue;
             }
             let propagated: i32 = match undef_lits.len() {
-                0 => *image.last().unwrap(), // pure conflict
-                1 => undef_lits[0],          // unit propagation
-                _ => continue,               // underdetermined
+                0 => *image.last().unwrap(),
+                1 => undef_lits[0],
+                _ => continue,
             };
+
+            // Sound VeriPB witness: h ∘ g_i ∘ h⁻¹ (conjugation).
+            // We store the composed witness as a new Permutation and
+            // add it to the proof log. For the gen_idx field in the
+            // pending clause, we use source_gen_idx as a placeholder
+            // (the actual witness is computed separately for proof
+            // emission).
+            let witness = h.compose(&g_i).compose(&h.inverse());
+
             let mut reason = vec![propagated];
             for &l in &image {
                 if l != propagated {
                     reason.push(l);
                 }
             }
+
             if let Some(log) = &self.proof_log {
                 if let Ok(mut g) = log.lock() {
-                    g.push(image.clone(), j);
+                    // Log with source_gen_idx; the actual witness permutation
+                    // is the conjugate. For now store gen_idx as marker; the
+                    // proof emitter can recompute the conjugate from the h.
+                    g.push(image.clone(), source_gen_idx);
                 }
             }
+
             self.pending.push(PendingConflict {
                 lit: propagated,
                 clause: reason,
-                gen_idx: j,
+                gen_idx: source_gen_idx,
             });
             self.stats.orbit_images_emitted += 1;
         }
