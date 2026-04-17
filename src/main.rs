@@ -71,6 +71,7 @@ fn main() -> ExitCode {
     let mut alg_propagate = false;
     let mut alg_prime: u8 = 2;
     let mut alg_php_functional: Option<(u32, u32)> = None;
+    let mut alg_problem: Option<String> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
     let mut cnc_threads: u32 = 0;
@@ -165,6 +166,18 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     }
                 }
+                i += 2;
+            }
+            "--problem" => {
+                // --problem FAMILY[:arg1,arg2,...]
+                // e.g. --problem php:5,4
+                // e.g. --problem ramsey:3,3,6
+                // Generic path: routes through tuple_schema + orbit_ns.
+                if i + 1 >= args.len() {
+                    eprintln!("--problem needs a family spec (e.g. php:5,4)");
+                    return ExitCode::from(2);
+                }
+                alg_problem = Some(args[i + 1].clone());
                 i += 2;
             }
             "--alg-php" => {
@@ -274,6 +287,70 @@ fn main() -> ExitCode {
     if let Some(d) = alg_preprocess_degree {
         use std::time::Instant;
         let t0 = Instant::now();
+
+        // Path 0: --problem FAMILY:args → generic orbit-reduced 𝔽_p.
+        // Routes through tuple_schema + orbit_ns + problems factories.
+        if let Some(spec) = &alg_problem {
+            let (family, rest) = match spec.split_once(':') {
+                Some((f, r)) => (f, r),
+                None => (spec.as_str(), ""),
+            };
+            let args_vec: Vec<u32> = if rest.is_empty() {
+                Vec::new()
+            } else {
+                rest.split(',')
+                    .map(|s| s.parse::<u32>().unwrap_or(0))
+                    .collect()
+            };
+            let (schema, axioms) = match (family, args_vec.as_slice()) {
+                ("php", [pp, hh]) => {
+                    cascade::problems::php_functional(*pp, *hh, alg_prime)
+                }
+                ("ramsey", [s, t, n]) => {
+                    cascade::problems::ramsey_disjunctive(*s, *t, *n, alg_prime)
+                }
+                _ => {
+                    eprintln!(
+                        "--problem: unsupported family '{}' or wrong arg count. \
+                         Supported: php:P,H | ramsey:s,t,n",
+                        family
+                    );
+                    return ExitCode::from(2);
+                }
+            };
+            println!(
+                "c [alg] generic orbit-reduced 𝔽_{} on family '{}' ({} axioms, {} vars), degree={}",
+                alg_prime,
+                family,
+                axioms.len(),
+                schema.n_vars(),
+                d
+            );
+            let res = cascade::algebra::orbit_ns::find_orbit_cert_fp(
+                &schema, &axioms, d, alg_prime,
+            );
+            let elapsed = t0.elapsed().as_secs_f64();
+            match res {
+                Some(mults) => {
+                    println!(
+                        "c [alg] generic orbit 𝔽_{} cert at degree {} in {:.3}s, {} axioms — UNSAT",
+                        alg_prime,
+                        d,
+                        elapsed,
+                        mults.len()
+                    );
+                    println!("s UNSATISFIABLE");
+                    return ExitCode::from(20);
+                }
+                None => {
+                    println!(
+                        "c [alg] generic orbit: no 𝔽_{} cert at degree {} in {:.3}s",
+                        alg_prime, d, elapsed
+                    );
+                    return ExitCode::from(0);
+                }
+            }
+        }
 
         // Path A: --alg-php P H → functional PHP axioms + orbit-reduced 𝔽_p.
         // This is the session-17 breakthrough path.

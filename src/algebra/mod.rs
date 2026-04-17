@@ -39,6 +39,7 @@ pub mod tseitin;
 pub mod propagator;
 pub mod php_orbit;
 pub mod ns_fp;
+pub mod orbit_ns;
 
 pub use poly::{Monomial, Poly, F2};
 pub use ns::{find_ns_certificate, NsResult, NsCertificate};
