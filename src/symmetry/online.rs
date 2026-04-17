@@ -81,12 +81,12 @@ pub struct SymmetryPropagator {
     /// consequence for any h ∈ Aut(F).
     /// Controlled by `CASCADE_SYM_LEARNED_ORBIT_K` env var (default 0).
     learned_orbit_k: usize,
-    /// Symmetry-aware decision guidance via `cb_decide`. When true,
-    /// `decide()` returns the next unassigned variable in the lex-leader
-    /// ordering with canonical (False) polarity, guiding CDCL through
-    /// the canonical search space and eliminating symmetry violations.
-    /// `CASCADE_SYM_DECIDE=1` enables (default 0).
-    decide_enabled: bool,
+    /// Symmetry-aware decision guidance depth. When > 0, `decide()`
+    /// guides the first `decide_depth` ordering positions canonically
+    /// (False polarity), then returns 0 (CaDiCaL uses VSIDS).
+    /// `CASCADE_SYM_DECIDE=N`: N=0 disabled, N=full guidance,
+    /// N<ordering.len() = partial (canonical prefix + VSIDS freedom).
+    decide_depth: usize,
     /// Buffer for the currently-streaming learned clause.
     learned_buf: Vec<i32>,
     /// External clauses waiting to be injected via cb_has_external_clause.
@@ -166,9 +166,10 @@ impl SymmetryPropagator {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let decide_enabled = std::env::var("CASCADE_SYM_DECIDE")
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
+        let decide_depth: usize = std::env::var("CASCADE_SYM_DECIDE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             gen_set,
             ordering,
@@ -178,7 +179,7 @@ impl SymmetryPropagator {
             proof_log: None,
             orbit_closure_k,
             learned_orbit_k,
-            decide_enabled,
+            decide_depth,
             learned_buf: Vec::new(),
             external_queue: Vec::new(),
             external_cursor: 0,
@@ -666,19 +667,15 @@ impl ExternalPropagator for SymmetryPropagator {
     }
 
     fn decide(&mut self) -> i32 {
-        if !self.decide_enabled {
+        if self.decide_depth == 0 {
             return 0;
         }
-        // Walk the lex-leader ordering left-to-right. Return the first
-        // unassigned variable with canonical polarity (False = MIN).
-        //
-        // Empirically validated: simple linear walk + always-False is
-        // the best heuristic. Tested alternatives that performed worse:
-        //   * Max-frontier-coverage: jumps ahead, leaves prefixes
-        //     unsettled, confuses comparators.
-        //   * Adaptive polarity (True when g(v)=True): introduces
-        //     inconsistent signal, breaks CDCL phase saving.
-        for &v in &self.ordering {
+        // Walk the first `decide_depth` ordering positions. Return the
+        // first unassigned with canonical polarity (False = MIN).
+        // Beyond decide_depth, return 0 → CaDiCaL uses VSIDS.
+        let limit = self.decide_depth.min(self.ordering.len());
+        for i in 0..limit {
+            let v = self.ordering[i];
             if v == 0 || v > self.gen_set.n_vars {
                 continue;
             }
