@@ -669,21 +669,24 @@ impl ExternalPropagator for SymmetryPropagator {
         if !self.decide_enabled {
             return 0;
         }
-        // Walk the lex-leader ordering. Return the first unassigned
-        // variable with canonical polarity (False = negative literal
-        // under MIN convention). This guides CDCL through the canonical
-        // search space.
+        // Walk the lex-leader ordering left-to-right. Return the first
+        // unassigned variable with canonical polarity (False = MIN).
+        //
+        // Empirically validated: simple linear walk + always-False is
+        // the best heuristic. Tested alternatives that performed worse:
+        //   * Max-frontier-coverage: jumps ahead, leaves prefixes
+        //     unsettled, confuses comparators.
+        //   * Adaptive polarity (True when g(v)=True): introduces
+        //     inconsistent signal, breaks CDCL phase saving.
         for &v in &self.ordering {
             if v == 0 || v > self.gen_set.n_vars {
                 continue;
             }
             if self.assign[v as usize] == Lbool::Undef {
-                // MIN convention: canonical = lex-smallest. Prefer
-                // False (0) at each position to stay lex-small.
                 return -(v as i32);
             }
         }
-        0 // all assigned; let CaDiCaL decide
+        0
     }
 
     fn has_external_clause(&mut self, is_forgettable: &mut bool) -> bool {
