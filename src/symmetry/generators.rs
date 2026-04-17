@@ -139,7 +139,17 @@ impl Permutation {
     /// same length, and `apply_clause(¬C) = ¬apply_clause(C)` literal-by-
     /// literal. Used for orbit-closed learning (RFC-0002).
     pub fn apply_clause(&self, clause: &[i32]) -> Vec<i32> {
-        clause.iter().map(|&l| self.apply_lit(l)).collect()
+        clause
+            .iter()
+            .map(|&l| {
+                let v = l.unsigned_abs();
+                if v >= 1 && v <= self.n_vars {
+                    self.apply_lit(l)
+                } else {
+                    l // out-of-range vars (aux from card encoding) pass through
+                }
+            })
+            .collect()
     }
 
     /// Compute the inverse permutation.

@@ -72,10 +72,30 @@ public:
     }
 };
 
-/* Opaque handle wraps solver + propagator */
+/* Bridge class: dispatches learned-clause notifications to Rust */
+class FFILearner : public CaDiCaL::Learner {
+    FFIPropagatorVtable *vt;
+
+public:
+    FFILearner(FFIPropagatorVtable *vt) : vt(vt) {}
+
+    bool learning(int size) override {
+        if (vt->cb_learning)
+            return vt->cb_learning(vt->state, size) != 0;
+        return false;
+    }
+
+    void learn(int lit) override {
+        if (vt->cb_learn)
+            vt->cb_learn(vt->state, lit);
+    }
+};
+
+/* Opaque handle wraps solver + propagator + learner */
 struct CaDiCaLSolver {
     CaDiCaL::Solver *solver;
     FFIPropagator *propagator;
+    FFILearner *learner;
 };
 
 extern "C" {
@@ -84,11 +104,16 @@ CaDiCaLSolver *cadical_ffi_new(void) {
     auto *s = new CaDiCaLSolver;
     s->solver = new CaDiCaL::Solver;
     s->propagator = nullptr;
+    s->learner = nullptr;
     return s;
 }
 
 void cadical_ffi_delete(CaDiCaLSolver *s) {
     if (!s) return;
+    if (s->learner) {
+        s->solver->disconnect_learner();
+        delete s->learner;
+    }
     if (s->propagator) {
         s->solver->disconnect_external_propagator();
         delete s->propagator;
@@ -120,6 +145,16 @@ void cadical_ffi_connect_propagator(CaDiCaLSolver *s, FFIPropagatorVtable *vt) {
     }
     s->propagator = new FFIPropagator(vt);
     s->solver->connect_external_propagator(s->propagator);
+
+    /* Also connect a learner if the vtable has cb_learning set */
+    if (vt->cb_learning) {
+        if (s->learner) {
+            s->solver->disconnect_learner();
+            delete s->learner;
+        }
+        s->learner = new FFILearner(vt);
+        s->solver->connect_learner(s->learner);
+    }
 }
 
 void cadical_ffi_disconnect_propagator(CaDiCaLSolver *s) {

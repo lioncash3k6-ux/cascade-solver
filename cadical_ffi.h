@@ -38,6 +38,12 @@ typedef struct {
     ffi_cb_add_external_clause_lit cb_add_external_clause_lit;
     ffi_cb_decide                cb_decide;
     int reasons_forgettable;     /* 0 = non-forgettable (proof-safe) */
+
+    /* Learner callback: notified for every CDCL-learned clause.
+     * cb_learning(state, size) → 1 if interested, 0 to skip.
+     * cb_learn(state, lit) streams lits; 0-terminated. */
+    int  (*cb_learning)(void *state, int size);
+    void (*cb_learn)(void *state, int lit);
 } FFIPropagatorVtable;
 
 /* Solver lifecycle */

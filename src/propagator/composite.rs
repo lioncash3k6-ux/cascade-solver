@@ -132,6 +132,35 @@ impl ExternalPropagator for CompositePropagator {
         }
         true
     }
+
+    fn learning(&mut self, size: i32) -> bool {
+        self.subs.iter_mut().any(|s| s.learning(size))
+    }
+
+    fn learn_clause_lit(&mut self, lit: i32) {
+        for sub in &mut self.subs {
+            sub.learn_clause_lit(lit);
+        }
+    }
+
+    fn has_external_clause(&mut self, is_forgettable: &mut bool) -> bool {
+        for sub in &mut self.subs {
+            if sub.has_external_clause(is_forgettable) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn add_external_clause_lit(&mut self) -> i32 {
+        for sub in &mut self.subs {
+            let lit = sub.add_external_clause_lit();
+            if lit != 0 {
+                return lit;
+            }
+        }
+        0
+    }
 }
 
 #[cfg(test)]

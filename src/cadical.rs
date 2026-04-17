@@ -21,6 +21,8 @@ struct FFIPropagatorVtable {
     cb_add_external_clause_lit: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     cb_decide: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     reasons_forgettable: c_int,
+    cb_learning: Option<unsafe extern "C" fn(*mut c_void, c_int) -> c_int>,
+    cb_learn: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
 }
 
 #[repr(C)]
@@ -70,6 +72,18 @@ pub trait ExternalPropagator {
     fn add_reason_clause_lit(&mut self, propagated_lit: i32) -> i32;
     /// Check if the found model is valid. Return true to accept.
     fn check_found_model(&mut self, model: &[i32]) -> bool;
+
+    /// Learner callback: called for each CDCL-learned clause. Return true
+    /// to receive the clause lits via `learn_clause_lit`.
+    fn learning(&mut self, _size: i32) -> bool { false }
+    /// Receive one literal of a learned clause (0-terminated).
+    fn learn_clause_lit(&mut self, _lit: i32) {}
+
+    /// Does the propagator have an external clause to add? If yes, set
+    /// `is_forgettable` and return true.
+    fn has_external_clause(&mut self, _is_forgettable: &mut bool) -> bool { false }
+    /// Stream one literal of the external clause; return 0 to end.
+    fn add_external_clause_lit(&mut self) -> i32 { 0 }
 }
 
 /// In-process CaDiCaL solver with IPASIR-UP support.
@@ -122,6 +136,34 @@ unsafe extern "C" fn trampoline_cb_check_found_model(
     let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
     let slice = std::slice::from_raw_parts(model, n);
     if prop.check_found_model(slice) { 1 } else { 0 }
+}
+
+unsafe extern "C" fn trampoline_cb_has_external_clause(
+    state: *mut c_void,
+    is_forgettable: *mut c_int,
+) -> c_int {
+    let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
+    let mut forgettable = false;
+    let has = prop.has_external_clause(&mut forgettable);
+    if !is_forgettable.is_null() {
+        *is_forgettable = if forgettable { 1 } else { 0 };
+    }
+    if has { 1 } else { 0 }
+}
+
+unsafe extern "C" fn trampoline_cb_add_external_clause_lit(state: *mut c_void) -> c_int {
+    let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
+    prop.add_external_clause_lit()
+}
+
+unsafe extern "C" fn trampoline_cb_learning(state: *mut c_void, size: c_int) -> c_int {
+    let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
+    if prop.learning(size) { 1 } else { 0 }
+}
+
+unsafe extern "C" fn trampoline_cb_learn(state: *mut c_void, lit: c_int) {
+    let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
+    prop.learn_clause_lit(lit);
 }
 
 impl Solver {
@@ -213,10 +255,12 @@ impl Solver {
             cb_propagate: Some(trampoline_cb_propagate),
             cb_add_reason_clause_lit: Some(trampoline_cb_add_reason_clause_lit),
             cb_check_found_model: Some(trampoline_cb_check_found_model),
-            cb_has_external_clause: None,
-            cb_add_external_clause_lit: None,
+            cb_has_external_clause: Some(trampoline_cb_has_external_clause),
+            cb_add_external_clause_lit: Some(trampoline_cb_add_external_clause_lit),
             cb_decide: None,
             reasons_forgettable: 0, // Non-forgettable = proof-safe
+            cb_learning: Some(trampoline_cb_learning),
+            cb_learn: Some(trampoline_cb_learn),
         });
 
         unsafe {

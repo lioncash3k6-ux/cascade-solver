@@ -72,6 +72,23 @@ pub struct SymmetryPropagator {
     /// every blocking/propagation clause is logged with its witnessing
     /// generator index for later VeriPB `red` emission.
     proof_log: Option<Arc<Mutex<SymProofLog>>>,
+
+    /// Learned-clause orbit closure (RFC-0002, SOUND version).
+    /// When > 0, each CDCL-learned clause is orbit-closed by applying
+    /// `learned_orbit_k` random group elements and injecting the images
+    /// as external clauses. This IS sound because learned clauses are
+    /// logical consequences of F, and h(learned) is also a logical
+    /// consequence for any h ∈ Aut(F).
+    /// Controlled by `CASCADE_SYM_LEARNED_ORBIT_K` env var (default 0).
+    learned_orbit_k: usize,
+    /// Buffer for the currently-streaming learned clause.
+    learned_buf: Vec<i32>,
+    /// External clauses waiting to be injected via cb_has_external_clause.
+    external_queue: Vec<Vec<i32>>,
+    external_cursor: usize,
+    external_lit_cursor: usize,
+    /// RNG state for random group element generation.
+    orbit_rng: u64,
     /// Orbit-closed clause learning cap (RFC-0002). When > 0, every
     /// blocking/propagation clause our propagator emits is amplified
     /// by computing its images under the first `orbit_closure_k`
@@ -139,6 +156,10 @@ impl SymmetryPropagator {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let learned_orbit_k: usize = std::env::var("CASCADE_SYM_LEARNED_ORBIT_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Self {
             gen_set,
             ordering,
@@ -147,6 +168,12 @@ impl SymmetryPropagator {
             violations_enabled,
             proof_log: None,
             orbit_closure_k,
+            learned_orbit_k,
+            learned_buf: Vec::new(),
+            external_queue: Vec::new(),
+            external_cursor: 0,
+            external_lit_cursor: 0,
+            orbit_rng: 0xCAFE_BABE_DEAD_BEEF,
             assign: vec![Lbool::Undef; n_vars as usize + 1],
             trail: Vec::new(),
             level_start: Vec::new(),
@@ -514,10 +541,13 @@ impl ExternalPropagator for SymmetryPropagator {
         for c in &mut self.comparators {
             c.pop_to_level(new_level);
         }
-        // Discard pending — those conflicts were for a now-unreachable
-        // trail.
+        // Discard pending + external queue — those were for a
+        // now-unreachable trail state.
         self.pending.clear();
         self.pending_head = 0;
+        self.external_queue.clear();
+        self.external_cursor = 0;
+        self.external_lit_cursor = 0;
     }
 
     fn propagate(&mut self) -> i32 {
@@ -567,6 +597,83 @@ impl ExternalPropagator for SymmetryPropagator {
             // (e.g., re-queries by CaDiCaL) re-serialize.
             self.reason_cursor.insert(propagated_lit, 0);
             0
+        }
+    }
+
+    fn learning(&mut self, size: i32) -> bool {
+        // Accept learned clauses of reasonable size for orbit closure.
+        if self.learned_orbit_k == 0 {
+            return false;
+        }
+        self.learned_buf.clear();
+        size <= 50 // skip very large clauses — orbit images would be huge
+    }
+
+    fn learn_clause_lit(&mut self, lit: i32) {
+        if self.learned_orbit_k == 0 {
+            return;
+        }
+        if lit == 0 {
+            // Clause complete. Generate orbit images and enqueue.
+            if self.learned_buf.is_empty() {
+                return;
+            }
+            let clause = std::mem::take(&mut self.learned_buf);
+            let gens = &self.gen_set.gens;
+            let n_vars = self.gen_set.n_vars;
+
+            let mut seen: HashSet<Vec<i32>> = HashSet::new();
+            seen.insert({ let mut c = clause.clone(); c.sort(); c });
+
+            for _ in 0..self.learned_orbit_k {
+                // Random group element h via Cayley walk.
+                let mut h = Permutation::identity(n_vars);
+                for _ in 0..12 {
+                    self.orbit_rng = self.orbit_rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let idx = (self.orbit_rng >> 33) as usize % gens.len();
+                    let use_inv = (self.orbit_rng >> 16) & 1 == 1;
+                    let step = if use_inv {
+                        gens[idx].inverse()
+                    } else {
+                        gens[idx].clone()
+                    };
+                    h = step.compose(&h);
+                }
+
+                let image = h.apply_clause(&clause);
+                let mut canon = image.clone();
+                canon.sort();
+                if seen.insert(canon) && !image.is_empty() {
+                    self.external_queue.push(image);
+                    self.stats.orbit_images_emitted += 1;
+                }
+            }
+        } else {
+            self.learned_buf.push(lit);
+        }
+    }
+
+    fn has_external_clause(&mut self, is_forgettable: &mut bool) -> bool {
+        *is_forgettable = true; // forgettable to avoid DB bloat
+        self.external_cursor < self.external_queue.len()
+    }
+
+    fn add_external_clause_lit(&mut self) -> i32 {
+        if self.external_cursor >= self.external_queue.len() {
+            return 0;
+        }
+        let clause = &self.external_queue[self.external_cursor];
+        if self.external_lit_cursor < clause.len() {
+            let lit = clause[self.external_lit_cursor];
+            self.external_lit_cursor += 1;
+            lit
+        } else {
+            // Clause done; advance to next.
+            self.external_cursor += 1;
+            self.external_lit_cursor = 0;
+            0 // 0-terminate this clause
         }
     }
 
