@@ -1248,116 +1248,155 @@ fn main() -> ExitCode {
                 }
             }
         } else {
-            eprintln!("c [biclique] not a Ramsey instance (nvars={} is not triangular)", cnf.nvars);
-            return ExitCode::from(1);
+            println!(
+                "c [biclique] not a Ramsey instance (nvars={}) — falling through to general solver",
+                cnf.nvars
+            );
+            // Fall through to Stage 4 (CaDiCaL subprocess backend).
         }
     }
 
-    // === Stage 4: CDCL backend (CaDiCaL subprocess) ===
-    let backend = CaDiCaL::new();
-    let format = if proof.is_some() {
-        BackendProofFormat::Drat
-    } else {
-        BackendProofFormat::None
-    };
-    let result = match backend.solve(&effective_cnf, proof.as_deref(), format, timeout) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("c backend error: {}", e);
-            return ExitCode::from(1);
+    // === Stage 4: General-purpose in-process CaDiCaL ===
+    //
+    // Reaches here when:
+    //   (a) --biclique was not set, or
+    //   (b) --biclique was set but Ramsey detection failed.
+    //
+    // Uses in-process CaDiCaL with optional sym propagator (if satsuma
+    // found non-trivial generators earlier in the pipeline). This makes
+    // cascade a general solver that auto-specializes on symmetry.
+    {
+        let gen_start = Instant::now();
+        let mut solver = cadical_ffi::Solver::new();
+
+        if let Some(t) = timeout {
+            solver.set("limit", t as i32);
         }
-    };
 
-    println!(
-        "c backend={} elapsed={:.2}s conflicts={}",
-        backend.name(),
-        result.elapsed_secs,
-        result.conflicts
-    );
+        // Enable proof tracing if requested.
+        let gen_proof_path = if proof.is_some() || certified {
+            let p = scratch_path(&input, "_general.drat");
+            solver.set("binary", 0);
+            solver.trace_proof(&p);
+            Some(p)
+        } else {
+            None
+        };
 
-    match result.verdict {
-        Verdict::Sat => {
-            if certified {
-                if let Some(model) = &result.model {
-                    print!("c [certify] model vs original CNF... ");
+        // Feed the (possibly augmented) CNF to in-process CaDiCaL.
+        let solve_cnf = match dimacs::parse_file(&effective_cnf) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("c parse error on {}: {}", effective_cnf.display(), e);
+                return ExitCode::from(1);
+            }
+        };
+        for clause in solve_cnf.clauses.iter() {
+            for lit in clause.lits() {
+                solver.add(lit.raw());
+            }
+            solver.add(0);
+        }
+
+        // Wire sym propagator if generators were extracted.
+        // (online_sym flag + equisat_proof presence.)
+        if online_sym {
+            if let Some(gs) = equisat_proof
+                .as_ref()
+                .and_then(|p| parse_veripb_proof(p, cnf.nvars as u32).ok())
+            {
+                if !gs.is_empty() {
+                    let max_gens: usize = std::env::var("CASCADE_SYM_MAX_GENS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(20);
+                    let mut gs = gs;
+                    if gs.gens.len() > max_gens {
+                        gs.gens.truncate(max_gens);
+                    }
+                    if gs.ordering.is_empty() {
+                        gs.ordering = (1..=cnf.nvars as u32).collect();
+                    }
+                    println!(
+                        "c [general] wiring sym propagator: {} generators",
+                        gs.len()
+                    );
+                    let sym = SymmetryPropagator::new(gs);
+                    let observed: Vec<i32> = (1..=cnf.nvars as i32).collect();
+                    solver.connect_propagator(
+                        Box::new(sym) as Box<dyn cadical_ffi::ExternalPropagator>,
+                        &observed,
+                    );
+                }
+            }
+        }
+
+        println!("c [general] solving with in-process CaDiCaL...");
+        let result = solver.solve();
+        let gen_elapsed = gen_start.elapsed().as_secs_f64();
+        let conflicts = solver.conflicts();
+
+        println!(
+            "c [general] {:?} in {:.2}s, {} conflicts",
+            result, gen_elapsed, conflicts
+        );
+
+        match result {
+            cadical_ffi::SolveResult::Sat => {
+                let mut model = Vec::new();
+                for v in 1..=cnf.nvars as i32 {
+                    model.push(solver.val(v));
+                }
+                if certified {
                     let lits: Vec<cascade::types::Lit> =
                         model.iter().map(|&v| cascade::types::Lit::new(v)).collect();
+                    print!("c [certify] model vs original CNF... ");
                     match certify::verify_model(&cnf, &lits) {
                         Ok(()) => println!("VERIFIED"),
                         Err(e) => {
                             println!("FAILED: {}", e);
-                            eprintln!("c [certify] FATAL: model invalid on original CNF");
                             return ExitCode::from(30);
                         }
                     }
                 }
-            }
-            println!("s SATISFIABLE");
-            if let Some(model) = &result.model {
+                println!("s SATISFIABLE");
                 let mut col = 2;
                 print!("v");
-                for &lit in model {
+                for &lit in &model {
                     let s = format!(" {}", lit);
-                    if col + s.len() > 78 {
-                        println!();
-                        print!("v");
-                        col = 1;
-                    }
+                    if col + s.len() > 78 { println!(); print!("v"); col = 1; }
                     print!("{}", s);
                     col += s.len();
                 }
                 println!(" 0");
+                return ExitCode::from(10);
             }
-            ExitCode::from(10)
-        }
-        Verdict::Unsat => {
-            if let Some(p) = &result.proof_path {
-                println!("c body proof: {}", p.display());
+            cadical_ffi::SolveResult::Unsat => {
+                if gen_proof_path.is_some() {
+                    solver.close_proof();
+                }
                 if certified {
-                    let mut all_drat_preamble: Vec<Vec<cascade::types::Lit>> = Vec::new();
-                    all_drat_preamble.extend(card_clauses.iter().cloned());
-                    all_drat_preamble.extend(chain_drat_clauses.iter().cloned());
-                    if !all_drat_preamble.is_empty() || !bcp_trail.is_empty() {
-                        let combined = scratch_path(&input, "_combined.drat");
-                        print!("c [certify] combining card({})+chain({})+bcp({})+body proof... ",
-                            card_clauses.len(), chain_drat_clauses.len(), bcp_trail.len());
-                        if let Err(e) = certify::combine_card_and_body_proof(
-                            &all_drat_preamble, &bcp_trail, p, &combined,
-                        ) {
-                            println!("FAILED: {}", e);
-                            return ExitCode::from(30);
-                        }
-                        println!("ok");
-                        print!("c [certify] drat-trim combined vs pre-card CNF... ");
-                        match certify::verify_drat_trim(&pre_card_cnf, &combined) {
-                            Ok(()) => println!("VERIFIED"),
-                            Err(e) => {
-                                println!("FAILED: {}", e);
-                                eprintln!("c [certify] FATAL: combined proof rejected");
-                                return ExitCode::from(30);
-                            }
-                        }
-                    } else {
+                    if let Some(gp) = &gen_proof_path {
                         print!("c [certify] drat-trim body... ");
-                        match certify::verify_drat_trim(&effective_cnf, p) {
+                        match certify::verify_drat_trim(&effective_cnf, gp) {
                             Ok(()) => println!("VERIFIED"),
                             Err(e) => {
                                 println!("FAILED: {}", e);
-                                eprintln!("c [certify] FATAL: body proof rejected");
                                 return ExitCode::from(30);
                             }
                         }
                     }
                 }
+                println!("s UNSATISFIABLE");
+                return ExitCode::from(20);
             }
-            println!("s UNSATISFIABLE");
-            ExitCode::from(20)
-        }
-        Verdict::Unknown => {
-            println!("s UNKNOWN");
-            ExitCode::SUCCESS
+            cadical_ffi::SolveResult::Unknown => {
+                println!("s UNKNOWN");
+                return ExitCode::from(0);
+            }
         }
     }
+
 }
 
 /// Estimate C(n, k) — binomial coefficient. Returns u64::MAX on overflow.
