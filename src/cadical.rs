@@ -84,6 +84,11 @@ pub trait ExternalPropagator {
     fn has_external_clause(&mut self, _is_forgettable: &mut bool) -> bool { false }
     /// Stream one literal of the external clause; return 0 to end.
     fn add_external_clause_lit(&mut self) -> i32 { 0 }
+
+    /// Called before each CaDiCaL decision. Return a literal to decide
+    /// on (variable + polarity), or 0 to let CaDiCaL decide. The
+    /// literal must be an observed, currently-unassigned variable.
+    fn decide(&mut self) -> i32 { 0 }
 }
 
 /// In-process CaDiCaL solver with IPASIR-UP support.
@@ -136,6 +141,11 @@ unsafe extern "C" fn trampoline_cb_check_found_model(
     let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
     let slice = std::slice::from_raw_parts(model, n);
     if prop.check_found_model(slice) { 1 } else { 0 }
+}
+
+unsafe extern "C" fn trampoline_cb_decide(state: *mut c_void) -> c_int {
+    let prop = &mut *(state as *mut Box<dyn ExternalPropagator>);
+    prop.decide()
 }
 
 unsafe extern "C" fn trampoline_cb_has_external_clause(
@@ -257,7 +267,7 @@ impl Solver {
             cb_check_found_model: Some(trampoline_cb_check_found_model),
             cb_has_external_clause: Some(trampoline_cb_has_external_clause),
             cb_add_external_clause_lit: Some(trampoline_cb_add_external_clause_lit),
-            cb_decide: None,
+            cb_decide: Some(trampoline_cb_decide),
             reasons_forgettable: 0, // Non-forgettable = proof-safe
             cb_learning: Some(trampoline_cb_learning),
             cb_learn: Some(trampoline_cb_learn),

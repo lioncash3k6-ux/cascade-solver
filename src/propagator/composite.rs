@@ -143,6 +143,16 @@ impl ExternalPropagator for CompositePropagator {
         }
     }
 
+    fn decide(&mut self) -> i32 {
+        for sub in &mut self.subs {
+            let d = sub.decide();
+            if d != 0 {
+                return d;
+            }
+        }
+        0
+    }
+
     fn has_external_clause(&mut self, is_forgettable: &mut bool) -> bool {
         for sub in &mut self.subs {
             if sub.has_external_clause(is_forgettable) {

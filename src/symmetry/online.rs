@@ -81,6 +81,12 @@ pub struct SymmetryPropagator {
     /// consequence for any h ∈ Aut(F).
     /// Controlled by `CASCADE_SYM_LEARNED_ORBIT_K` env var (default 0).
     learned_orbit_k: usize,
+    /// Symmetry-aware decision guidance via `cb_decide`. When true,
+    /// `decide()` returns the next unassigned variable in the lex-leader
+    /// ordering with canonical (False) polarity, guiding CDCL through
+    /// the canonical search space and eliminating symmetry violations.
+    /// `CASCADE_SYM_DECIDE=1` enables (default 0).
+    decide_enabled: bool,
     /// Buffer for the currently-streaming learned clause.
     learned_buf: Vec<i32>,
     /// External clauses waiting to be injected via cb_has_external_clause.
@@ -160,6 +166,9 @@ impl SymmetryPropagator {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let decide_enabled = std::env::var("CASCADE_SYM_DECIDE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
         Self {
             gen_set,
             ordering,
@@ -169,6 +178,7 @@ impl SymmetryPropagator {
             proof_log: None,
             orbit_closure_k,
             learned_orbit_k,
+            decide_enabled,
             learned_buf: Vec::new(),
             external_queue: Vec::new(),
             external_cursor: 0,
@@ -653,6 +663,27 @@ impl ExternalPropagator for SymmetryPropagator {
         } else {
             self.learned_buf.push(lit);
         }
+    }
+
+    fn decide(&mut self) -> i32 {
+        if !self.decide_enabled {
+            return 0;
+        }
+        // Walk the lex-leader ordering. Return the first unassigned
+        // variable with canonical polarity (False = negative literal
+        // under MIN convention). This guides CDCL through the canonical
+        // search space.
+        for &v in &self.ordering {
+            if v == 0 || v > self.gen_set.n_vars {
+                continue;
+            }
+            if self.assign[v as usize] == Lbool::Undef {
+                // MIN convention: canonical = lex-smallest. Prefer
+                // False (0) at each position to stay lex-small.
+                return -(v as i32);
+            }
+        }
+        0 // all assigned; let CaDiCaL decide
     }
 
     fn has_external_clause(&mut self, is_forgettable: &mut bool) -> bool {
