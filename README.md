@@ -30,11 +30,11 @@ checked by veripb + drat-trim.
 Functional-encoding + orbit-reduced NS over 𝔽_p, driven by a generic
 `(TupleVarSchema, axioms)` engine shared with Ramsey:
 
-| Instance | 𝔽₂ / CNF (dense) | 𝔽_p / functional (orbit) |
+| Instance | 𝔽₂ / CNF (dense) | 𝔽_p / functional (orbit) — time / peak RAM |
 |---|---|---|
-| PHP_{5,4} | **OOM** at d=5 | d=5, **0.17s** (𝔽₇) |
-| PHP_{6,5} | OOM | d=6, **1.9s** (𝔽₇) |
-| PHP_{7,6} | OOM | d=7, **238s** (𝔽₁₁) |
+| PHP_{5,4} | **OOM** at d=5 | d=5, **0.17s** / 10 MB (𝔽₇) |
+| PHP_{6,5} | OOM | d=6, **1.9s** / **166 MB** (𝔽₇) |
+| PHP_{7,6} | OOM | d=7, **247s** / **5.0 GB** (𝔽₁₁) |
 
 Key facts:
 
@@ -44,12 +44,26 @@ Key facts:
 * **Prime matters.** When `p ∤ |G| = P!·H!`, G-invariant certs exist.
   When `p | |G|` (e.g., 𝔽₃ on PHP_{5,4} since 3 | 5!), certs exist but are
   non-invariant and orbit reduction fails by returning "no cert".
-* **Engine optimization: 10× across the board.** Three-layer rewrite —
-  index-key pair BFS (`Vec<u32>` replaces `BTreeMap<(usize, Monomial), ...>`),
-  unified per-generator monomial-index action tables, and u128 bitmask
-  monomial representation with bit-OR product / popcount degree. PHP_{6,5}
-  d=6 went from 22s → 1.9s; PHP_{7,6} d=7 moved from OOM-at-600s to a 238s
-  certified UNSAT.
+* **Engine optimization: 10× time, 5× memory.** Combined rewrite of
+  `src/algebra/orbit_ns.rs` in multiple layers:
+  1. **Index-key pair BFS** — `BTreeMap<(usize, Monomial), _>` → `Vec<u32>`
+     keyed by `ai * n_monos + mi`.
+  2. **Unified action tables** — precomputed per-generator monomial-index
+     permutation drives both the monomial-orbit BFS and the unknown-pair BFS.
+  3. **u128 bitmask Monomial** (`MonoBits`) — bit-OR product, popcount degree,
+     bit-scan apply. Zero allocation in hot loop.
+  4. **Bit-packed `pair_visited`** — BFS dedup uses 1 bit/slot, not u32.
+  5. **Fused matrix scatter** — orbits scatter their axiom-term contributions
+     into the matrix as pairs are discovered; only a seed is stored per orbit,
+     members are re-enumerated on demand at cert time.
+  6. **Drop `Vec<Monomial>`** once bits are built; use `bits_to_mono` for
+     cert output.
+  7. **Direct-bits enumeration** — combinatorial walk produces u128 bitmasks
+     directly.
+
+  Result: PHP_{6,5} d=6 went from 22s / 930 MB to **1.9s / 166 MB**;
+  PHP_{7,6} d=7 moved from OOM-at-600s / 13 GB to **247s / 5.0 GB** (5.2×
+  memory reduction from the memory-compression pass alone).
 
 ## GAPS architecture
 
