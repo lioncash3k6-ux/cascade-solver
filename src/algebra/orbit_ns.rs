@@ -193,6 +193,73 @@ fn mod_inv(a: u8, p: u8) -> u8 {
     panic!("no inverse of {} mod {}", a, p);
 }
 
+/// Scatter a single `(axiom_idx, mu_idx)` pair's contribution into the
+/// growing matrix. Each axiom term `(term_bits, coef)` produces the product
+/// `term_bits | mu_bits`; if that monomial is present in the enumeration
+/// AND is the canonical rep of its monomial-orbit, add `coef` to
+/// `matrix[row][col]` (mod p). Extracted from the main BFS so the same
+/// scatter is reused for cert reconstruction.
+#[inline]
+fn scatter_pair(
+    axiom_bits: &[Vec<(MonoBits, u8)>],
+    monos_bits: &[MonoBits],
+    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    mono_orbit_id: &[usize],
+    mono_orbit_rep: &[usize],
+    matrix: &mut [Vec<u8>],
+    ai: u32,
+    mi: u32,
+    col: usize,
+    p: u8,
+) {
+    let mu_bits = monos_bits[mi as usize];
+    for &(term_bits, coef) in &axiom_bits[ai as usize] {
+        let product = term_bits | mu_bits;
+        if let Some(&idx) = bits_index.get(&product) {
+            let row = mono_orbit_id[idx];
+            if idx == mono_orbit_rep[row] {
+                matrix[row][col] = (matrix[row][col] + coef) % p;
+            }
+        }
+    }
+}
+
+/// Re-enumerate the full member list of an unknown-pair orbit starting
+/// from its stored seed pair. Used during certificate reconstruction —
+/// we don't materialize members during the main BFS to keep memory small.
+fn reenumerate_orbit_members(
+    n_monos: usize,
+    axiom_action: &[Vec<usize>],
+    mono_action: &[Vec<u32>],
+    n_axioms: usize,
+    seed: (u32, u32),
+) -> Vec<(u32, u32)> {
+    let total_slots = n_axioms * n_monos;
+    let bv_words = total_slots.div_ceil(64);
+    let mut visited: Vec<u64> = vec![0u64; bv_words];
+    let seed_slot = (seed.0 as usize) * n_monos + seed.1 as usize;
+    visited[seed_slot >> 6] |= 1u64 << (seed_slot & 63);
+    let mut members: Vec<(u32, u32)> = vec![seed];
+    let mut queue: Vec<(u32, u32)> = vec![seed];
+    while let Some((ci, cmi)) = queue.pop() {
+        let ci_u = ci as usize;
+        let cmi_u = cmi as usize;
+        for gi in 0..mono_action.len() {
+            let ni = axiom_action[gi][ci_u] as u32;
+            let nmi = mono_action[gi][cmi_u];
+            let slot = (ni as usize) * n_monos + nmi as usize;
+            let w = slot >> 6;
+            let b = 1u64 << (slot & 63);
+            if visited[w] & b == 0 {
+                visited[w] |= b;
+                members.push((ni, nmi));
+                queue.push((ni, nmi));
+            }
+        }
+    }
+    members
+}
+
 /// Find a G-invariant NS certificate at degree `d` over 𝔽_p for the given
 /// schema + axioms. Returns `axiom_idx → multiplier polynomial` on success.
 ///
@@ -236,6 +303,10 @@ pub fn find_orbit_cert_fp(
     let t0 = std::time::Instant::now();
     let monos_bits: Vec<MonoBits> =
         monos.iter().map(|m| mono_to_bits(m, n)).collect();
+    // Drop the BTreeSet-backed Monomial vector — we keep only the bit-packed
+    // form and reconstruct Monomial via bits_to_mono when the cert is
+    // assembled. For PHP_{8,7} d=7 this alone saves ~20 GB.
+    drop(monos);
     let mut bits_index: std::collections::HashMap<MonoBits, usize> =
         std::collections::HashMap::with_capacity(n_monos);
     for (i, &b) in monos_bits.iter().enumerate() {
@@ -302,16 +373,43 @@ pub fn find_orbit_cert_fp(
         );
     }
 
+    // Precompute axiom terms as (bits, coef) pairs — used by both the BFS
+    // matrix scatter and the cert-reconstruction pass.
+    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms
+        .iter()
+        .map(|a| {
+            a.terms
+                .iter()
+                .map(|(m, c)| (mono_to_bits(m, n), *c))
+                .collect()
+        })
+        .collect();
+
     // Unknown orbits: (axiom_idx, multiplier_mono_idx) pairs under the group.
-    // Key space is axioms.len() × monos.len(); packed as axiom_idx*n_monos + mi.
-    // `pair_orbit[key] = orbit_idx+1` (0 = unvisited) — a single u32 per pair.
+    // Visited-set is bit-packed (1 bit per slot) — for PHP_{7,6} d=7 this
+    // drops the dedup table from 17 GB (Vec<u32>) to ~550 MB. Member lists
+    // are NOT materialized: as each pair is discovered we scatter its
+    // axiom-term contributions straight into the matrix, and we keep only
+    // one canonical seed per orbit for later cert reconstruction.
     let t0 = std::time::Instant::now();
     let axiom_degrees: Vec<usize> = axioms.iter().map(|a| a.degree()).collect();
-    let n_monos = monos.len();
     let n_axioms = axioms.len();
     let total_slots = n_axioms.checked_mul(n_monos).expect("pair table overflow");
-    let mut pair_orbit: Vec<u32> = vec![0u32; total_slots];
-    let mut unknown_orbits: Vec<Vec<(u32, u32)>> = Vec::new();
+    let bv_words = total_slots.div_ceil(64);
+    let mut pair_visited: Vec<u64> = vec![0u64; bv_words];
+    // Seed of each unknown orbit (first pair that started its BFS) — enough
+    // to re-enumerate members on demand during cert reconstruction.
+    let mut unknown_seeds: Vec<(u32, u32)> = Vec::new();
+
+    let n_rows = n_mono_orbits;
+
+    // Matrix grows column-by-column as orbits are discovered. Row-major
+    // storage so Gaussian elimination works unchanged on the final shape.
+    let mut matrix_rows: Vec<Vec<u8>> = (0..n_rows).map(|_| Vec::new()).collect();
+    let mut rhs: Vec<u8> = Vec::new();
+
+    // Counters for timing summary.
+    let mut total_pairs: usize = 0;
 
     for (i, deg_i) in axiom_degrees.iter().enumerate() {
         if *deg_i > d {
@@ -323,14 +421,37 @@ pub fn find_orbit_cert_fp(
             if (bits.count_ones() as usize) > budget {
                 continue;
             }
-            if pair_orbit[base + mi] != 0 {
+            let seed_slot = base + mi;
+            let word = seed_slot >> 6;
+            let bit = 1u64 << (seed_slot & 63);
+            if pair_visited[word] & bit != 0 {
                 continue;
             }
-            let orbit_idx = unknown_orbits.len() as u32;
-            let tag = orbit_idx + 1;
-            pair_orbit[base + mi] = tag;
-            let mut members: Vec<(u32, u32)> = Vec::new();
-            members.push((i as u32, mi as u32));
+            pair_visited[word] |= bit;
+
+            let col = unknown_seeds.len();
+            unknown_seeds.push((i as u32, mi as u32));
+            // Extend matrix with a fresh zero column.
+            for r in matrix_rows.iter_mut() {
+                r.push(0);
+            }
+            rhs.push(0);
+
+            // Scatter seed pair.
+            scatter_pair(
+                &axiom_bits,
+                &monos_bits,
+                &bits_index,
+                &mono_orbit_id,
+                &mono_orbit_rep,
+                &mut matrix_rows,
+                i as u32,
+                mi as u32,
+                col,
+                p,
+            );
+            total_pairs += 1;
+
             let mut queue: Vec<(u32, u32)> = Vec::new();
             queue.push((i as u32, mi as u32));
             while let Some((ci, cmi)) = queue.pop() {
@@ -340,68 +461,56 @@ pub fn find_orbit_cert_fp(
                     let ni = axiom_action[gi][ci_u] as u32;
                     let nmi = mono_action[gi][cmi_u];
                     let slot = (ni as usize) * n_monos + nmi as usize;
-                    if pair_orbit[slot] == 0 {
-                        pair_orbit[slot] = tag;
-                        members.push((ni, nmi));
+                    let w = slot >> 6;
+                    let b = 1u64 << (slot & 63);
+                    if pair_visited[w] & b == 0 {
+                        pair_visited[w] |= b;
+                        scatter_pair(
+                            &axiom_bits,
+                            &monos_bits,
+                            &bits_index,
+                            &mono_orbit_id,
+                            &mono_orbit_rep,
+                            &mut matrix_rows,
+                            ni,
+                            nmi,
+                            col,
+                            p,
+                        );
                         queue.push((ni, nmi));
+                        total_pairs += 1;
                     }
                 }
             }
-            unknown_orbits.push(members);
         }
     }
 
-    let n_rows = n_mono_orbits;
-    let n_cols = unknown_orbits.len();
+    let n_cols = unknown_seeds.len();
     if verbose {
-        let total_members: usize = unknown_orbits.iter().map(|m| m.len()).sum();
         eprintln!(
-            "c [alg-timing] unknown_orbits: {} orbits ({} total (i, mi) pairs) in {:.3}s",
-            n_cols,
-            total_members,
-            t0.elapsed().as_secs_f64()
+            "c [alg-timing] unknown_orbits (fused scatter): {} orbits ({} total (i, mi) pairs) in {:.3}s",
+            n_cols, total_pairs, t0.elapsed().as_secs_f64()
         );
     }
-    drop(pair_orbit); // free before matrix build
+    drop(pair_visited);
     if n_cols == 0 {
         return None;
     }
 
-    // Precompute axiom terms as (bits, coef) pairs — avoids re-converting
-    // Monomial → bits per member during matrix build.
-    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms
-        .iter()
-        .map(|a| {
-            a.terms
-                .iter()
-                .map(|(m, c)| (mono_to_bits(m, n), *c))
-                .collect()
-        })
-        .collect();
-
-    // Dense u8 matrix; last column is RHS. Populated by scattering μ·axiom_i
-    // contributions directly into orbit-representative rows. Entire hot loop
-    // runs in u128 bitmask space — no per-step allocation.
-    let t0 = std::time::Instant::now();
-    let mut matrix: Vec<Vec<u8>> = vec![vec![0u8; n_cols + 1]; n_rows];
-
-    for (col, members) in unknown_orbits.iter().enumerate() {
-        for (ai, mi) in members {
-            let mu_bits = monos_bits[*mi as usize];
-            for &(term_bits, coef) in &axiom_bits[*ai as usize] {
-                let product = term_bits | mu_bits;
-                if let Some(&idx) = bits_index.get(&product) {
-                    let row = mono_orbit_id[idx];
-                    if idx == mono_orbit_rep[row] {
-                        matrix[row][col] = (matrix[row][col] + coef) % p;
-                    }
-                }
-            }
-        }
-    }
+    // RHS: mono_rep[one_orbit] = 1. Place into matrix_rows + rhs.
     let one_idx = bits_index[&0u128];
     let one_orbit = mono_orbit_id[one_idx];
+    rhs[0] = rhs[0]; // keep types stable (no-op)
+    // Build the combined matrix [lhs | rhs] expected by the existing
+    // Gaussian elim (row-major, last column is RHS).
+    let mut matrix: Vec<Vec<u8>> = matrix_rows;
+    for r in 0..n_rows {
+        matrix[r].push(0);
+    }
     matrix[one_orbit][n_cols] = 1;
+    // Dummy use of rhs to silence unused warning — keeps symmetry with the
+    // bookkeeping above and makes it easy to switch to a split layout.
+    let _ = rhs;
     if verbose {
         eprintln!(
             "c [alg-timing] matrix build ({} rows × {} cols): {:.3}s",
@@ -481,17 +590,28 @@ pub fn find_orbit_cert_fp(
         }
     }
 
-    // Reconstruct full cert.
+    // Reconstruct full cert. Member lists were not stored during BFS (to
+    // keep memory small); re-enumerate each selected orbit from its seed.
+    // Only orbits with nonzero solution coefficients are walked.
     let mut mults: BTreeMap<usize, PolyP> = BTreeMap::new();
     for (col, &coef) in solution.iter().enumerate() {
         if coef == 0 {
             continue;
         }
-        for (ai, mi) in &unknown_orbits[col] {
+        let seed = unknown_seeds[col];
+        let members = reenumerate_orbit_members(
+            n_monos,
+            &axiom_action,
+            &mono_action,
+            n_axioms,
+            seed,
+        );
+        for (ai, mi) in &members {
             let entry = mults
                 .entry(*ai as usize)
                 .or_insert_with(|| PolyP::zero(p));
-            let term = PolyP::single(p, monos[*mi as usize].clone(), coef);
+            let mu_mono = bits_to_mono(monos_bits[*mi as usize]);
+            let term = PolyP::single(p, mu_mono, coef);
             entry.add_assign(&term);
         }
     }
