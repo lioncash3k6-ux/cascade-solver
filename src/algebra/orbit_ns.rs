@@ -130,32 +130,40 @@ fn enumerate_bits_up_to(n: u32, d: usize) -> Vec<MonoBits> {
 
 /// Compute G-orbits of monomials from a precomputed per-generator monomial-
 /// index action table. Pure integer BFS — no BTreeMap lookups. Returns
-/// `(orbit_id[i], orbit_rep[o])`.
+/// `(orbit_id[i], orbit_rep[o])`. Uses u32 since n_monos fits comfortably
+/// — saves 4 bytes per monomial vs Vec<usize> (8 GB of the 268M-monomial
+/// scale halved, ~1 GB net at PHP_{8,7} d=7).
 fn monomial_orbits_from_action(
     mono_action: &[Vec<u32>],
     n_monos: usize,
-) -> (Vec<usize>, Vec<usize>) {
-    let mut orbit_id = vec![usize::MAX; n_monos];
-    let mut orbit_rep: Vec<usize> = Vec::new();
+) -> (Vec<u32>, Vec<u32>) {
+    assert!(
+        n_monos <= u32::MAX as usize,
+        "n_monos ({}) exceeds u32 range; widen mono_orbit_id to usize",
+        n_monos
+    );
+    let sentinel = u32::MAX;
+    let mut orbit_id = vec![sentinel; n_monos];
+    let mut orbit_rep: Vec<u32> = Vec::new();
     let mut queue: Vec<u32> = Vec::new();
     for start in 0..n_monos {
-        if orbit_id[start] != usize::MAX {
+        if orbit_id[start] != sentinel {
             continue;
         }
-        let this_orbit = orbit_rep.len();
+        let this_orbit = orbit_rep.len() as u32;
         orbit_id[start] = this_orbit;
-        let mut rep = start;
+        let mut rep = start as u32;
         queue.clear();
         queue.push(start as u32);
         while let Some(i) = queue.pop() {
             for gi in 0..mono_action.len() {
-                let j = mono_action[gi][i as usize] as usize;
-                if orbit_id[j] == usize::MAX {
-                    orbit_id[j] = this_orbit;
+                let j = mono_action[gi][i as usize];
+                if orbit_id[j as usize] == sentinel {
+                    orbit_id[j as usize] = this_orbit;
                     if j < rep {
                         rep = j;
                     }
-                    queue.push(j as u32);
+                    queue.push(j);
                 }
             }
         }
@@ -233,8 +241,8 @@ fn scatter_pair(
     axiom_bits: &[Vec<(MonoBits, u8)>],
     monos_bits: &[MonoBits],
     bits_index: &std::collections::HashMap<MonoBits, usize>,
-    mono_orbit_id: &[usize],
-    mono_orbit_rep: &[usize],
+    mono_orbit_id: &[u32],
+    mono_orbit_rep: &[u32],
     matrix: &mut [Vec<u8>],
     ai: u32,
     mi: u32,
@@ -245,8 +253,8 @@ fn scatter_pair(
     for &(term_bits, coef) in &axiom_bits[ai as usize] {
         let product = term_bits | mu_bits;
         if let Some(&idx) = bits_index.get(&product) {
-            let row = mono_orbit_id[idx];
-            if idx == mono_orbit_rep[row] {
+            let row = mono_orbit_id[idx] as usize;
+            if idx as u32 == mono_orbit_rep[row] {
                 matrix[row][col] = (matrix[row][col] + coef) % p;
             }
         }
@@ -530,7 +538,7 @@ pub fn find_orbit_cert_fp(
     for r in 0..n_rows {
         matrix[r].push(0);
     }
-    matrix[one_orbit][n_cols] = 1;
+    matrix[one_orbit as usize][n_cols] = 1;
     // Dummy use of rhs to silence unused warning — keeps symmetry with the
     // bookkeeping above and makes it easy to switch to a split layout.
     let _ = rhs;
