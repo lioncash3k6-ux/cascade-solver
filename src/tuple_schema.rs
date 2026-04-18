@@ -225,6 +225,29 @@ impl TupleVarSchema {
         }
         Monomial(s)
     }
+
+    /// Precompute the permutation on variables induced by a generator.
+    /// `table[v]` = `g · v` for `v ∈ 1..=n_vars()`. Index 0 is unused.
+    /// Replaces per-call tuple decode/encode in `apply_var` — critical for
+    /// the orbit-NS engine when applying the same generator millions of times.
+    pub fn var_action_table(&self, g: &Generator) -> Vec<u32> {
+        let n = self.n_vars();
+        let mut out = vec![0u32; (n + 1) as usize];
+        for v in 1..=n {
+            out[v as usize] = self.apply_var(v, g);
+        }
+        out
+    }
+
+    /// Apply a precomputed var action table to a monomial. Faster than
+    /// `apply_mono` for repeated use.
+    pub fn apply_mono_table(&self, m: &Monomial, table: &[u32]) -> Monomial {
+        let mut s: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for &v in &m.0 {
+            s.insert(table[v as usize]);
+        }
+        Monomial(s)
+    }
 }
 
 // Token BTreeMap re-export so downstream modules can use it consistently.

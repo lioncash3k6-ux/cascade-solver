@@ -26,7 +26,7 @@ impl fmt::Debug for F2 {
 /// A multilinear monomial: the set of variables in its support. Ordered
 /// (BTreeSet) so monomials are canonical and comparable. Variables are
 /// u32 (DIMACS-style, 1-indexed).
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub struct Monomial(pub BTreeSet<u32>);
 
 impl Monomial {

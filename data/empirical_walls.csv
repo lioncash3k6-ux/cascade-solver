@@ -10,6 +10,9 @@ PHP-functional,P=5;H=4,F7,5,0.250,orbit-reduced-fp,cert,476x speedup vs dense
 PHP-functional,P=5;H=4,F7,5,0.290,orbit-reduced-generic-fp,cert,15% overhead vs PHP-specific
 PHP-functional,P=6;H=5,F5,4,335.000,dense-ns-fp-functional,no-cert,needs higher degree
 PHP-functional,P=6;H=5,F7,6,20.737,orbit-reduced-fp,cert,dense would OOM
+PHP-functional,P=6;H=5,F7,6,1.900,orbit-reduced-generic-fp-bits,cert,u128 bitmask + index-key BFS + HashMap mono_index: 11.6x vs pre-bits
+PHP-functional,P=7;H=6,F11,6,24.846,orbit-reduced-generic-fp-bits,no-cert,needs higher degree (d=7)
+PHP-functional,P=7;H=6,F11,7,237.676,orbit-reduced-generic-fp-bits,cert,previously OOM/timeout; 26GB peak
 PHP-functional,P=10;H=9,F7,3,1045.900,dense-ns-fp-functional,no-cert,blocked by dense matrix scaling
 Ramsey,s=3;t=3;n=6,F7,3,0.001,orbit-reduced-generic-fp,no-cert,Ramsey NS degree is Ω(n); not reachable
 Ramsey,s=4;t=4;n=17,F2,any,,alg-preprocess,no-cert,cb_decide wins instead

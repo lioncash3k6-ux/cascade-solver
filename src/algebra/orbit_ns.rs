@@ -20,6 +20,46 @@ use super::poly::Monomial;
 use crate::tuple_schema::{Generator, TupleVarSchema};
 use std::collections::BTreeMap;
 
+/// Fixed-capacity bitmask monomial representation. Bit `v-1` is set iff
+/// variable `v` is in the monomial support. Keeps the engine in purely
+/// integer arithmetic for monomial operations — no allocation per apply
+/// or multiply.
+///
+/// 128-bit limit matches the u128 primitive. Falls back to the BTreeSet
+/// path above for `n_vars > 128`; this covers PHP up to P·H = 128
+/// (e.g. PHP_{11,11}, PHP_{13,9}) and Ramsey up to n=16 (120 edges).
+type MonoBits = u128;
+
+fn mono_to_bits(m: &Monomial, n: u32) -> MonoBits {
+    debug_assert!(n <= 128);
+    let mut b: MonoBits = 0;
+    for &v in &m.0 {
+        debug_assert!(v >= 1 && v <= n);
+        b |= 1u128 << (v - 1);
+    }
+    b
+}
+
+fn bits_to_mono(mut b: MonoBits) -> Monomial {
+    let mut s = std::collections::BTreeSet::new();
+    while b != 0 {
+        let lo = b.trailing_zeros();
+        s.insert(lo + 1);
+        b &= b - 1;
+    }
+    Monomial(s)
+}
+
+fn apply_bits(mut b: MonoBits, var_table: &[u32]) -> MonoBits {
+    let mut out: MonoBits = 0;
+    while b != 0 {
+        let lo = b.trailing_zeros() as usize;
+        out |= 1u128 << (var_table[lo + 1] - 1);
+        b &= b - 1;
+    }
+    out
+}
+
 /// Enumerate all multilinear monomials of degree exactly `k` over the
 /// variables `1..=n`.
 fn enumerate_of_degree(n: u32, k: usize) -> Vec<Monomial> {
@@ -59,40 +99,34 @@ fn enumerate_up_to(n: u32, d: usize) -> Vec<Monomial> {
     out
 }
 
-/// Compute G-orbits of monomials via BFS over adjacent-transposition
-/// generators. Returns `(orbit_id[i], orbit_rep[o])`.
-fn monomial_orbits(
-    schema: &TupleVarSchema,
-    monomials: &[Monomial],
-    gens: &[Generator],
+/// Compute G-orbits of monomials from a precomputed per-generator monomial-
+/// index action table. Pure integer BFS — no BTreeMap lookups. Returns
+/// `(orbit_id[i], orbit_rep[o])`.
+fn monomial_orbits_from_action(
+    mono_action: &[Vec<u32>],
+    n_monos: usize,
 ) -> (Vec<usize>, Vec<usize>) {
-    let index: BTreeMap<Monomial, usize> = monomials
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, m)| (m, i))
-        .collect();
-    let n = monomials.len();
-    let mut orbit_id = vec![usize::MAX; n];
+    let mut orbit_id = vec![usize::MAX; n_monos];
     let mut orbit_rep: Vec<usize> = Vec::new();
-    for start in 0..n {
+    let mut queue: Vec<u32> = Vec::new();
+    for start in 0..n_monos {
         if orbit_id[start] != usize::MAX {
             continue;
         }
         let this_orbit = orbit_rep.len();
         orbit_id[start] = this_orbit;
         let mut rep = start;
-        let mut queue = vec![start];
+        queue.clear();
+        queue.push(start as u32);
         while let Some(i) = queue.pop() {
-            for g in gens {
-                let img = schema.apply_mono(&monomials[i], g);
-                let j = index[&img];
+            for gi in 0..mono_action.len() {
+                let j = mono_action[gi][i as usize] as usize;
                 if orbit_id[j] == usize::MAX {
                     orbit_id[j] = this_orbit;
                     if j < rep {
                         rep = j;
                     }
-                    queue.push(j);
+                    queue.push(j as u32);
                 }
             }
         }
@@ -169,56 +203,147 @@ pub fn find_orbit_cert_fp(
     d: usize,
     p: u8,
 ) -> Option<BTreeMap<usize, PolyP>> {
+    let verbose = std::env::var("CASCADE_ALG_TIMING").is_ok();
+    let t_total = std::time::Instant::now();
     let n = schema.n_vars();
     let gens = schema.generators();
     if axioms.is_empty() {
         return None;
     }
 
-    // Monomial orbits.
+    assert!(
+        n <= 128,
+        "orbit_ns currently supports up to 128 vars (got {}). Bitmask Monomial \
+         is u128; widen to [u64; 4] for larger families.",
+        n
+    );
+
+    // Monomial enumeration (produces Monomial; converted to bits below).
+    let t0 = std::time::Instant::now();
     let monos = enumerate_up_to(n, d);
-    let mono_index: BTreeMap<Monomial, usize> = monos
+    let n_monos = monos.len();
+    if verbose {
+        eprintln!(
+            "c [alg-timing] enumerate_up_to: {} monomials in {:.3}s",
+            n_monos,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    // Bit-packed monomials + O(1) index. Keeping the engine in u128 space
+    // eliminates per-operation BTreeSet allocations — critical for matrix
+    // build and mono_action, which dominate at higher degree.
+    let t0 = std::time::Instant::now();
+    let monos_bits: Vec<MonoBits> =
+        monos.iter().map(|m| mono_to_bits(m, n)).collect();
+    let mut bits_index: std::collections::HashMap<MonoBits, usize> =
+        std::collections::HashMap::with_capacity(n_monos);
+    for (i, &b) in monos_bits.iter().enumerate() {
+        bits_index.insert(b, i);
+    }
+    if verbose {
+        eprintln!(
+            "c [alg-timing] mono_index build: {:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    // Precompute per-generator var-action tables, then per-generator
+    // monomial-index action tables. Uses u128 bit-apply — no allocation
+    // per image lookup.
+    let t0 = std::time::Instant::now();
+    let var_tables: Vec<Vec<u32>> =
+        gens.iter().map(|g| schema.var_action_table(g)).collect();
+    let mono_action: Vec<Vec<u32>> = var_tables
         .iter()
-        .cloned()
-        .enumerate()
-        .map(|(i, m)| (m, i))
+        .map(|vt| {
+            monos_bits
+                .iter()
+                .map(|&b| {
+                    let img = apply_bits(b, vt);
+                    *bits_index
+                        .get(&img)
+                        .expect("monomial image not in enumeration")
+                        as u32
+                })
+                .collect()
+        })
         .collect();
-    let (mono_orbit_id, mono_orbit_rep) = monomial_orbits(schema, &monos, &gens);
+    if verbose {
+        eprintln!(
+            "c [alg-timing] mono_action table: {} gens × {} monos in {:.3}s",
+            gens.len(),
+            n_monos,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    // Monomial orbits via pure-index BFS using mono_action.
+    let t0 = std::time::Instant::now();
+    let (mono_orbit_id, mono_orbit_rep) =
+        monomial_orbits_from_action(&mono_action, n_monos);
     let n_mono_orbits = mono_orbit_rep.len();
+    if verbose {
+        eprintln!(
+            "c [alg-timing] monomial_orbits: {} orbits from {} monos in {:.3}s",
+            n_mono_orbits,
+            n_monos,
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     // Axiom action under group.
+    let t0 = std::time::Instant::now();
     let axiom_action = axiom_action_table(schema, axioms, &gens);
+    if verbose {
+        eprintln!(
+            "c [alg-timing] axiom_action_table: {:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
-    // Unknown orbits: (axiom_idx, multiplier_monomial) pairs under the group.
+    // Unknown orbits: (axiom_idx, multiplier_mono_idx) pairs under the group.
+    // Key space is axioms.len() × monos.len(); packed as axiom_idx*n_monos + mi.
+    // `pair_orbit[key] = orbit_idx+1` (0 = unvisited) — a single u32 per pair.
+    let t0 = std::time::Instant::now();
     let axiom_degrees: Vec<usize> = axioms.iter().map(|a| a.degree()).collect();
-    let mut unknown_orbits: Vec<Vec<(usize, Monomial)>> = Vec::new();
-    let mut pair_to_orbit: BTreeMap<(usize, Monomial), usize> = BTreeMap::new();
+    let n_monos = monos.len();
+    let n_axioms = axioms.len();
+    let total_slots = n_axioms.checked_mul(n_monos).expect("pair table overflow");
+    let mut pair_orbit: Vec<u32> = vec![0u32; total_slots];
+    let mut unknown_orbits: Vec<Vec<(u32, u32)>> = Vec::new();
 
     for (i, deg_i) in axiom_degrees.iter().enumerate() {
         if *deg_i > d {
             continue;
         }
         let budget = d - deg_i;
-        let mus = enumerate_up_to(n, budget);
-        for mu in mus {
-            let key = (i, mu.clone());
-            if pair_to_orbit.contains_key(&key) {
+        let base = i * n_monos;
+        for (mi, &bits) in monos_bits.iter().enumerate() {
+            if (bits.count_ones() as usize) > budget {
                 continue;
             }
-            let orbit_idx = unknown_orbits.len();
-            let mut members: Vec<(usize, Monomial)> = Vec::new();
-            let mut queue: Vec<(usize, Monomial)> = vec![key.clone()];
-            pair_to_orbit.insert(key.clone(), orbit_idx);
-            members.push(key.clone());
-            while let Some((ci, cmu)) = queue.pop() {
-                for (gi, g) in gens.iter().enumerate() {
-                    let ni = axiom_action[gi][ci];
-                    let nmu = schema.apply_mono(&cmu, g);
-                    let nkey = (ni, nmu);
-                    if !pair_to_orbit.contains_key(&nkey) {
-                        pair_to_orbit.insert(nkey.clone(), orbit_idx);
-                        members.push(nkey.clone());
-                        queue.push(nkey);
+            if pair_orbit[base + mi] != 0 {
+                continue;
+            }
+            let orbit_idx = unknown_orbits.len() as u32;
+            let tag = orbit_idx + 1;
+            pair_orbit[base + mi] = tag;
+            let mut members: Vec<(u32, u32)> = Vec::new();
+            members.push((i as u32, mi as u32));
+            let mut queue: Vec<(u32, u32)> = Vec::new();
+            queue.push((i as u32, mi as u32));
+            while let Some((ci, cmi)) = queue.pop() {
+                let ci_u = ci as usize;
+                let cmi_u = cmi as usize;
+                for gi in 0..gens.len() {
+                    let ni = axiom_action[gi][ci_u] as u32;
+                    let nmi = mono_action[gi][cmi_u];
+                    let slot = (ni as usize) * n_monos + nmi as usize;
+                    if pair_orbit[slot] == 0 {
+                        pair_orbit[slot] = tag;
+                        members.push((ni, nmi));
+                        queue.push((ni, nmi));
                     }
                 }
             }
@@ -228,37 +353,66 @@ pub fn find_orbit_cert_fp(
 
     let n_rows = n_mono_orbits;
     let n_cols = unknown_orbits.len();
+    if verbose {
+        let total_members: usize = unknown_orbits.iter().map(|m| m.len()).sum();
+        eprintln!(
+            "c [alg-timing] unknown_orbits: {} orbits ({} total (i, mi) pairs) in {:.3}s",
+            n_cols,
+            total_members,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    drop(pair_orbit); // free before matrix build
     if n_cols == 0 {
         return None;
     }
 
-    // Dense u8 matrix; last column is RHS.
+    // Precompute axiom terms as (bits, coef) pairs — avoids re-converting
+    // Monomial → bits per member during matrix build.
+    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms
+        .iter()
+        .map(|a| {
+            a.terms
+                .iter()
+                .map(|(m, c)| (mono_to_bits(m, n), *c))
+                .collect()
+        })
+        .collect();
+
+    // Dense u8 matrix; last column is RHS. Populated by scattering μ·axiom_i
+    // contributions directly into orbit-representative rows. Entire hot loop
+    // runs in u128 bitmask space — no per-step allocation.
+    let t0 = std::time::Instant::now();
     let mut matrix: Vec<Vec<u8>> = vec![vec![0u8; n_cols + 1]; n_rows];
 
     for (col, members) in unknown_orbits.iter().enumerate() {
-        // accum = ∑_{(i, μ) ∈ members} μ · axioms[i] — G-invariant.
-        let mut accum = PolyP::zero(p);
-        for (ai, mu) in members {
-            let mu_poly = PolyP::single(p, mu.clone(), 1);
-            let contrib = mu_poly.mul(&axioms[*ai]);
-            accum.add_assign(&contrib);
-        }
-        // Project each G-invariant polynomial onto orbit rows by reading
-        // coefficients at orbit representatives only.
-        for (m, c) in &accum.terms {
-            if let Some(&idx) = mono_index.get(m) {
-                let row = mono_orbit_id[idx];
-                if idx == mono_orbit_rep[row] {
-                    matrix[row][col] = (matrix[row][col] + *c) % p;
+        for (ai, mi) in members {
+            let mu_bits = monos_bits[*mi as usize];
+            for &(term_bits, coef) in &axiom_bits[*ai as usize] {
+                let product = term_bits | mu_bits;
+                if let Some(&idx) = bits_index.get(&product) {
+                    let row = mono_orbit_id[idx];
+                    if idx == mono_orbit_rep[row] {
+                        matrix[row][col] = (matrix[row][col] + coef) % p;
+                    }
                 }
             }
         }
     }
-    let one_idx = mono_index[&Monomial::one()];
+    let one_idx = bits_index[&0u128];
     let one_orbit = mono_orbit_id[one_idx];
     matrix[one_orbit][n_cols] = 1;
+    if verbose {
+        eprintln!(
+            "c [alg-timing] matrix build ({} rows × {} cols): {:.3}s",
+            n_rows,
+            n_cols,
+            t0.elapsed().as_secs_f64()
+        );
+    }
 
     // Gaussian elimination over 𝔽_p.
+    let t0 = std::time::Instant::now();
     let mut pivot_row_of_col: Vec<Option<usize>> = vec![None; n_cols];
     let mut row = 0usize;
     for col in 0..n_cols {
@@ -298,11 +452,24 @@ pub fn find_orbit_cert_fp(
         }
         row += 1;
     }
+    if verbose {
+        eprintln!(
+            "c [alg-timing] gaussian elim: {:.3}s (rank so far {})",
+            t0.elapsed().as_secs_f64(),
+            row
+        );
+    }
 
     // Consistency.
     for r in 0..n_rows {
         let all_zero = matrix[r][..n_cols].iter().all(|&v| v == 0);
         if all_zero && matrix[r][n_cols] != 0 {
+            if verbose {
+                eprintln!(
+                    "c [alg-timing] TOTAL (no cert, inconsistent): {:.3}s",
+                    t_total.elapsed().as_secs_f64()
+                );
+            }
             return None;
         }
     }
@@ -320,21 +487,37 @@ pub fn find_orbit_cert_fp(
         if coef == 0 {
             continue;
         }
-        for (ai, mu) in &unknown_orbits[col] {
-            let entry = mults.entry(*ai).or_insert_with(|| PolyP::zero(p));
-            let term = PolyP::single(p, mu.clone(), coef);
+        for (ai, mi) in &unknown_orbits[col] {
+            let entry = mults
+                .entry(*ai as usize)
+                .or_insert_with(|| PolyP::zero(p));
+            let term = PolyP::single(p, monos[*mi as usize].clone(), coef);
             entry.add_assign(&term);
         }
     }
 
     // Verify.
+    let t0 = std::time::Instant::now();
     let mut acc = PolyP::zero(p);
     for (&ai, mult) in &mults {
         let contrib = mult.mul(&axioms[ai]);
         acc.add_assign(&contrib);
     }
     if !acc.is_one() {
+        if verbose {
+            eprintln!(
+                "c [alg-timing] verify FAILED in {:.3}s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
         return None;
+    }
+    if verbose {
+        eprintln!(
+            "c [alg-timing] verify: {:.3}s | TOTAL {:.3}s",
+            t0.elapsed().as_secs_f64(),
+            t_total.elapsed().as_secs_f64()
+        );
     }
 
     Some(mults)

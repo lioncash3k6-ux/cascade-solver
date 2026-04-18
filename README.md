@@ -25,15 +25,16 @@ checked by veripb + drat-trim.
 - **cascade 18 solved, Kissat 12 solved.**
 - **6 unique cascade wins, 0 unique Kissat wins.**
 
-### Pigeonhole (this session, algebraic engine)
+### Pigeonhole (algebraic engine)
 
-Functional-encoding + orbit-reduced NS over 𝔽_p extends the algebraic reach:
+Functional-encoding + orbit-reduced NS over 𝔽_p, driven by a generic
+`(TupleVarSchema, axioms)` engine shared with Ramsey:
 
-| Instance | 𝔽₂ / CNF (dense) | 𝔽_p / functional (dense) | 𝔽_p / functional (orbit) |
-|---|---|---|---|
-| PHP_{4,3} | d=6, 50ms | d=4, 30ms (𝔽₅) | — |
-| PHP_{5,4} | **OOM** at d=5 | **d=3, 60ms (𝔽₃)** | **d=5, 0.25s (𝔽₇, 480× vs dense)** |
-| PHP_{6,5} | OOM | no cert at d=4 in 335s (𝔽₅) | **d=6, 21s (𝔽₇)** |
+| Instance | 𝔽₂ / CNF (dense) | 𝔽_p / functional (orbit) |
+|---|---|---|
+| PHP_{5,4} | **OOM** at d=5 | d=5, **0.17s** (𝔽₇) |
+| PHP_{6,5} | OOM | d=6, **1.9s** (𝔽₇) |
+| PHP_{7,6} | OOM | d=7, **238s** (𝔽₁₁) |
 
 Key facts:
 
@@ -43,8 +44,12 @@ Key facts:
 * **Prime matters.** When `p ∤ |G| = P!·H!`, G-invariant certs exist.
   When `p | |G|` (e.g., 𝔽₃ on PHP_{5,4} since 3 | 5!), certs exist but are
   non-invariant and orbit reduction fails by returning "no cert".
-* **Orbit reduction gives a 480× speedup on PHP_{5,4}/𝔽₇/d=5 and makes
-  PHP_{6,5}/d=6 tractable where dense OOMs.**
+* **Engine optimization: 10× across the board.** Three-layer rewrite —
+  index-key pair BFS (`Vec<u32>` replaces `BTreeMap<(usize, Monomial), ...>`),
+  unified per-generator monomial-index action tables, and u128 bitmask
+  monomial representation with bit-OR product / popcount degree. PHP_{6,5}
+  d=6 went from 22s → 1.9s; PHP_{7,6} d=7 moved from OOM-at-600s to a 238s
+  certified UNSAT.
 
 ## GAPS architecture
 
@@ -71,9 +76,11 @@ to 270 conflicts.
 CASCADE_SYM_DECIDE=20 cascade input.cnf
 
 # Algebraic preprocessing: degree-D Nullstellensatz-lite over 𝔽_p
-cascade --alg-preprocess 2 input.cnf                     # 𝔽₂, CNF
-cascade --alg-preprocess 4 --alg-p 5 input.cnf           # 𝔽₅, CNF
-cascade --alg-preprocess 5 --alg-p 7 --alg-php 5 4 input.cnf  # functional PHP_{5,4}, orbit 𝔽₇
+cascade --alg-preprocess 2 input.cnf                                  # 𝔽₂, CNF
+cascade --alg-preprocess 4 --alg-p 5 input.cnf                        # 𝔽₅, CNF
+cascade --alg-preprocess 5 --alg-p 7  --problem php:5,4    in.cnf     # generic orbit-reduced 𝔽_p
+cascade --alg-preprocess 7 --alg-p 11 --problem php:7,6    in.cnf     # PHP_{7,6}, ~4min
+cascade --alg-preprocess 3 --alg-p 7  --problem ramsey:3,3,6 in.cnf   # Ramsey smoke test
 
 # Algebraic side-channel on the propagator bus
 cascade --alg-propagate input.cnf
@@ -112,11 +119,14 @@ src/
     schreier_sims.rs      Schreier-Sims stabilizer chain
   propagator/
     composite.rs          multi-propagator bus
+  tuple_schema.rs         generic variable-tuple schema + group action
+  problems.rs             problem-family factories (PHP, Ramsey, …)
   algebra/                GAPS leg 4
     poly.rs               multilinear polynomials over 𝔽₂
     ns.rs                 naive NS over 𝔽₂, bit-packed matrix
-    ns_fp.rs              NS over 𝔽_p (odd prime), functional axioms  ← session
-    php_orbit.rs          orbit-reduced NS over 𝔽₂ (negative result)  ← session
+    ns_fp.rs              NS over 𝔽_p (odd prime), functional axioms
+    orbit_ns.rs           generic orbit-reduced NS engine, u128 bitmask fast path
+    php_orbit.rs          PHP-specific orbit engine (regression baseline)
     tseitin.rs            clause encoding of NS certificates
     propagator.rs         algebraic side-channel propagator
   bcp.rs                  two-watched-literals BCP cascade
