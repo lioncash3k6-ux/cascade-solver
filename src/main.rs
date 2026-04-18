@@ -72,6 +72,7 @@ fn main() -> ExitCode {
     let mut alg_prime: u8 = 2;
     let mut alg_php_functional: Option<(u32, u32)> = None;
     let mut alg_problem: Option<String> = None;
+    let mut alg_cert_path: Option<PathBuf> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
     let mut cnc_threads: u32 = 0;
@@ -178,6 +179,18 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
                 alg_problem = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--alg-cert" => {
+                // --alg-cert <path>: if the algebraic engine finds an NS
+                // certificate, write it to <path> in text format. The file
+                // is independently verifiable by the checker in
+                // algebra::ns_cert (or by `cascade-cert-verify`, once added).
+                if i + 1 >= args.len() {
+                    eprintln!("--alg-cert needs a path");
+                    return ExitCode::from(2);
+                }
+                alg_cert_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
             "--alg-php" => {
@@ -339,6 +352,38 @@ fn main() -> ExitCode {
                         elapsed,
                         mults.len()
                     );
+                    // Emit the certificate to a file if requested. The
+                    // verifier in algebra::ns_cert reads this format and
+                    // re-checks the polynomial identity independently of
+                    // the solver — so a claim of UNSAT here has an
+                    // externally-auditable artifact behind it.
+                    if let Some(path) = &alg_cert_path {
+                        let doc = cascade::algebra::ns_cert::CertDoc::from_solver(
+                            alg_prime,
+                            d,
+                            schema.n_vars(),
+                            axioms.clone(),
+                            &mults,
+                        );
+                        match std::fs::File::create(path) {
+                            Ok(mut f) => match doc.write(&mut f) {
+                                Ok(()) => println!(
+                                    "c [alg-cert] wrote certificate to {}",
+                                    path.display()
+                                ),
+                                Err(e) => eprintln!(
+                                    "c [alg-cert] WARNING failed to write {}: {}",
+                                    path.display(),
+                                    e
+                                ),
+                            },
+                            Err(e) => eprintln!(
+                                "c [alg-cert] WARNING cannot create {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        }
+                    }
                     println!("s UNSATISFIABLE");
                     return ExitCode::from(20);
                 }

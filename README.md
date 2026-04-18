@@ -96,6 +96,11 @@ cascade --alg-preprocess 5 --alg-p 7  --problem php:5,4    in.cnf     # generic 
 cascade --alg-preprocess 7 --alg-p 11 --problem php:7,6    in.cnf     # PHP_{7,6}, ~4min
 cascade --alg-preprocess 3 --alg-p 7  --problem ramsey:3,3,6 in.cnf   # Ramsey smoke test
 
+# Emit the NS certificate and verify it independently.
+cascade --alg-preprocess 5 --alg-p 7 --problem php:5,4 \
+        --alg-cert php_5_4.cert in.cnf     # writes cert on UNSAT
+cascade_cert_verify php_5_4.cert           # independently re-checks the identity
+
 # Algebraic side-channel on the propagator bus
 cascade --alg-propagate input.cnf
 ```
@@ -141,8 +146,11 @@ src/
     ns_fp.rs              NS over 𝔽_p (odd prime), functional axioms
     orbit_ns.rs           generic orbit-reduced NS engine, u128 bitmask fast path
     php_orbit.rs          PHP-specific orbit engine (regression baseline)
+    ns_cert.rs            serializable cert format + standalone verifier
     tseitin.rs            clause encoding of NS certificates
     propagator.rs         algebraic side-channel propagator
+  bin/
+    cascade_cert_verify.rs  standalone binary to re-check any emitted NS cert
   bcp.rs                  two-watched-literals BCP cascade
   cardinality.rs          Sinz-2005 + Ramsey degree bounds
   biclique.rs             K4/K5 biclique group propagation
