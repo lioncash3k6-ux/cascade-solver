@@ -99,6 +99,35 @@ fn enumerate_up_to(n: u32, d: usize) -> Vec<Monomial> {
     out
 }
 
+/// Enumerate multilinear monomials of degree ≤ `d` over `1..=n` directly as
+/// u128 bitmasks, skipping the intermediate `Vec<Monomial>`. For large
+/// monomial counts (PHP_{8,7} d=7 hits ~268M) this avoids a multi-GB
+/// transient allocation of BTreeSet-backed Monomials.
+///
+/// The output is NOT sorted as `Monomial` comparison would sort it —
+/// consumers that need canonical order should use `enumerate_up_to` or
+/// sort separately. The current orbit-NS engine only uses hash-indexed
+/// lookup, so sort order does not matter.
+fn enumerate_bits_up_to(n: u32, d: usize) -> Vec<MonoBits> {
+    fn rec(n: u32, start: u32, k_left: usize, bits: MonoBits, out: &mut Vec<MonoBits>) {
+        if k_left == 0 {
+            out.push(bits);
+            return;
+        }
+        if n + 1 < start || (n - start + 1) < k_left as u32 {
+            return;
+        }
+        for v in start..=n {
+            rec(n, v + 1, k_left - 1, bits | (1u128 << (v - 1)), out);
+        }
+    }
+    let mut out = Vec::new();
+    for k in 0..=d {
+        rec(n, 1, k, 0, &mut out);
+    }
+    out
+}
+
 /// Compute G-orbits of monomials from a precomputed per-generator monomial-
 /// index action table. Pure integer BFS — no BTreeMap lookups. Returns
 /// `(orbit_id[i], orbit_rep[o])`.
@@ -285,28 +314,22 @@ pub fn find_orbit_cert_fp(
         n
     );
 
-    // Monomial enumeration (produces Monomial; converted to bits below).
+    // Direct bit-packed monomial enumeration — skips the intermediate
+    // Vec<Monomial>, which would be a multi-GB transient at PHP_{8,7} scale.
     let t0 = std::time::Instant::now();
-    let monos = enumerate_up_to(n, d);
-    let n_monos = monos.len();
+    let monos_bits: Vec<MonoBits> = enumerate_bits_up_to(n, d);
+    let n_monos = monos_bits.len();
     if verbose {
         eprintln!(
-            "c [alg-timing] enumerate_up_to: {} monomials in {:.3}s",
+            "c [alg-timing] enumerate_bits_up_to: {} monomials in {:.3}s",
             n_monos,
             t0.elapsed().as_secs_f64()
         );
     }
 
-    // Bit-packed monomials + O(1) index. Keeping the engine in u128 space
-    // eliminates per-operation BTreeSet allocations — critical for matrix
-    // build and mono_action, which dominate at higher degree.
+    // Hash-indexed monomial lookup for O(1) image resolution during
+    // mono_action and matrix scatter.
     let t0 = std::time::Instant::now();
-    let monos_bits: Vec<MonoBits> =
-        monos.iter().map(|m| mono_to_bits(m, n)).collect();
-    // Drop the BTreeSet-backed Monomial vector — we keep only the bit-packed
-    // form and reconstruct Monomial via bits_to_mono when the cert is
-    // assembled. For PHP_{8,7} d=7 this alone saves ~20 GB.
-    drop(monos);
     let mut bits_index: std::collections::HashMap<MonoBits, usize> =
         std::collections::HashMap::with_capacity(n_monos);
     for (i, &b) in monos_bits.iter().enumerate() {
