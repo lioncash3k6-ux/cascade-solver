@@ -37,6 +37,14 @@ pub enum TupleKind {
     /// Each variable = an unordered pair `{a, b}` with `a < b`, from a single
     /// base. Variable count = `C(|base|, 2)`.
     UnorderedPair,
+    /// Each variable = an unordered k-subset `{a_1, a_2, ..., a_k}` with
+    /// `a_1 < a_2 < ... < a_k`, from a single base. Variable count =
+    /// `C(|base|, size)`. Must be combined with `GroupSpec::Diagonal`.
+    /// Enables Count_q / mod-q counting principles and k-uniform hypergraph
+    /// families. `size == 2` overlaps with `UnorderedPair` but uses a
+    /// different (colex) ordering; kept separate to avoid perturbing existing
+    /// Ramsey variable ids.
+    UnorderedSubset { size: u32 },
 }
 
 /// Group acting on variables by permuting base elements.
@@ -71,6 +79,15 @@ impl TupleVarSchema {
                 let n = self.bases[0].size;
                 n * (n - 1) / 2
             }
+            TupleKind::UnorderedSubset { size } => {
+                assert_eq!(
+                    self.bases.len(),
+                    1,
+                    "UnorderedSubset requires exactly one base"
+                );
+                let n = self.bases[0].size;
+                binom(n, size)
+            }
         }
     }
 
@@ -101,6 +118,17 @@ impl TupleVarSchema {
                 idx += b - a - 1;
                 idx + 1
             }
+            TupleKind::UnorderedSubset { size } => {
+                assert_eq!(tup.len(), size as usize);
+                let mut sorted: Vec<u32> = tup.to_vec();
+                sorted.sort();
+                // Colex rank: rank({a_1 < a_2 < ... < a_k}) = ∑ C(a_i - 1, i).
+                let mut rank: u32 = 0;
+                for (i, &a) in sorted.iter().enumerate() {
+                    rank += binom(a - 1, (i + 1) as u32);
+                }
+                rank + 1
+            }
         }
     }
 
@@ -128,6 +156,23 @@ impl TupleVarSchema {
                     idx -= width;
                 }
                 unreachable!("UnorderedPair var out of range")
+            }
+            TupleKind::UnorderedSubset { size } => {
+                // Colex rank formula: rank({a_1<...<a_k}) = ∑ C(a_i - 1, i).
+                // Unrank: find largest a ≥ 0 with C(a, i) ≤ rank; then
+                // a_i = a + 1, and recurse on rank − C(a, i) for i−1.
+                let mut rank = v - 1;
+                let mut out = vec![0u32; size as usize];
+                let n = self.bases[0].size;
+                for i in (1..=size).rev() {
+                    let mut a: u32 = 0;
+                    while a + 1 <= n && binom(a + 1, i) <= rank {
+                        a += 1;
+                    }
+                    out[(i - 1) as usize] = a + 1;
+                    rank -= binom(a, i);
+                }
+                out
             }
         }
     }
@@ -165,6 +210,13 @@ impl TupleVarSchema {
         gens
     }
 
+    /// For Diagonal + UnorderedSubset, `Generator::perms` has `bases.len() = 1`
+    /// entry; we use it on every coordinate of the k-tuple. Accessor that
+    /// keeps `apply_var` below readable.
+    fn diagonal_perm<'a>(&self, g: &'a Generator) -> &'a [u32] {
+        &g.perms[0]
+    }
+
     /// Apply generator `g` to variable `v`, returning the new variable id.
     pub fn apply_var(&self, v: u32, g: &Generator) -> u32 {
         let tup = self.tuple_of_var(v);
@@ -179,6 +231,10 @@ impl TupleVarSchema {
                 tup.iter()
                     .map(|&t| g.perms[0][(t - 1) as usize] + 1)
                     .collect()
+            }
+            TupleKind::UnorderedSubset { .. } => {
+                let perm = self.diagonal_perm(g);
+                tup.iter().map(|&t| perm[(t - 1) as usize] + 1).collect()
             }
         };
         self.var_of_tuple(&new_tup)
@@ -252,6 +308,21 @@ impl TupleVarSchema {
 
 // Token BTreeMap re-export so downstream modules can use it consistently.
 pub(crate) type OrbitMap<K, V> = BTreeMap<K, V>;
+
+/// Binomial coefficient C(n, k), saturating to 0 when k > n. Returns u32;
+/// callers of `UnorderedSubset` sizes small enough to not overflow (Count_q
+/// at reasonable n, k ≤ 10 stays well under 2^32).
+pub fn binom(n: u32, k: u32) -> u32 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut out: u64 = 1;
+    for i in 0..k {
+        out = out * (n as u64 - i as u64) / (i as u64 + 1);
+    }
+    out as u32
+}
 
 #[cfg(test)]
 mod tests {
@@ -342,5 +413,64 @@ mod tests {
         let e13 = schema.var_of_tuple(&[1, 3]);
         let e23 = schema.var_of_tuple(&[2, 3]);
         assert_eq!(schema.apply_var(e13, g), e23);
+    }
+
+    #[test]
+    fn unordered_subset_k3_roundtrip() {
+        let schema = TupleVarSchema {
+            bases: vec![BaseSet::new("V", 6)],
+            tuple_kind: TupleKind::UnorderedSubset { size: 3 },
+            group: GroupSpec::Diagonal,
+        };
+        assert_eq!(schema.n_vars(), 20); // C(6, 3)
+        // Every 3-subset round-trips.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for a in 1..=4 {
+            for b in (a + 1)..=5 {
+                for c in (b + 1)..=6 {
+                    let v = schema.var_of_tuple(&[a, b, c]);
+                    assert!(seen.insert(v), "duplicate var {} for {{{},{},{}}}", v, a, b, c);
+                    let t = schema.tuple_of_var(v);
+                    assert_eq!(t, vec![a, b, c]);
+                }
+            }
+        }
+        // All variable ids are present and span 1..=20.
+        assert_eq!(seen.len(), 20);
+        assert_eq!(*seen.iter().min().unwrap(), 1);
+        assert_eq!(*seen.iter().max().unwrap(), 20);
+    }
+
+    #[test]
+    fn unordered_subset_generator_action_sorts() {
+        let schema = TupleVarSchema {
+            bases: vec![BaseSet::new("V", 5)],
+            tuple_kind: TupleKind::UnorderedSubset { size: 3 },
+            group: GroupSpec::Diagonal,
+        };
+        let gens = schema.generators();
+        // Swap vertices 2 and 3: subset {1,2,4} ↔ {1,3,4}.
+        let g = &gens[1]; // swap (2,3)
+        let s124 = schema.var_of_tuple(&[1, 2, 4]);
+        let s134 = schema.var_of_tuple(&[1, 3, 4]);
+        assert_eq!(schema.apply_var(s124, g), s134);
+        // Idempotent on subsets that contain both swapped vertices.
+        let s123 = schema.var_of_tuple(&[1, 2, 3]);
+        assert_eq!(schema.apply_var(s123, g), s123);
+    }
+
+    #[test]
+    fn unordered_subset_input_order_invariant() {
+        // The caller may pass a tuple in any order; `var_of_tuple` sorts.
+        let schema = TupleVarSchema {
+            bases: vec![BaseSet::new("V", 5)],
+            tuple_kind: TupleKind::UnorderedSubset { size: 3 },
+            group: GroupSpec::Diagonal,
+        };
+        let v1 = schema.var_of_tuple(&[3, 1, 2]);
+        let v2 = schema.var_of_tuple(&[1, 2, 3]);
+        let v3 = schema.var_of_tuple(&[2, 3, 1]);
+        assert_eq!(v1, v2);
+        assert_eq!(v1, v3);
     }
 }

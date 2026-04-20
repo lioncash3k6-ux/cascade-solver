@@ -72,6 +72,7 @@ fn main() -> ExitCode {
     let mut alg_prime: u8 = 2;
     let mut alg_php_functional: Option<(u32, u32)> = None;
     let mut alg_problem: Option<String> = None;
+    let mut alg_no_orbit: bool = false;
     let mut alg_cert_path: Option<PathBuf> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
@@ -169,10 +170,20 @@ fn main() -> ExitCode {
                 }
                 i += 2;
             }
+            "--alg-no-orbit" => {
+                // Dense (non-orbit-reduced) NS over 𝔽_p. Needed when the
+                // prime divides |G| — orbit reduction cannot find an
+                // invariant cert there. Required to evaluate Count_q at
+                // p = q, where orbit path is unusable.
+                alg_no_orbit = true;
+                i += 1;
+                continue;
+            }
             "--problem" => {
                 // --problem FAMILY[:arg1,arg2,...]
                 // e.g. --problem php:5,4
                 // e.g. --problem ramsey:3,3,6
+                // e.g. --problem count:n,q
                 // Generic path: routes through tuple_schema + orbit_ns.
                 if i + 1 >= args.len() {
                     eprintln!("--problem needs a family spec (e.g. php:5,4)");
@@ -322,31 +333,59 @@ fn main() -> ExitCode {
                 ("ramsey", [s, t, n]) => {
                     cascade::problems::ramsey_disjunctive(*s, *t, *n, alg_prime)
                 }
+                ("count", [n, q]) => {
+                    cascade::problems::count_q_partition(*n, *q, alg_prime)
+                }
+                ("tseitin-kn", [n]) => {
+                    cascade::problems::tseitin_kn(*n, 1, alg_prime)
+                }
+                ("tseitin-kn", [n, c]) => {
+                    cascade::problems::tseitin_kn(*n, *c as u8, alg_prime)
+                }
+                ("tseitin-cycle", [n]) => {
+                    cascade::problems::tseitin_cycle(*n, 1, alg_prime)
+                }
+                ("tseitin-cycle", [n, c]) => {
+                    cascade::problems::tseitin_cycle(*n, *c as u8, alg_prime)
+                }
+                ("tseitin-petersen", []) => {
+                    let charges = [1u8; 10];
+                    cascade::problems::tseitin_petersen(&charges, alg_prime)
+                }
                 _ => {
                     eprintln!(
                         "--problem: unsupported family '{}' or wrong arg count. \
-                         Supported: php:P,H | ramsey:s,t,n",
+                         Supported: php:P,H | ramsey:s,t,n | count:n,q | \
+                         tseitin-kn:n[,c] | tseitin-cycle:n[,c] | tseitin-petersen",
                         family
                     );
                     return ExitCode::from(2);
                 }
             };
             println!(
-                "c [alg] generic orbit-reduced 𝔽_{} on family '{}' ({} axioms, {} vars), degree={}",
+                "c [alg] {} 𝔽_{} on family '{}' ({} axioms, {} vars), degree={}",
+                if alg_no_orbit { "dense" } else { "generic orbit-reduced" },
                 alg_prime,
                 family,
                 axioms.len(),
                 schema.n_vars(),
                 d
             );
-            let res = cascade::algebra::orbit_ns::find_orbit_cert_fp(
-                &schema, &axioms, d, alg_prime,
-            );
+            let res = if alg_no_orbit {
+                cascade::algebra::ns_fp::find_ns_p_from_axioms(
+                    &axioms, schema.n_vars(), d, alg_prime,
+                )
+            } else {
+                cascade::algebra::orbit_ns::find_orbit_cert_fp(
+                    &schema, &axioms, d, alg_prime,
+                )
+            };
             let elapsed = t0.elapsed().as_secs_f64();
             match res {
                 Some(mults) => {
                     println!(
-                        "c [alg] generic orbit 𝔽_{} cert at degree {} in {:.3}s, {} axioms — UNSAT",
+                        "c [alg] {} 𝔽_{} cert at degree {} in {:.3}s, {} axioms — UNSAT",
+                        if alg_no_orbit { "dense" } else { "generic orbit" },
                         alg_prime,
                         d,
                         elapsed,
@@ -389,7 +428,8 @@ fn main() -> ExitCode {
                 }
                 None => {
                     println!(
-                        "c [alg] generic orbit: no 𝔽_{} cert at degree {} in {:.3}s",
+                        "c [alg] {}: no 𝔽_{} cert at degree {} in {:.3}s",
+                        if alg_no_orbit { "dense" } else { "generic orbit" },
                         alg_prime, d, elapsed
                     );
                     return ExitCode::from(0);

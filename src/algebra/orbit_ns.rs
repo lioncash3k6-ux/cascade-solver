@@ -128,15 +128,21 @@ fn enumerate_bits_up_to(n: u32, d: usize) -> Vec<MonoBits> {
     out
 }
 
-/// Compute G-orbits of monomials from a precomputed per-generator monomial-
-/// index action table. Pure integer BFS — no BTreeMap lookups. Returns
-/// `(orbit_id[i], orbit_rep[o])`. Uses u32 since n_monos fits comfortably
-/// — saves 4 bytes per monomial vs Vec<usize> (8 GB of the 268M-monomial
-/// scale halved, ~1 GB net at PHP_{8,7} d=7).
-fn monomial_orbits_from_action(
-    mono_action: &[Vec<u32>],
-    n_monos: usize,
+/// Compute G-orbits of monomials on-the-fly, without a precomputed
+/// `mono_action[gi][mi]` table. The image of monomial `mi` under generator
+/// `gi` is recomputed as
+/// `bits_index[apply_bits(monos_bits[mi], &var_tables[gi])]`.
+///
+/// Memory win: a full `mono_action` table is `n_gens × n_monos × 4` bytes
+/// (13 × 268M × 4 ≈ 14 GB at PHP_{8,7} d=7). Dropping it leaves only the
+/// `var_tables` (≤ 128 × n_gens × 4 bytes, negligible). The cost is one
+/// `apply_bits` + one hash lookup per visited edge in the BFS.
+fn monomial_orbits_on_the_fly(
+    monos_bits: &[MonoBits],
+    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    var_tables: &[Vec<u32>],
 ) -> (Vec<u32>, Vec<u32>) {
+    let n_monos = monos_bits.len();
     assert!(
         n_monos <= u32::MAX as usize,
         "n_monos ({}) exceeds u32 range; widen mono_orbit_id to usize",
@@ -156,8 +162,12 @@ fn monomial_orbits_from_action(
         queue.clear();
         queue.push(start as u32);
         while let Some(i) = queue.pop() {
-            for gi in 0..mono_action.len() {
-                let j = mono_action[gi][i as usize];
+            let bits_i = monos_bits[i as usize];
+            for vt in var_tables {
+                let img_bits = apply_bits(bits_i, vt);
+                let j = *bits_index
+                    .get(&img_bits)
+                    .expect("monomial image not in enumeration") as u32;
                 if orbit_id[j as usize] == sentinel {
                     orbit_id[j as usize] = this_orbit;
                     if j < rep {
@@ -264,13 +274,17 @@ fn scatter_pair(
 /// Re-enumerate the full member list of an unknown-pair orbit starting
 /// from its stored seed pair. Used during certificate reconstruction —
 /// we don't materialize members during the main BFS to keep memory small.
+/// Monomial images are computed on-the-fly via `var_tables` + `bits_index`;
+/// no precomputed `mono_action` table is required.
 fn reenumerate_orbit_members(
-    n_monos: usize,
+    monos_bits: &[MonoBits],
+    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    var_tables: &[Vec<u32>],
     axiom_action: &[Vec<usize>],
-    mono_action: &[Vec<u32>],
     n_axioms: usize,
     seed: (u32, u32),
 ) -> Vec<(u32, u32)> {
+    let n_monos = monos_bits.len();
     let total_slots = n_axioms * n_monos;
     let bv_words = total_slots.div_ceil(64);
     let mut visited: Vec<u64> = vec![0u64; bv_words];
@@ -281,9 +295,12 @@ fn reenumerate_orbit_members(
     while let Some((ci, cmi)) = queue.pop() {
         let ci_u = ci as usize;
         let cmi_u = cmi as usize;
-        for gi in 0..mono_action.len() {
+        let bits_cmi = monos_bits[cmi_u];
+        for (gi, vt) in var_tables.iter().enumerate() {
             let ni = axiom_action[gi][ci_u] as u32;
-            let nmi = mono_action[gi][cmi_u];
+            let nmi = *bits_index
+                .get(&apply_bits(bits_cmi, vt))
+                .expect("monomial image not in enumeration") as u32;
             let slot = (ni as usize) * n_monos + nmi as usize;
             let w = slot >> 6;
             let b = 1u64 << (slot & 63);
@@ -298,7 +315,10 @@ fn reenumerate_orbit_members(
 }
 
 /// Find a G-invariant NS certificate at degree `d` over 𝔽_p for the given
-/// schema + axioms. Returns `axiom_idx → multiplier polynomial` on success.
+/// schema + axioms. Uses the adjacent-transposition generators implied by
+/// the schema's group spec. See [`find_orbit_cert_fp_with_gens`] for
+/// problems whose symmetry group is a proper subgroup of the schema's
+/// default (e.g. Tseitin on a non-complete graph).
 ///
 /// Precondition: `p ∤ |G|`, otherwise invariant certs may not exist.
 pub fn find_orbit_cert_fp(
@@ -307,10 +327,30 @@ pub fn find_orbit_cert_fp(
     d: usize,
     p: u8,
 ) -> Option<BTreeMap<usize, PolyP>> {
+    let gens = schema.generators();
+    find_orbit_cert_fp_with_gens(schema, axioms, &gens, d, p)
+}
+
+/// Like [`find_orbit_cert_fp`] but uses explicit generators instead of
+/// the schema's default. Required for families whose automorphism group
+/// is a proper subgroup of the schema's natural group (Tseitin on
+/// non-complete graphs: only edge-preserving permutations, not all of
+/// S_n).
+///
+/// The generators must still lie in the schema's group (i.e. each
+/// generator's per-base permutation is a valid permutation of the base).
+/// The engine verifies closure implicitly by building `axiom_action_table`;
+/// a non-closed set panics there.
+pub fn find_orbit_cert_fp_with_gens(
+    schema: &TupleVarSchema,
+    axioms: &[PolyP],
+    gens: &[Generator],
+    d: usize,
+    p: u8,
+) -> Option<BTreeMap<usize, PolyP>> {
     let verbose = std::env::var("CASCADE_ALG_TIMING").is_ok();
     let t_total = std::time::Instant::now();
     let n = schema.n_vars();
-    let gens = schema.generators();
     if axioms.is_empty() {
         return None;
     }
@@ -350,44 +390,32 @@ pub fn find_orbit_cert_fp(
         );
     }
 
-    // Precompute per-generator var-action tables, then per-generator
-    // monomial-index action tables. Uses u128 bit-apply — no allocation
-    // per image lookup.
+    // Precompute per-generator var-action tables only. The full per-
+    // generator monomial-index action table (`mono_action[gi][mi]`) used
+    // to live here; it was dropped because for PHP_{8,7} d=7 it was
+    // `n_gens × n_monos × 4` ≈ 14 GB — the dominant memory cost. Images
+    // are now recomputed inline as `bits_index[apply_bits(monos_bits[mi],
+    // var_tables[gi])]`: `apply_bits` is O(degree) and the hash lookup
+    // we were already doing anyway.
     let t0 = std::time::Instant::now();
     let var_tables: Vec<Vec<u32>> =
         gens.iter().map(|g| schema.var_action_table(g)).collect();
-    let mono_action: Vec<Vec<u32>> = var_tables
-        .iter()
-        .map(|vt| {
-            monos_bits
-                .iter()
-                .map(|&b| {
-                    let img = apply_bits(b, vt);
-                    *bits_index
-                        .get(&img)
-                        .expect("monomial image not in enumeration")
-                        as u32
-                })
-                .collect()
-        })
-        .collect();
     if verbose {
         eprintln!(
-            "c [alg-timing] mono_action table: {} gens × {} monos in {:.3}s",
+            "c [alg-timing] var_tables: {} gens in {:.3}s",
             gens.len(),
-            n_monos,
             t0.elapsed().as_secs_f64()
         );
     }
 
-    // Monomial orbits via pure-index BFS using mono_action.
+    // Monomial orbits via BFS with on-the-fly generator application.
     let t0 = std::time::Instant::now();
     let (mono_orbit_id, mono_orbit_rep) =
-        monomial_orbits_from_action(&mono_action, n_monos);
+        monomial_orbits_on_the_fly(&monos_bits, &bits_index, &var_tables);
     let n_mono_orbits = mono_orbit_rep.len();
     if verbose {
         eprintln!(
-            "c [alg-timing] monomial_orbits: {} orbits from {} monos in {:.3}s",
+            "c [alg-timing] monomial_orbits (on-the-fly): {} orbits from {} monos in {:.3}s",
             n_mono_orbits,
             n_monos,
             t0.elapsed().as_secs_f64()
@@ -488,9 +516,12 @@ pub fn find_orbit_cert_fp(
             while let Some((ci, cmi)) = queue.pop() {
                 let ci_u = ci as usize;
                 let cmi_u = cmi as usize;
-                for gi in 0..gens.len() {
+                let bits_cmi = monos_bits[cmi_u];
+                for (gi, vt) in var_tables.iter().enumerate() {
                     let ni = axiom_action[gi][ci_u] as u32;
-                    let nmi = mono_action[gi][cmi_u];
+                    let nmi = *bits_index
+                        .get(&apply_bits(bits_cmi, vt))
+                        .expect("monomial image not in enumeration") as u32;
                     let slot = (ni as usize) * n_monos + nmi as usize;
                     let w = slot >> 6;
                     let b = 1u64 << (slot & 63);
@@ -631,9 +662,10 @@ pub fn find_orbit_cert_fp(
         }
         let seed = unknown_seeds[col];
         let members = reenumerate_orbit_members(
-            n_monos,
+            &monos_bits,
+            &bits_index,
+            &var_tables,
             &axiom_action,
-            &mono_action,
             n_axioms,
             seed,
         );
