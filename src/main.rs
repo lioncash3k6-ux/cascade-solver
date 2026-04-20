@@ -432,6 +432,32 @@ fn main() -> ExitCode {
                         if alg_no_orbit { "dense" } else { "generic orbit" },
                         alg_prime, d, elapsed
                     );
+                    // Diagnostic hints: the three reasons no cert is
+                    // found all have different remedies, so surface them
+                    // rather than leaving the user to guess.
+                    eprintln!("c [alg] no cert at this (p, d). Possible reasons:");
+                    eprintln!(
+                        "c [alg]   1. Degree too low: try --alg-preprocess {} (one higher).",
+                        d + 1
+                    );
+                    if !alg_no_orbit {
+                        eprintln!(
+                            "c [alg]   2. Prime {} may divide |G|; orbit reduction \
+                             fails when p ∣ |G|. Try --alg-no-orbit (dense) or a \
+                             different prime.",
+                            alg_prime
+                        );
+                    } else {
+                        eprintln!(
+                            "c [alg]   2. Prime {} may not support a cert for this \
+                             family; try a different prime (see family-specific \
+                             guidance in docs/TUTORIAL.md).",
+                            alg_prime
+                        );
+                    }
+                    eprintln!(
+                        "c [alg]   3. The instance may be SAT (no UNSAT cert exists)."
+                    );
                     return ExitCode::from(0);
                 }
             }

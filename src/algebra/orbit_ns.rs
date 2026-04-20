@@ -99,47 +99,160 @@ fn enumerate_up_to(n: u32, d: usize) -> Vec<Monomial> {
     out
 }
 
-/// Enumerate multilinear monomials of degree ≤ `d` over `1..=n` directly as
-/// u128 bitmasks, skipping the intermediate `Vec<Monomial>`. For large
-/// monomial counts (PHP_{8,7} d=7 hits ~268M) this avoids a multi-GB
-/// transient allocation of BTreeSet-backed Monomials.
+/// Enumerate multilinear monomials of degree ≤ `d` over `1..=n` as u128
+/// bitmasks, **in colex order** (grouped by degree, colex within degree).
 ///
-/// The output is NOT sorted as `Monomial` comparison would sort it —
-/// consumers that need canonical order should use `enumerate_up_to` or
-/// sort separately. The current orbit-NS engine only uses hash-indexed
-/// lookup, so sort order does not matter.
+/// Colex order lets us replace the `HashMap<u128, usize>` monomial → index
+/// lookup with a direct combinatorial ranking ([`ColexIndex::rank`]) —
+/// O(d) arithmetic instead of a hash probe, and zero memory. At PHP_{8,7}
+/// d=7 scale the HashMap was 15-20 GB; the ranking is a tiny
+/// `binom[n+1][d+1]` table (a few KB).
+///
+/// Ordering (for a 2-subset of [4], the colex sequence is):
+/// `{1,2}, {1,3}, {2,3}, {1,4}, {2,4}, {3,4}`.
 fn enumerate_bits_up_to(n: u32, d: usize) -> Vec<MonoBits> {
-    fn rec(n: u32, start: u32, k_left: usize, bits: MonoBits, out: &mut Vec<MonoBits>) {
+    fn rec(max_val: u32, k_left: u32, bits: MonoBits, out: &mut Vec<MonoBits>) {
         if k_left == 0 {
             out.push(bits);
             return;
         }
-        if n + 1 < start || (n - start + 1) < k_left as u32 {
-            return;
-        }
-        for v in start..=n {
-            rec(n, v + 1, k_left - 1, bits | (1u128 << (v - 1)), out);
+        for v in k_left..=max_val {
+            rec(v - 1, k_left - 1, bits | (1u128 << (v - 1)), out);
         }
     }
     let mut out = Vec::new();
-    for k in 0..=d {
-        rec(n, 1, k, 0, &mut out);
+    for k in 0..=(d as u32) {
+        rec(n, k, 0, &mut out);
     }
     out
+}
+
+/// Perfect-hash index for multilinear monomials of degree ≤ `d` over
+/// `1..=n`, via colex ranking. `rank(bits)` returns the position of a
+/// monomial in the `enumerate_bits_up_to(n, d)` sequence; `unrank(r)`
+/// inverts it.
+///
+/// Replaces the old `bits_index: HashMap<u128, usize>` (which at
+/// PHP_{8,7} d=7 scale cost ~15-20 GB) with `O((d+1)·(n+1))` bytes of
+/// binomial table.
+struct ColexIndex {
+    // binom[a][k] = C(a, k). Dimensions (n+2) × (d+2); a trailing row/col
+    // avoids bounds-check branches on edge lookups.
+    binom: Vec<Vec<u32>>,
+    // prefix[k] = total count of monomials of degree < k, i.e.
+    // ∑_{k'=0..k-1} C(n, k'). Length (d+2).
+    prefix: Vec<u32>,
+    n: u32,
+    d: u32,
+}
+
+impl ColexIndex {
+    fn new(n: u32, d: u32) -> Self {
+        let nn = (n + 2) as usize;
+        let dd = (d + 2) as usize;
+        let mut binom = vec![vec![0u32; dd]; nn];
+        for a in 0..nn {
+            binom[a][0] = 1;
+            for k in 1..dd {
+                // C(a, k) = C(a-1, k-1) + C(a-1, k) with boundary C(0, >0) = 0.
+                let upper = if a == 0 { 0 } else { binom[a - 1][k - 1] };
+                let left = if a == 0 { 0 } else { binom[a - 1][k] };
+                binom[a][k] = upper.saturating_add(left);
+            }
+        }
+        let mut prefix = vec![0u32; (d + 2) as usize];
+        for k in 0..=(d as usize) {
+            prefix[k + 1] = prefix[k] + binom[n as usize][k];
+        }
+        Self { binom, prefix, n, d }
+    }
+
+    /// Total number of monomials of degree ≤ d. Equals
+    /// `enumerate_bits_up_to(n, d).len()`.
+    fn len(&self) -> u32 {
+        self.prefix[(self.d + 1) as usize]
+    }
+
+    /// Rank a monomial bitset in the colex enumeration.
+    ///
+    /// Formula: for `S = {a_1 < ... < a_k}` (1-indexed elements),
+    /// `rank = prefix[k] + ∑_{i=1..k} C(a_i - 1, i)`.
+    #[inline]
+    fn rank(&self, bits: MonoBits) -> u32 {
+        let k = bits.count_ones();
+        let mut r = self.prefix[k as usize];
+        let mut b = bits;
+        let mut i: u32 = 1;
+        while b != 0 {
+            let v = b.trailing_zeros(); // 0-indexed bit position = a_i - 1
+            r += self.binom[v as usize][i as usize];
+            b &= b - 1;
+            i += 1;
+        }
+        r
+    }
+
+    /// Invert [`rank`]: return the monomial bitset at position `r`.
+    fn unrank(&self, r: u32) -> MonoBits {
+        // Find degree k with prefix[k] ≤ r < prefix[k+1].
+        let mut k: u32 = 0;
+        while k <= self.d && self.prefix[(k + 1) as usize] <= r {
+            k += 1;
+        }
+        debug_assert!(k <= self.d);
+        let mut rem = r - self.prefix[k as usize];
+        let mut bits: MonoBits = 0;
+        // Peel off a_k, a_{k-1}, ..., a_1 in decreasing i.
+        for i in (1..=k).rev() {
+            // Find largest a with C(a, i) ≤ rem; a_i = a + 1 (1-indexed).
+            let mut a: u32 = 0;
+            while a + 1 <= self.n && self.binom[(a + 1) as usize][i as usize] <= rem {
+                a += 1;
+            }
+            bits |= 1u128 << a;
+            rem -= self.binom[a as usize][i as usize];
+        }
+        debug_assert_eq!(rem, 0);
+        bits
+    }
+}
+
+#[cfg(test)]
+mod colex_tests {
+    use super::*;
+
+    #[test]
+    fn rank_matches_enumeration() {
+        // For each (n, d), colex rank of the i-th bitset must equal i.
+        for n in [3u32, 5, 7, 10] {
+            for d in 1u32..=4 {
+                let enum_bits = enumerate_bits_up_to(n, d as usize);
+                let ci = ColexIndex::new(n, d);
+                assert_eq!(ci.len() as usize, enum_bits.len());
+                for (i, &b) in enum_bits.iter().enumerate() {
+                    let r = ci.rank(b);
+                    assert_eq!(r as usize, i, "n={}, d={}: rank({:b}) = {}, expected {}", n, d, b, r, i);
+                    let b2 = ci.unrank(r);
+                    assert_eq!(b2, b, "n={}, d={}: unrank({}) = {:b}, expected {:b}", n, d, r, b2, b);
+                }
+            }
+        }
+    }
 }
 
 /// Compute G-orbits of monomials on-the-fly, without a precomputed
 /// `mono_action[gi][mi]` table. The image of monomial `mi` under generator
 /// `gi` is recomputed as
-/// `bits_index[apply_bits(monos_bits[mi], &var_tables[gi])]`.
+/// `colex.rank(apply_bits(monos_bits[mi], &var_tables[gi]))`.
 ///
 /// Memory win: a full `mono_action` table is `n_gens × n_monos × 4` bytes
 /// (13 × 268M × 4 ≈ 14 GB at PHP_{8,7} d=7). Dropping it leaves only the
-/// `var_tables` (≤ 128 × n_gens × 4 bytes, negligible). The cost is one
-/// `apply_bits` + one hash lookup per visited edge in the BFS.
+/// `var_tables` (≤ 128 × n_gens × 4 bytes) and the colex binomial
+/// table (a few KB) — both negligible. Cost per visited edge: an
+/// `apply_bits` (O(d) bit-scans) and a `colex.rank` (O(d) additions).
 fn monomial_orbits_on_the_fly(
     monos_bits: &[MonoBits],
-    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    colex: &ColexIndex,
     var_tables: &[Vec<u32>],
 ) -> (Vec<u32>, Vec<u32>) {
     let n_monos = monos_bits.len();
@@ -165,9 +278,7 @@ fn monomial_orbits_on_the_fly(
             let bits_i = monos_bits[i as usize];
             for vt in var_tables {
                 let img_bits = apply_bits(bits_i, vt);
-                let j = *bits_index
-                    .get(&img_bits)
-                    .expect("monomial image not in enumeration") as u32;
+                let j = colex.rank(img_bits);
                 if orbit_id[j as usize] == sentinel {
                     orbit_id[j as usize] = this_orbit;
                     if j < rep {
@@ -250,7 +361,7 @@ fn mod_inv(a: u8, p: u8) -> u8 {
 fn scatter_pair(
     axiom_bits: &[Vec<(MonoBits, u8)>],
     monos_bits: &[MonoBits],
-    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    colex: &ColexIndex,
     mono_orbit_id: &[u32],
     mono_orbit_rep: &[u32],
     matrix: &mut [Vec<u8>],
@@ -262,11 +373,16 @@ fn scatter_pair(
     let mu_bits = monos_bits[mi as usize];
     for &(term_bits, coef) in &axiom_bits[ai as usize] {
         let product = term_bits | mu_bits;
-        if let Some(&idx) = bits_index.get(&product) {
-            let row = mono_orbit_id[idx] as usize;
-            if idx as u32 == mono_orbit_rep[row] {
-                matrix[row][col] = (matrix[row][col] + coef) % p;
-            }
+        // Products whose degree exceeds `d` are outside the enumeration and
+        // contribute nothing to the degree-`d` cert system. Check via
+        // popcount before ranking; colex.rank() assumes popcount ≤ d.
+        if (product.count_ones() as u32) > colex.d {
+            continue;
+        }
+        let idx = colex.rank(product) as usize;
+        let row = mono_orbit_id[idx] as usize;
+        if idx as u32 == mono_orbit_rep[row] {
+            matrix[row][col] = (matrix[row][col] + coef) % p;
         }
     }
 }
@@ -274,11 +390,11 @@ fn scatter_pair(
 /// Re-enumerate the full member list of an unknown-pair orbit starting
 /// from its stored seed pair. Used during certificate reconstruction —
 /// we don't materialize members during the main BFS to keep memory small.
-/// Monomial images are computed on-the-fly via `var_tables` + `bits_index`;
-/// no precomputed `mono_action` table is required.
+/// Monomial images are computed on-the-fly via `var_tables` + colex
+/// ranking; no precomputed `mono_action` or hash index is required.
 fn reenumerate_orbit_members(
     monos_bits: &[MonoBits],
-    bits_index: &std::collections::HashMap<MonoBits, usize>,
+    colex: &ColexIndex,
     var_tables: &[Vec<u32>],
     axiom_action: &[Vec<usize>],
     n_axioms: usize,
@@ -298,9 +414,7 @@ fn reenumerate_orbit_members(
         let bits_cmi = monos_bits[cmi_u];
         for (gi, vt) in var_tables.iter().enumerate() {
             let ni = axiom_action[gi][ci_u] as u32;
-            let nmi = *bits_index
-                .get(&apply_bits(bits_cmi, vt))
-                .expect("monomial image not in enumeration") as u32;
+            let nmi = colex.rank(apply_bits(bits_cmi, vt));
             let slot = (ni as usize) * n_monos + nmi as usize;
             let w = slot >> 6;
             let b = 1u64 << (slot & 63);
@@ -375,18 +489,18 @@ pub fn find_orbit_cert_fp_with_gens(
         );
     }
 
-    // Hash-indexed monomial lookup for O(1) image resolution during
-    // mono_action and matrix scatter.
+    // Colex perfect-hash index: bits ↔ position in the enumeration. The
+    // old path was a `HashMap<u128, usize>` that at PHP_{8,7} d=7 scale
+    // cost 15-20 GB; colex ranking is O(d) arithmetic on a small
+    // precomputed binomial table (a few KB).
     let t0 = std::time::Instant::now();
-    let mut bits_index: std::collections::HashMap<MonoBits, usize> =
-        std::collections::HashMap::with_capacity(n_monos);
-    for (i, &b) in monos_bits.iter().enumerate() {
-        bits_index.insert(b, i);
-    }
+    let colex = ColexIndex::new(n, d as u32);
     if verbose {
         eprintln!(
-            "c [alg-timing] mono_index build: {:.3}s",
-            t0.elapsed().as_secs_f64()
+            "c [alg-timing] colex index build: {:.3}s (binom {} × {})",
+            t0.elapsed().as_secs_f64(),
+            (n + 2),
+            (d as u32 + 2)
         );
     }
 
@@ -394,9 +508,9 @@ pub fn find_orbit_cert_fp_with_gens(
     // generator monomial-index action table (`mono_action[gi][mi]`) used
     // to live here; it was dropped because for PHP_{8,7} d=7 it was
     // `n_gens × n_monos × 4` ≈ 14 GB — the dominant memory cost. Images
-    // are now recomputed inline as `bits_index[apply_bits(monos_bits[mi],
-    // var_tables[gi])]`: `apply_bits` is O(degree) and the hash lookup
-    // we were already doing anyway.
+    // are now recomputed inline as `colex.rank(apply_bits(monos_bits[mi],
+    // var_tables[gi]))`: `apply_bits` is O(degree) and colex ranking is
+    // also O(degree), both very fast.
     let t0 = std::time::Instant::now();
     let var_tables: Vec<Vec<u32>> =
         gens.iter().map(|g| schema.var_action_table(g)).collect();
@@ -411,7 +525,7 @@ pub fn find_orbit_cert_fp_with_gens(
     // Monomial orbits via BFS with on-the-fly generator application.
     let t0 = std::time::Instant::now();
     let (mono_orbit_id, mono_orbit_rep) =
-        monomial_orbits_on_the_fly(&monos_bits, &bits_index, &var_tables);
+        monomial_orbits_on_the_fly(&monos_bits, &colex, &var_tables);
     let n_mono_orbits = mono_orbit_rep.len();
     if verbose {
         eprintln!(
@@ -500,7 +614,7 @@ pub fn find_orbit_cert_fp_with_gens(
             scatter_pair(
                 &axiom_bits,
                 &monos_bits,
-                &bits_index,
+                &colex,
                 &mono_orbit_id,
                 &mono_orbit_rep,
                 &mut matrix_rows,
@@ -519,9 +633,7 @@ pub fn find_orbit_cert_fp_with_gens(
                 let bits_cmi = monos_bits[cmi_u];
                 for (gi, vt) in var_tables.iter().enumerate() {
                     let ni = axiom_action[gi][ci_u] as u32;
-                    let nmi = *bits_index
-                        .get(&apply_bits(bits_cmi, vt))
-                        .expect("monomial image not in enumeration") as u32;
+                    let nmi = colex.rank(apply_bits(bits_cmi, vt));
                     let slot = (ni as usize) * n_monos + nmi as usize;
                     let w = slot >> 6;
                     let b = 1u64 << (slot & 63);
@@ -530,7 +642,7 @@ pub fn find_orbit_cert_fp_with_gens(
                         scatter_pair(
                             &axiom_bits,
                             &monos_bits,
-                            &bits_index,
+                            &colex,
                             &mono_orbit_id,
                             &mono_orbit_rep,
                             &mut matrix_rows,
@@ -560,7 +672,10 @@ pub fn find_orbit_cert_fp_with_gens(
     }
 
     // RHS: mono_rep[one_orbit] = 1. Place into matrix_rows + rhs.
-    let one_idx = bits_index[&0u128];
+    // The constant monomial "1" corresponds to bits = 0, which has colex
+    // rank 0 (first in the enumeration: degree 0, the empty subset).
+    let one_idx = colex.rank(0u128) as usize;
+    debug_assert_eq!(one_idx, 0, "colex rank of empty monomial must be 0");
     let one_orbit = mono_orbit_id[one_idx];
     rhs[0] = rhs[0]; // keep types stable (no-op)
     // Build the combined matrix [lhs | rhs] expected by the existing
@@ -663,7 +778,7 @@ pub fn find_orbit_cert_fp_with_gens(
         let seed = unknown_seeds[col];
         let members = reenumerate_orbit_members(
             &monos_bits,
-            &bits_index,
+            &colex,
             &var_tables,
             &axiom_action,
             n_axioms,
