@@ -174,7 +174,14 @@ minutes-to-an-hour of runtime.
 
 ## Architecture
 
-Legs on a shared propagator bus:
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a comprehensive
+walk-through of the solver internals: tuple-schema abstraction,
+colex perfect-hash indexing, orbit engine phase breakdown, problem
+factories, certificate formats, VeriPB lowering, extension points,
+and soundness / trust-chain analysis. ~900 lines with file:line
+pointers into the source.
+
+Short summary: legs on a shared propagator bus.
 
 | Leg | Mechanism | Status |
 |---|---|---|
