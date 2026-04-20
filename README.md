@@ -116,6 +116,25 @@ Measured cert sizes: PHP_{5,4} d=5 — 52 KB; PHP_{6,5} d=6 — 1.0 MB;
 verification < 1 s. Corrupting one coefficient rejects with
 `s REJECTED sum does not reduce to 1`.
 
+### VeriPB lowering (Gap 2)
+
+For families with linear axioms (Count_q, Tseitin on regular graphs),
+`--alg-cert-pb <stem>` additionally emits `<stem>.opb` (the formula
+in OPB format) and `<stem>.pbp` (a VeriPB proof). These are accepted
+by the stock [VeriPB](https://gitlab.com/MIAOresearch/software/VeriPB)
+checker — no bespoke trust chain:
+
+```bash
+cascade --alg-no-orbit --alg-preprocess 1 --alg-p 3 --problem count:4,3 \
+        --alg-cert-pb count43 /tmp/dummy.cnf
+veripb count43.opb count43.pbp     # external: s VERIFIED UNSATISFIABLE
+```
+
+Verified cells (external `veripb 3.0.1`): `count:{4,3|5,3}` over 𝔽_3,
+`count:{5,2|7,2}` over 𝔽_2. PHP and nonlinear-axiom families need a
+richer lowering (expanding polynomial multipliers into PB
+operations) and are follow-up work.
+
 ## Engineering story — memory compression (Stage 1, 2026-04-20)
 
 The dominant structure at scale was the per-generator monomial-action

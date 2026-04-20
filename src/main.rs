@@ -73,6 +73,12 @@ fn main() -> ExitCode {
     let mut alg_php_functional: Option<(u32, u32)> = None;
     let mut alg_problem: Option<String> = None;
     let mut alg_no_orbit: bool = false;
+    // --alg-cert-pb <stem>: on UNSAT, write <stem>.opb and <stem>.pbp so
+    // an external VeriPB checker can re-verify the cert in the PB proof
+    // system (Gap 2 — pipeline integration with existing infrastructure).
+    // Only valid for families whose axioms are linear (Count_q today;
+    // PHP / Tseitin need follow-up work).
+    let mut alg_cert_pb_stem: Option<std::path::PathBuf> = None;
     let mut alg_cert_path: Option<PathBuf> = None;
     let mut use_cnc = false;
     let mut cnc_depth: u32 = 0;
@@ -177,6 +183,17 @@ fn main() -> ExitCode {
                 // p = q, where orbit path is unusable.
                 alg_no_orbit = true;
                 i += 1;
+                continue;
+            }
+            "--alg-cert-pb" => {
+                // --alg-cert-pb <stem>: on UNSAT, emit <stem>.opb +
+                // <stem>.pbp for VeriPB external verification.
+                if i + 1 >= args.len() {
+                    eprintln!("--alg-cert-pb needs a file stem");
+                    return ExitCode::from(2);
+                }
+                alg_cert_pb_stem = Some(std::path::PathBuf::from(&args[i + 1]));
+                i += 2;
                 continue;
             }
             "--problem" => {
@@ -421,6 +438,56 @@ fn main() -> ExitCode {
                                 path.display(),
                                 e
                             ),
+                        }
+                    }
+                    // VeriPB lowering (Gap 2): if --alg-cert-pb was set,
+                    // write <stem>.opb + <stem>.pbp. Only valid for
+                    // linear-axiom families with scalar multipliers.
+                    if let Some(stem) = &alg_cert_pb_stem {
+                        let doc = cascade::algebra::ns_cert::CertDoc::from_solver(
+                            alg_prime,
+                            d,
+                            schema.n_vars(),
+                            axioms.clone(),
+                            &mults,
+                        );
+                        let opb_path = stem.with_extension("opb");
+                        let pbp_path = stem.with_extension("pbp");
+                        let opb_res = std::fs::File::create(&opb_path);
+                        let pbp_res = std::fs::File::create(&pbp_path);
+                        match (opb_res, pbp_res) {
+                            (Ok(mut opb), Ok(mut pbp)) => {
+                                match cascade::algebra::ns_to_pb::emit_veripb(
+                                    &doc, &mut opb, &mut pbp,
+                                ) {
+                                    Ok(()) => {
+                                        println!(
+                                            "c [alg-cert-pb] wrote {} + {}",
+                                            opb_path.display(),
+                                            pbp_path.display()
+                                        );
+                                        println!(
+                                            "c [alg-cert-pb] verify with: \
+                                             veripb {} {}",
+                                            opb_path.display(),
+                                            pbp_path.display()
+                                        );
+                                    }
+                                    Err(e) => eprintln!(
+                                        "c [alg-cert-pb] WARNING VeriPB \
+                                         lowering failed: {}",
+                                        e
+                                    ),
+                                }
+                            }
+                            (opb_r, pbp_r) => {
+                                if let Err(e) = opb_r {
+                                    eprintln!("c [alg-cert-pb] cannot create {}: {}", opb_path.display(), e);
+                                }
+                                if let Err(e) = pbp_r {
+                                    eprintln!("c [alg-cert-pb] cannot create {}: {}", pbp_path.display(), e);
+                                }
+                            }
                         }
                     }
                     println!("s UNSATISFIABLE");

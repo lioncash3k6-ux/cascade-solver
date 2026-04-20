@@ -223,6 +223,45 @@ else
   printf "Tamper check:  ${RED}FAILED: verifier accepted corrupted cert!${RESET}\n"
 fi
 
+# -------- VeriPB lowering (Gap 2) --------
+
+echo
+echo "${BOLD}VeriPB external validation — Count_q lowered to PB proof${RESET}"
+hr
+if command -v veripb >/dev/null 2>&1; then
+  # Each case uses p = q (Count_q always has a d=1 cert at p = q).
+  for case in "count:4,3 3" "count:5,3 3" "count:5,2 2" "count:7,2 2"; do
+    prob="${case% *}"
+    p="${case##* }"
+    extra=""
+    if (( p == 2 )); then
+      # p=2 and family uses Diagonal S_n; orbit path fails (2 ∣ |S_n|).
+      # Use --alg-no-orbit. Dense engine is fast at these sizes anyway.
+      extra="--alg-no-orbit"
+    else
+      # p odd: orbit path works for n < p, else add --alg-no-orbit.
+      n_val=$(echo "$prob" | awk -F'[:,]' '{print $2}')
+      if (( p <= n_val )); then extra="--alg-no-orbit"; fi
+    fi
+    "$CASCADE" $extra --alg-preprocess 1 --alg-p "$p" --problem "$prob" \
+      --alg-cert-pb "$WORKDIR/pb_${prob//[:,]/_}" "$DUMMY" > /dev/null 2>&1
+    STEM="$WORKDIR/pb_${prob//[:,]/_}"
+    if [[ ! -s "$STEM.opb" ]]; then
+      printf "%-12s  ${RED}NO CERT at (p=%s, d=1)${RESET}\n" "$prob" "$p"
+      continue
+    fi
+    out=$(veripb "$STEM.opb" "$STEM.pbp" 2>&1 | grep -E "^s " | head -1)
+    if [[ "$out" == "s VERIFIED UNSATISFIABLE" ]]; then
+      printf "%-12s  (p=%s) ${GREEN}%s${RESET}\n" "$prob" "$p" "$out"
+    else
+      printf "%-12s  (p=%s) ${RED}UNEXPECTED:${RESET} %s\n" "$prob" "$p" "$out"
+    fi
+  done
+else
+  echo "${DIM}veripb not found on PATH; skipping external validation.${RESET}"
+  echo "${DIM}Install: cargo install veripb (or see https://gitlab.com/MIAOresearch/software/VeriPB).${RESET}"
+fi
+
 # -------- Summary --------
 
 echo
