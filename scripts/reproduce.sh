@@ -269,6 +269,6 @@ echo "${BOLD}Reproduction complete.${RESET}"
 hr
 echo "Output logs:  $WORKDIR/"
 echo "Heavy cases (not run by default):"
-echo "  PHP_{7,6} d=7:   $CASCADE --alg-preprocess 7 --alg-p 11 --problem php:7,6 $DUMMY   # ~4-5 min"
-echo "  PHP_{8,7} d=7:   $CASCADE --alg-preprocess 7 --alg-p 11 --problem php:8,7 $DUMMY   # ~60 min, returns correct 'no cert'"
+echo "  PHP_{8,7} d=7:   $CASCADE --alg-preprocess 7 --alg-p 11 --problem php:8,7 $DUMMY   # ~14 min / 5.5 GB, returns correct 'no cert'"
+echo "  PHP_{8,7} d=8:   $CASCADE --alg-preprocess 8 --alg-p 11 --problem php:8,7 $DUMMY   # open frontier; hours, 20-40 GB"
 hr

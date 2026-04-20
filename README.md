@@ -19,7 +19,9 @@ regimes we have measured, not as a general-purpose solver.
 * Low Nullstellensatz / polynomial-calculus degree over *some* `𝔽_p`
   (so the algebraic leg terminates).
 * Small enough variable count to fit the monomial space at the needed
-  degree (currently: up to `n = 56` vars, `d = 7`, fits in ~25 GB RAM).
+  degree. Current envelope: up to `n = 56` vars at `d = 7` fits in
+  ~5.5 GB RAM and ~14 min (PHP_{8,7}); larger instances and
+  higher degrees scale roughly as `n_axioms · n_monos`.
 
 **Does not do.**
 
@@ -46,13 +48,17 @@ cascade --alg-preprocess D --alg-p P --problem FAMILY[:args] input.cnf
 
 ### PHP (functional encoding)
 
+All measurements on the current head (colex perfect-hash, commit
+`a436daa`). `/usr/bin/time -v`, single 24-core Linux box, RSS peak
+reported by the kernel.
+
 | Instance | Setting | Time | Peak RAM | Verdict |
 |---|---|---:|---:|---|
 | PHP_{5,4} d=5 | 𝔽₇, orbit | 0.17 s | 10 MB | cert |
-| PHP_{6,5} d=6 | 𝔽₇, orbit | 1.7 s | 69 MB | cert |
-| PHP_{7,6} d=7 | 𝔽₁₁, orbit | 260 s | 3.05 GB | cert |
-| PHP_{8,7} d=7 | 𝔽₁₁, orbit | 60 min | 22.8 GB | no cert (correct: PHP_{P,P-1} needs d ≥ P) |
-| PHP_{8,7} d=8 | 𝔽₁₁, orbit | — | — | open; needs factored-gen speedup first |
+| PHP_{6,5} d=6 | 𝔽₇, orbit | 0.98 s | 35 MB | cert |
+| PHP_{7,6} d=7 | 𝔽₁₁, orbit | 75 s | 886 MB | cert |
+| PHP_{8,7} d=7 | 𝔽₁₁, orbit | 14 min | 5.5 GB | no cert (correct: `PHP_{P,P-1}` needs `d ≥ P`) |
+| PHP_{8,7} d=8 | 𝔽₁₁, orbit | — | — | open frontier; estimated 20–40 GB and a few hours |
 
 CLI: `--problem php:P,H`.
 
@@ -135,26 +141,38 @@ Verified cells (external `veripb 3.0.1`): `count:{4,3|5,3}` over 𝔽_3,
 richer lowering (expanding polynomial multipliers into PB
 operations) and are follow-up work.
 
-## Engineering story — memory compression (Stage 1, 2026-04-20)
+## Engineering story — PHP memory trajectory (2026-04-20)
 
-The dominant structure at scale was the per-generator monomial-action
-table `mono_action[gi][mi]: Vec<Vec<u32>>`. For PHP_{8,7} d=7 this is
-`13 × 268 M × 4 B ≈ 14 GB`, the single biggest thing in RAM.
+Two data-structure decisions collapsed PHP from "needs a workstation"
+to "runs on a laptop." The same instances, over a three-commit window:
 
-Stage 1 dropped the table entirely; generator images are recomputed
-on-the-fly as `bits_index[apply_bits(monos_bits[mi], &var_tables[gi])]`.
-The hash lookup was already in the hot path (for the scatter dedup), so
-the precomputation was pure amortisation.
+| Instance | Original | Stage 1 (b34a51a) | Colex (a436daa) |
+|---|---|---|---|
+| PHP_{6,5} d=6, 𝔽₇ | 1.9 s / 166 MB | 1.7 s / 69 MB | **0.98 s / 35 MB** |
+| PHP_{7,6} d=7, 𝔽₁₁ | 218 s / 4.47 GB | 260 s / 3.05 GB | **75 s / 886 MB** |
+| PHP_{8,7} d=7, 𝔽₁₁ | timeout @ 1800 s, 40 GB | 60 min / 22.8 GB | **14 min / 5.5 GB** |
 
-| Instance | Before Stage 1 | After Stage 1 | Δ |
-|---|---:|---:|---|
-| PHP_{6,5} d=6 | 1.9 s / 166 MB | 1.7 s / 69 MB | −58 % mem |
-| PHP_{7,6} d=7 | 218 s / 4.47 GB | 260 s / 3.05 GB | −32 % mem, +19 % time |
-| PHP_{8,7} d=7 | timeout @ 1800 s, 40 GB | 60 min, 22.8 GB, correct no-cert | OOM → feasible |
+**Stage 1 — drop `mono_action`.** The per-generator monomial-image
+table `Vec<Vec<u32>>` was `n_gens × n_monos × 4 B` — 14 GB at
+PHP_{8,7} d=7 and the dominant memory cost. Dropping it and recomputing
+images on-the-fly as `bits_index[apply_bits(monos_bits[mi],
+&var_tables[gi])]` saved the memory at a modest time cost.
 
-Next natural move: factored bit-swap representation of adjacent-
-transposition generators on the u128 monomial — reclaims the time
-regression without re-materialising the table.
+**Colex perfect hash — drop `bits_index`.** The remaining giant was
+the `HashMap<u128, usize>` that mapped monomial bits to enumeration
+index (~15–20 GB at PHP_{8,7} scale). Replaced by a direct
+combinatorial ranking function (colex) that uses only a tiny
+`(n+2)·(d+2)` binomial table — a few KB. Both the time and memory
+improvements come from this step: no hash probe, no HashMap overhead,
+O(d) arithmetic for each lookup.
+
+Full derivation and measurements in
+[`docs/ARCHITECTURE.md § 5`](docs/ARCHITECTURE.md#5-colex-perfect-hash-indexing).
+
+Next natural move (not yet implemented): factored bit-swap
+representation of adjacent-transposition generators on the u128
+monomial — reclaims further time by turning `apply_bits` into a
+single u128 XOR-mask swap for the structural case.
 
 ## End-to-end reproduction
 
@@ -163,14 +181,32 @@ cargo build --release
 ./scripts/reproduce.sh
 ```
 
-Runs the full demonstration across PHP (5,4 through 7,6), Count_q
-(selected (p, q) cells), and Tseitin (K_n, cycle, Petersen). Prints a
-summary table; emits and re-verifies a certificate for PHP_{6,5} d=6.
-Expected total runtime ~5 min on a modern machine with ≥ 8 GB RAM.
+Runs the full demonstration across:
 
-PHP_{7,6} d=7 and PHP_{8,7} d=7 are heavy and **not** in the default
-reproduction script; invoke them individually if you want to sit through
-minutes-to-an-hour of runtime.
+* **PHP** — 5,4 through 7,6 (times from this machine: 0.17 s / 1 s /
+  75 s, total ≈ 80 s).
+* **Count_q** — a `(p, q)` grid across 𝔽_2, 𝔽_3, 𝔽_5, 𝔽_7, 𝔽_11, 𝔽_13
+  (all sub-second at the sizes tested).
+* **Tseitin** — K_5, K_6, C_5, C_7, Petersen.
+* **Certificate round-trip** — emits a PHP_{6,5} d=6 cert (~1 MB) and
+  re-verifies it via the independent `cascade_cert_verify` binary, then
+  corrupts a coefficient and confirms the verifier rejects it.
+* **VeriPB validation** — four Count_q cells lowered to
+  `<stem>.opb + <stem>.pbp`, fed to the stock `veripb` binary, all
+  return `s VERIFIED UNSATISFIABLE` (skipped if `veripb` is not on
+  `PATH`).
+
+Total runtime ≈ 1 min 20 s on a modern machine with ≥ 2 GB RAM
+(measured 78.8 s on a 24-core box).
+
+**Heavy cases** not run by default (invoke manually if curious):
+
+```bash
+./target/release/cascade --alg-preprocess 7 --alg-p 11 \
+    --problem php:8,7 /tmp/dummy.cnf                       # ~14 min, 5.5 GB
+./target/release/cascade --alg-preprocess 8 --alg-p 11 \
+    --problem php:8,7 /tmp/dummy.cnf                       # open frontier
+```
 
 ## Architecture
 
@@ -178,7 +214,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a comprehensive
 walk-through of the solver internals: tuple-schema abstraction,
 colex perfect-hash indexing, orbit engine phase breakdown, problem
 factories, certificate formats, VeriPB lowering, extension points,
-and soundness / trust-chain analysis. ~900 lines with file:line
+and soundness / trust-chain analysis. ~1150 lines with file:line
 pointers into the source.
 
 Short summary: legs on a shared propagator bus.
@@ -229,19 +265,23 @@ src/
     poly.rs               multilinear polynomials over 𝔽₂
     ns.rs                 naive NS over 𝔽₂
     ns_fp.rs              dense NS over 𝔽_p
-    orbit_ns.rs           generic orbit-reduced NS
+    orbit_ns.rs           generic orbit-reduced NS + ColexIndex
     php_orbit.rs          PHP-specific engine (regression baseline)
-    ns_cert.rs            serializable cert format + verifier
+    ns_cert.rs            serializable cert format + in-solver verifier
+    ns_to_pb.rs           VeriPB lowering for linear-axiom families
   bin/cascade_cert_verify.rs   standalone cert verifier
 scripts/
   reproduce.sh            end-to-end demonstration runner
+docs/
+  ARCHITECTURE.md         comprehensive internals walk-through
+  TUTORIAL.md             hands-on CNF → verified cert walkthrough
 ```
 
 ## Build & test
 
 ```bash
 cargo build --release
-cargo test --release      # 178 tests, ~2 min
+cargo test --release      # 180 tests, ~2 min
 ```
 
 ## Honest limitations
@@ -249,11 +289,16 @@ cargo test --release      # 178 tests, ~2 min
 * **Orbit reduction requires `p ∤ |G|`.** For Count_q with `p = q ≤ n`,
   the orbit path is unusable; we fall back to the dense engine, which
   runs out at roughly `n = 7, d = 5`.
-* **`mono_orbits` BFS is now the slowest step at PHP_{8,7} scale**
-  (13 min on its own). Factored bit-swap gens would restore array-speed.
+* **Pair BFS + matrix scatter is the hot path at PHP_{8,7} d=7 scale**
+  (about 640 s on its own, ~77 % of wall time). Factored bit-swap
+  generators would reduce each `apply_bits` call from O(d) to O(1),
+  the natural next speedup.
 * **PHP_{10,9}** needs `d = 10` on 90 vars, `∑_{k ≤ 10} C(90, k) ≈ 10¹²`
   monomials — beyond anything we can enumerate. Direct orbit enumeration
   without per-monomial materialization is genuine research work.
+* **VeriPB lowering is linear-axiom only.** Count_q and Tseitin (on
+  regular graphs with uniform charge) lower cleanly; PHP's quadratic
+  AMO axioms need a richer proof structure, not yet implemented.
 * **Tseitin custom-Aut reduction** (cycle, hypercube, Petersen) is wired
   (`find_orbit_cert_fp_with_gens`) but the public factories still default
   to `S_n`, which works only for K_n.
