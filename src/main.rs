@@ -379,6 +379,63 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+
+            // Closed-form SAT detector (Option A). Cheap; when SAT,
+            // short-circuits the whole UNSAT probe by emitting a DIMACS
+            // model and exiting 10. When UNSAT (or when no detector is
+            // registered for this family), fall through to the
+            // algebraic engine as before.
+            let sat_model: Option<Vec<bool>> = match (family, args_vec.as_slice()) {
+                ("php", [pp, hh]) => {
+                    cascade::problems::php_functional_model(*pp, *hh)
+                }
+                ("count", [n, q]) => {
+                    cascade::problems::count_q_partition_model(*n, *q)
+                }
+                ("tseitin-kn", [n]) => {
+                    cascade::problems::tseitin_kn_model(*n, 1)
+                }
+                ("tseitin-kn", [n, c]) => {
+                    cascade::problems::tseitin_kn_model(*n, *c as u8)
+                }
+                ("tseitin-cycle", [n]) => {
+                    cascade::problems::tseitin_cycle_model(*n, 1)
+                }
+                ("tseitin-cycle", [n, c]) => {
+                    cascade::problems::tseitin_cycle_model(*n, *c as u8)
+                }
+                ("tseitin-petersen", []) => {
+                    let charges = [1u8; 10];
+                    cascade::problems::tseitin_petersen_model(&charges)
+                }
+                _ => None, // ramsey has no closed-form SAT check
+            };
+            if let Some(model) = sat_model {
+                println!(
+                    "c [sat] closed-form SAT detector for '{}' returned a model ({} vars)",
+                    family,
+                    model.len()
+                );
+                println!("s SATISFIABLE");
+                // DIMACS model: `v <lit_1> <lit_2> ... 0` with lines at
+                // most ~80 chars wide.
+                let mut line: Vec<String> = Vec::new();
+                let mut width = 1; // "v"
+                for (i, &val) in model.iter().enumerate() {
+                    let lit: i32 = if val { (i as i32) + 1 } else { -((i as i32) + 1) };
+                    let tok = lit.to_string();
+                    if width + 1 + tok.len() > 76 {
+                        println!("v {}", line.join(" "));
+                        line.clear();
+                        width = 1;
+                    }
+                    width += 1 + tok.len();
+                    line.push(tok);
+                }
+                line.push("0".to_string());
+                println!("v {}", line.join(" "));
+                return ExitCode::from(10);
+            }
             println!(
                 "c [alg] {} 𝔽_{} on family '{}' ({} axioms, {} vars), degree={}",
                 if alg_no_orbit { "dense" } else { "generic orbit-reduced" },

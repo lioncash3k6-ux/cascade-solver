@@ -223,6 +223,45 @@ else
   printf "Tamper check:  ${RED}FAILED: verifier accepted corrupted cert!${RESET}\n"
 fi
 
+# -------- SAT detection (Option A) --------
+
+echo
+echo "${BOLD}SAT detection — closed-form witnesses for known-SAT instances${RESET}"
+hr
+check_sat() {
+  local label="$1"; shift
+  local args=("$@")
+  local out
+  out=$("$CASCADE" --alg-preprocess 1 --alg-p 2 --problem "${args[@]}" "$DUMMY" 2>&1)
+  if echo "$out" | grep -q "^s SATISFIABLE"; then
+    local nvars; nvars=$(echo "$out" | grep -oE "model \([0-9]+ vars\)" | head -1)
+    printf "%-28s  ${GREEN}s SATISFIABLE${RESET}  %s\n" "$label" "$nvars"
+  else
+    printf "%-28s  ${RED}expected SAT, got:${RESET} %s\n" "$label" \
+      "$(echo "$out" | grep -E "^s |no .* cert" | head -1)"
+  fi
+}
+# Short form — pass family + args just like the CLI.
+check_sat_2() {
+  local label="$1"; local problem="$2"
+  local out
+  out=$("$CASCADE" --alg-preprocess 1 --alg-p 2 --problem "$problem" "$DUMMY" 2>&1)
+  if echo "$out" | grep -q "^s SATISFIABLE"; then
+    local nvars; nvars=$(echo "$out" | grep -oE "model \([0-9]+ vars\)" | head -1)
+    printf "%-28s  ${GREEN}s SATISFIABLE${RESET}  %s\n" "$label" "$nvars"
+  else
+    printf "%-28s  ${RED}expected SAT, got:${RESET} %s\n" "$label" \
+      "$(echo "$out" | grep -E "^s |no .* cert" | head -1)"
+  fi
+}
+check_sat_2 "PHP_{3,5}  (P ≤ H)"        "php:3,5"
+check_sat_2 "PHP_{5,5}  (P = H)"        "php:5,5"
+check_sat_2 "Count_3 n=6 (q | n)"       "count:6,3"
+check_sat_2 "Count_2 n=8 (q | n)"       "count:8,2"
+check_sat_2 "Tseitin K_6 charge=1"      "tseitin-kn:6"
+check_sat_2 "Tseitin C_6 charge=1"      "tseitin-cycle:6"
+check_sat_2 "Tseitin Petersen charge=1" "tseitin-petersen"
+
 # -------- VeriPB lowering (Gap 2) --------
 
 echo

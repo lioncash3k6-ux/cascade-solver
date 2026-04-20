@@ -341,6 +341,249 @@ fn choose_from(src: &[u32], k: usize) -> Vec<Vec<u32>> {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// SAT model finders (Option A — per-family closed-form SAT detection)
+// ─────────────────────────────────────────────────────────────────────
+//
+// For each factory above we know the SAT/UNSAT boundary in closed form:
+//
+//   php_functional(P, H)    SAT iff P ≤ H
+//   count_q_partition(n,q)  SAT iff q ∣ n
+//   tseitin_graph(...)      SAT iff ∑_v c_v is even
+//
+// These `*_model` functions return `Some(Vec<bool>)` with a satisfying
+// variable assignment (indexed as `model[var_id - 1]`) when the instance
+// is SAT, and `None` when it is UNSAT. The assignment is consistent with
+// the *same* variable numbering the corresponding factory produces, so a
+// caller can verify against those axioms.
+
+/// Satisfying assignment for PHP_{P, H} when `P ≤ H`.
+///
+/// Strategy: the injection `pigeon i → hole i` uses `P` distinct holes
+/// and satisfies both the totality (each pigeon maps somewhere) and
+/// the AMO (no two pigeons share a hole) axioms.
+pub fn php_functional_model(n_pigeons: u32, n_holes: u32) -> Option<Vec<bool>> {
+    if n_pigeons > n_holes {
+        return None;
+    }
+    let schema = TupleVarSchema {
+        bases: vec![
+            BaseSet::new("P", n_pigeons),
+            BaseSet::new("H", n_holes),
+        ],
+        tuple_kind: TupleKind::Ordered,
+        group: GroupSpec::FullProduct,
+    };
+    let mut model = vec![false; schema.n_vars() as usize];
+    for p in 1..=n_pigeons {
+        let v = schema.var_of_tuple(&[p, p]); // pigeon p → hole p
+        model[(v - 1) as usize] = true;
+    }
+    Some(model)
+}
+
+/// Satisfying assignment for `count_q_partition(n, q)` when `q ∣ n`.
+///
+/// Strategy: the natural block partition `{1..q}, {q+1..2q}, ..., {n−q+1..n}`.
+/// Each vertex is in exactly one chosen block, so every vertex axiom is
+/// satisfied.
+pub fn count_q_partition_model(n: u32, q: u32) -> Option<Vec<bool>> {
+    if q == 0 || n % q != 0 {
+        return None;
+    }
+    let schema = TupleVarSchema {
+        bases: vec![BaseSet::new("V", n)],
+        tuple_kind: TupleKind::UnorderedSubset { size: q },
+        group: GroupSpec::Diagonal,
+    };
+    let mut model = vec![false; schema.n_vars() as usize];
+    for block in 0..(n / q) {
+        let start = block * q + 1;
+        let subset: Vec<u32> = (start..start + q).collect();
+        let v = schema.var_of_tuple(&subset);
+        model[(v - 1) as usize] = true;
+    }
+    Some(model)
+}
+
+/// Satisfying assignment for `tseitin_graph(n, edges, charges)` when
+/// `∑_v c_v` is even.
+///
+/// Strategy: Gaussian elimination over 𝔽_2 on the vertex-edge incidence
+/// system `M · x = c`, where `M[v][e] = 1` iff `v` is incident to `e`.
+/// Any particular solution works; we take the one produced by
+/// back-substitution (free variables set to 0).
+///
+/// Complexity: `O(|V|² · |E|)` for the elimination. Fine for graphs of
+/// practical interest (K_n up to `n = 16`, hypercubes up to `Q_4`, etc.).
+pub fn tseitin_graph_model(
+    n_verts: u32,
+    edges: &[(u32, u32)],
+    charges: &[u8],
+) -> Option<Vec<bool>> {
+    assert_eq!(
+        charges.len(),
+        n_verts as usize,
+        "tseitin_graph_model: charges.len() must equal n_verts"
+    );
+    let parity_sum: u32 = charges.iter().map(|&c| (c & 1) as u32).sum();
+    if parity_sum % 2 != 0 {
+        return None; // handshake lemma — UNSAT
+    }
+    let n_edges = edges.len();
+    let n = n_verts as usize;
+
+    // Augmented incidence matrix: rows = vertices, cols = edges + 1 RHS.
+    // Each row is a bitset over n_edges + 1 bits. Using `Vec<u64>` words.
+    let n_cols = n_edges + 1;
+    let words = (n_cols + 63) / 64;
+    let mut rows: Vec<Vec<u64>> = vec![vec![0u64; words]; n];
+    for (e_idx, &(u, v)) in edges.iter().enumerate() {
+        let w = e_idx / 64;
+        let b = 1u64 << (e_idx & 63);
+        rows[(u - 1) as usize][w] ^= b;
+        rows[(v - 1) as usize][w] ^= b;
+    }
+    // RHS column = n_edges.
+    let rhs_w = n_edges / 64;
+    let rhs_b = 1u64 << (n_edges & 63);
+    for (v_idx, &c) in charges.iter().enumerate() {
+        if c & 1 != 0 {
+            rows[v_idx][rhs_w] ^= rhs_b;
+        }
+    }
+
+    // Forward elimination. For each edge column in order, find a pivot
+    // row and XOR it into every other row with that column set.
+    let mut pivot_row_of_col: Vec<Option<usize>> = vec![None; n_edges];
+    let mut next_pivot_row = 0usize;
+    for col in 0..n_edges {
+        let w = col / 64;
+        let b = 1u64 << (col & 63);
+        let mut pivot: Option<usize> = None;
+        for r in next_pivot_row..n {
+            if rows[r][w] & b != 0 {
+                pivot = Some(r);
+                break;
+            }
+        }
+        let pivot = match pivot {
+            Some(r) => r,
+            None => continue,
+        };
+        rows.swap(pivot, next_pivot_row);
+        let prow = next_pivot_row;
+        for r in 0..n {
+            if r == prow {
+                continue;
+            }
+            if rows[r][w] & b != 0 {
+                // rows[r] ^= rows[prow]
+                for k in 0..words {
+                    rows[r][k] ^= rows[prow][k];
+                }
+            }
+        }
+        pivot_row_of_col[col] = Some(prow);
+        next_pivot_row += 1;
+    }
+
+    // Consistency check: any all-zero row with RHS = 1 is a contradiction.
+    for r in 0..n {
+        let lhs_zero = (0..n_edges).all(|c| {
+            let w = c / 64;
+            let b = 1u64 << (c & 63);
+            rows[r][w] & b == 0
+        });
+        if lhs_zero && (rows[r][rhs_w] & rhs_b != 0) {
+            return None;
+        }
+    }
+
+    // Back-substitute: free variables (no pivot) are 0; pivot variables
+    // take the value of the RHS in their row.
+    let mut model = vec![false; n_edges];
+    for col in 0..n_edges {
+        if let Some(prow) = pivot_row_of_col[col] {
+            let bit_set = rows[prow][rhs_w] & rhs_b != 0;
+            model[col] = bit_set;
+        }
+    }
+    Some(model)
+}
+
+/// Convenience wrapper matching [`tseitin_kn`]'s variable numbering.
+pub fn tseitin_kn_model(n: u32, charge: u8) -> Option<Vec<bool>> {
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for i in 1..n {
+        for j in (i + 1)..=n {
+            edges.push((i, j));
+        }
+    }
+    let charges = vec![charge; n as usize];
+    // tseitin_kn uses UnorderedPair schema; `tseitin_graph_model` indexes
+    // model entries by edge position in `edges`, matching
+    // `schema.var_of_tuple(&[u, v])` lex numbering. Map them explicitly.
+    let raw = tseitin_graph_model(n, &edges, &charges)?;
+    let schema = TupleVarSchema {
+        bases: vec![BaseSet::new("V", n)],
+        tuple_kind: TupleKind::UnorderedPair,
+        group: GroupSpec::Diagonal,
+    };
+    let mut model = vec![false; schema.n_vars() as usize];
+    for (e_idx, &(u, v)) in edges.iter().enumerate() {
+        let var = schema.var_of_tuple(&[u, v]);
+        model[(var - 1) as usize] = raw[e_idx];
+    }
+    Some(model)
+}
+
+/// Convenience wrapper matching [`tseitin_cycle`]'s variable numbering.
+pub fn tseitin_cycle_model(n: u32, charge: u8) -> Option<Vec<bool>> {
+    assert!(n >= 3);
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for i in 1..n {
+        edges.push((i, i + 1));
+    }
+    edges.push((1, n));
+    let charges = vec![charge; n as usize];
+    let raw = tseitin_graph_model(n, &edges, &charges)?;
+    let schema = TupleVarSchema {
+        bases: vec![BaseSet::new("V", n)],
+        tuple_kind: TupleKind::UnorderedPair,
+        group: GroupSpec::Diagonal,
+    };
+    let mut model = vec![false; schema.n_vars() as usize];
+    for (e_idx, &(u, v)) in edges.iter().enumerate() {
+        let var = schema.var_of_tuple(&[u, v]);
+        model[(var - 1) as usize] = raw[e_idx];
+    }
+    Some(model)
+}
+
+/// Convenience wrapper matching [`tseitin_petersen`]'s variable numbering.
+pub fn tseitin_petersen_model(charges: &[u8; 10]) -> Option<Vec<bool>> {
+    let edges: [(u32, u32); 15] = [
+        (1, 2), (2, 3), (3, 4), (4, 5), (5, 1),
+        (6, 8), (8, 10), (10, 7), (7, 9), (9, 6),
+        (1, 6), (2, 7), (3, 8), (4, 9), (5, 10),
+    ];
+    let raw = tseitin_graph_model(10, &edges, charges)?;
+    let schema = TupleVarSchema {
+        bases: vec![BaseSet::new("V", 10)],
+        tuple_kind: TupleKind::UnorderedPair,
+        group: GroupSpec::Diagonal,
+    };
+    let mut model = vec![false; schema.n_vars() as usize];
+    for (e_idx, &(u, v)) in edges.iter().enumerate() {
+        let var = schema.var_of_tuple(&[u, v]);
+        model[(var - 1) as usize] = raw[e_idx];
+    }
+    Some(model)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+
 fn combinations(n: u32, k: usize) -> Vec<Vec<u32>> {
     let mut out = Vec::new();
     let vals: Vec<u32> = (1..=n).collect();
@@ -465,6 +708,132 @@ mod tests {
             let mut v: Vec<(Monomial, u8)> = img.into_iter().collect();
             v.sort();
             assert!(key_of.contains_key(&v), "axiom image not in axiom set");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SAT model finder tests — each one checks that the model actually
+    // satisfies the polynomial axioms produced by the paired factory.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Evaluate a polynomial over 𝔽_p at a Boolean assignment; return the
+    /// integer residue mod p. Used by the model-check tests below.
+    fn eval_polyp(poly: &PolyP, model: &[bool]) -> u8 {
+        let mut acc: u16 = 0;
+        for (m, &c) in &poly.terms {
+            let ok = m.0.iter().all(|&v| model[(v - 1) as usize]);
+            if ok {
+                acc = (acc + c as u16) % poly.p as u16;
+            }
+        }
+        acc as u8
+    }
+
+    #[test]
+    fn php_model_unsat_when_p_gt_h() {
+        assert!(php_functional_model(5, 4).is_none());
+        assert!(php_functional_model(3, 2).is_none());
+    }
+
+    #[test]
+    fn php_model_satisfies_axioms_when_p_le_h() {
+        for (p_, h) in [(3, 3), (3, 5), (5, 5), (4, 7)] {
+            let model = php_functional_model(p_, h).expect("SAT");
+            let (_, axioms) = php_functional(p_, h, 7);
+            for (i, a) in axioms.iter().enumerate() {
+                assert_eq!(
+                    eval_polyp(a, &model),
+                    0,
+                    "PHP_{{{}, {}}}: axiom {} not satisfied",
+                    p_, h, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_q_model_unsat_when_not_divisible() {
+        assert!(count_q_partition_model(5, 3).is_none());
+        assert!(count_q_partition_model(7, 2).is_none());
+        assert!(count_q_partition_model(4, 3).is_none());
+    }
+
+    #[test]
+    fn count_q_model_satisfies_axioms_when_divisible() {
+        for (n, q) in [(4, 2), (6, 2), (6, 3), (9, 3), (8, 4)] {
+            let model = count_q_partition_model(n, q).expect("SAT");
+            let (_, axioms) = count_q_partition(n, q, 5);
+            for (i, a) in axioms.iter().enumerate() {
+                assert_eq!(
+                    eval_polyp(a, &model),
+                    0,
+                    "Count_{} n={}: axiom {} not satisfied",
+                    q, n, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tseitin_kn_model_unsat_when_sum_odd() {
+        // charge 1 on n odd → ∑ c_v = n odd → UNSAT
+        assert!(tseitin_kn_model(5, 1).is_none());
+        assert!(tseitin_kn_model(7, 1).is_none());
+    }
+
+    #[test]
+    fn tseitin_kn_model_satisfies_axioms_when_sum_even() {
+        // n even with charge 1 → SAT
+        for n in [4u32, 6, 8] {
+            let model = tseitin_kn_model(n, 1).expect("SAT");
+            let (_, axioms) = tseitin_kn(n, 1, 2);
+            for (i, a) in axioms.iter().enumerate() {
+                assert_eq!(
+                    eval_polyp(a, &model),
+                    0,
+                    "Tseitin K_{} charge=1: axiom {} not satisfied",
+                    n, i
+                );
+            }
+        }
+        // n odd with charge 0 → SAT (all-zero model)
+        for n in [5u32, 7] {
+            let model = tseitin_kn_model(n, 0).expect("SAT");
+            let (_, axioms) = tseitin_kn(n, 0, 2);
+            for (i, a) in axioms.iter().enumerate() {
+                assert_eq!(
+                    eval_polyp(a, &model),
+                    0,
+                    "Tseitin K_{} charge=0: axiom {} not satisfied",
+                    n, i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tseitin_cycle_model_satisfies_axioms() {
+        // Even-cycle with charge 1 → SAT
+        let model = tseitin_cycle_model(6, 1).expect("SAT");
+        let (_, axioms) = tseitin_cycle(6, 1, 2);
+        for (i, a) in axioms.iter().enumerate() {
+            assert_eq!(eval_polyp(a, &model), 0, "C_6 axiom {} not satisfied", i);
+        }
+    }
+
+    #[test]
+    fn tseitin_petersen_uniform_charge_1_is_sat() {
+        // ∑ c_v = 10 (even) → SAT (consistent with README note).
+        let charges = [1u8; 10];
+        let model = tseitin_petersen_model(&charges).expect("SAT");
+        let (_, axioms) = tseitin_petersen(&charges, 2);
+        for (i, a) in axioms.iter().enumerate() {
+            assert_eq!(
+                eval_polyp(a, &model),
+                0,
+                "Petersen axiom {} not satisfied",
+                i
+            );
         }
     }
 }

@@ -104,6 +104,36 @@ infrastructure for custom automorphism groups (cycle → D_n, Petersen → S_5)
 is wired (`find_orbit_cert_fp_with_gens`) but not yet used by the public
 factories — `Aut(G) ⊊ S_n` reduction is follow-up work.
 
+## SAT detection
+
+For the structured families (PHP, Count_q, Tseitin), SAT / UNSAT is
+determined by a closed-form condition the solver checks before
+running the algebraic probe. When the instance is SAT, it emits a
+DIMACS-standard model and exits 10, bypassing the UNSAT search
+entirely.
+
+| Family | SAT condition | Witness |
+|---|---|---|
+| `php:P,H` | `P ≤ H` | injection `pigeon i → hole i` |
+| `count:n,q` | `q ∣ n` | natural partition `{1..q}, {q+1..2q}, ...` |
+| `tseitin-*` | `∑_v c_v` even | Gaussian elim over 𝔽_2 on vertex-edge incidence |
+
+```bash
+cascade --alg-preprocess 1 --alg-p 2 --problem php:3,5 /tmp/dummy.cnf
+# s SATISFIABLE
+# v 1 -2 -3 -4 -5 -6 7 -8 -9 -10 -11 -12 13 -14 -15 0
+```
+
+When the SAT condition fails, cascade proceeds to the algebraic UNSAT
+probe at the given `(p, d)`. The three possible end states for
+`--problem` are now:
+
+1. `s SATISFIABLE` + model (closed-form detector found a witness).
+2. `s UNSATISFIABLE` + optional cert (algebraic probe closed).
+3. `c [alg] no ... cert at degree D` (UNSAT cert not found at this
+   `d`; the instance is still provably UNSAT by the closed-form
+   condition, but the algebraic witness at this degree does not close).
+
 ## Certificates
 
 Every `--alg-preprocess` UNSAT verdict produces a cert when
