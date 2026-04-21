@@ -44,6 +44,7 @@ pub mod ns_cert;
 pub mod ns_to_pb;
 pub mod php_orbit_enum;
 pub mod php_pair_orbits;
+pub mod php_cert_explicit;
 
 pub use poly::{Monomial, Poly, F2};
 pub use ns::{find_ns_certificate, NsResult, NsCertificate};

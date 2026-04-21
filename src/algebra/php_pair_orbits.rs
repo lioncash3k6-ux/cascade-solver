@@ -388,7 +388,7 @@ pub fn axiom_terms(
 
 /// A pair-orbit member: (axiom label, mono bits). Axiom label depends on
 /// which axiom orbit the pair belongs to.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum AxiomLabel {
     Pigeon(u32),               // pigeon index 0..P-1
     Hole(u32, u32, u32),       // (hole, p_lo, p_hi) with p_lo < p_hi
@@ -425,86 +425,189 @@ fn axiom_terms_of_label(
     }
 }
 
-/// Color-refinement-based Stab(pair)-orbit computation for holes, given a
-/// pair orbit with axiom_orbit=0 (pigeon totality at pigeon 0) and monomial
-/// rep m*.
+/// Exact computation of Stab(pair)-orbits on holes for a pigeon-axiom pair
+/// orbit with monomial rep `m*`.
 ///
-/// Returns `hole_orbit_id[j]` such that two holes j, j' are in the same
-/// Stab(pair)-orbit iff `hole_orbit_id[j] == hole_orbit_id[j']`.
+/// Stab(pair) = Aut(bipartite graph m*) ∩ {permutations fixing pigeon 0}.
+/// We compute this by brute-force enumeration of automorphisms on the
+/// "connected" part of m* (pigeons and holes with nonzero degree in m*).
+/// Disconnected pigeons/holes are freely permutable so they fall out of
+/// the computation.
 ///
-/// Algorithm: iterated color refinement on the bipartite graph of m* with
-/// pigeon 0 distinguished. Initialize colors by local structure, refine by
-/// multisets of neighbor colors until stable. For sparse m* (d ≤ 7 cells on
-/// up to 8×7 grid), refinement converges to the true Aut-orbit partition.
+/// For sparse m* (d ≤ 8 cells on up to 16×16 grid), connected-pigeons ≤ d
+/// and connected-holes ≤ d, so we enumerate at most `d!` permutations
+/// (≤ 40,320 for d=8). Per permutation: O(d) work to derive τ. Fast.
 fn hole_orbits_under_pigeon_stab(m_bits: u128, p: u32, h: u32) -> Vec<u32> {
-    let p_usize = p as usize;
-    let h_usize = h as usize;
-    // Adjacency: m_bits cell (i, j) at bit i*h + j.
-    let cell = |i: u32, j: u32| -> bool {
-        let pos = i * h + j;
-        (m_bits >> pos) & 1 == 1
-    };
-
-    // Initial hole colors: (has pigeon 0 connection, # non-0 pigeons connected).
-    let mut hole_color: Vec<u64> = (0..h)
-        .map(|j| {
-            let has_p0 = if cell(0, j) { 1u64 } else { 0 };
-            let non_0_count: u64 =
-                (1..p).filter(|&i| cell(i, j)).count() as u64;
-            (has_p0 << 32) | non_0_count
-        })
+    let cell = |i: u32, j: u32| -> bool { (m_bits >> (i * h + j)) & 1 == 1 };
+    // Adjacency bitmasks.
+    let pigeon_adj: Vec<u128> = (0..p)
+        .map(|i| (0..h).filter(|&j| cell(i, j)).fold(0u128, |a, j| a | (1u128 << j)))
         .collect();
-    // Initial pigeon colors: (is pigeon 0, # holes connected).
-    // Pigeon 0 gets a unique color (distinguishes pigeon 0).
-    let mut pigeon_color: Vec<u64> = (0..p)
-        .map(|i| {
-            let is_p0 = if i == 0 { u64::MAX } else { 0 };
-            let pop: u64 = (0..h).filter(|&j| cell(i, j)).count() as u64;
-            is_p0 ^ pop
-        })
+    let hole_adj: Vec<u128> = (0..h)
+        .map(|j| (0..p).filter(|&i| cell(i, j)).fold(0u128, |a, i| a | (1u128 << i)))
         .collect();
+    // Connected pigeons (excluding pigeon 0 which is distinguished).
+    let connected_pigeons: Vec<u32> =
+        (1..p).filter(|&i| pigeon_adj[i as usize] != 0).collect();
+    let connected_holes: Vec<u32> =
+        (0..h).filter(|&j| hole_adj[j as usize] != 0).collect();
 
-    // Iterate color refinement until stable (max 8 iterations — plenty for
-    // graphs of this size).
-    for _iter in 0..8 {
-        let mut new_hole_color: Vec<u64> = Vec::with_capacity(h_usize);
-        for j in 0..h {
-            let mut neighbor_pigeon_colors: Vec<u64> =
-                (0..p).filter(|&i| cell(i, j)).map(|i| pigeon_color[i as usize]).collect();
-            neighbor_pigeon_colors.sort();
-            // Hash the multiset.
-            let mut hash: u64 = hole_color[j as usize];
-            for c in neighbor_pigeon_colors {
-                hash = hash.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(c);
-            }
-            new_hole_color.push(hash);
+    let mut hole_parent: Vec<usize> = (0..h as usize).collect();
+
+    // Backtrack over permutations of connected_pigeons. For each σ, derive
+    // τ on connected holes such that (σ, τ) preserves m*.
+    let n_cp = connected_pigeons.len();
+    let mut perm_indices: Vec<usize> = (0..n_cp).collect();
+    loop {
+        // Build full pigeon permutation σ_p: σ_p[pigeon 0] = 0, σ_p[connected_pigeons[k]] = connected_pigeons[perm_indices[k]].
+        let mut sigma_p: Vec<u32> = (0..p).collect();
+        sigma_p[0] = 0;
+        for k in 0..n_cp {
+            sigma_p[connected_pigeons[k] as usize] = connected_pigeons[perm_indices[k]];
         }
-        let mut new_pigeon_color: Vec<u64> = Vec::with_capacity(p_usize);
-        for i in 0..p {
-            let mut neighbor_hole_colors: Vec<u64> =
-                (0..h).filter(|&j| cell(i, j)).map(|j| hole_color[j as usize]).collect();
-            neighbor_hole_colors.sort();
-            let mut hash: u64 = pigeon_color[i as usize];
-            for c in neighbor_hole_colors {
-                hash = hash.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(c);
+        // Validate: pigeon-adjacency-cardinality check.
+        let mut valid_sigma = true;
+        for k in 0..n_cp {
+            let i = connected_pigeons[k] as usize;
+            let i_img = sigma_p[i] as usize;
+            if pigeon_adj[i].count_ones() != pigeon_adj[i_img].count_ones() {
+                valid_sigma = false;
+                break;
             }
-            new_pigeon_color.push(hash);
         }
-        if new_hole_color == hole_color && new_pigeon_color == pigeon_color {
+        if valid_sigma {
+            // Backtrack over τ assignments: for each connected hole j, τ(j) can
+            // be ANY connected hole with matching hole_adj under σ. Earlier
+            // version picked the first match — missed alternative τ's that
+            // are also valid Auts.
+            let mut tau_p: Vec<u32> = vec![0; h as usize];
+            enumerate_taus(
+                &connected_holes,
+                &hole_adj,
+                &sigma_p,
+                0,
+                0u128,
+                &mut tau_p,
+                p,
+                &mut |tau: &[u32]| {
+                    // (σ, τ) valid — union hole orbits.
+                    for &j in &connected_holes {
+                        let j_img = tau[j as usize];
+                        let (a, b) = (j as usize, j_img as usize);
+                        let ra = uf_find_local(&mut hole_parent, a);
+                        let rb = uf_find_local(&mut hole_parent, b);
+                        if ra != rb {
+                            hole_parent[ra] = rb;
+                        }
+                    }
+                },
+            );
+        }
+        if !next_permutation(&mut perm_indices) {
             break;
         }
-        hole_color = new_hole_color;
-        pigeon_color = new_pigeon_color;
     }
 
-    // Compact colors to contiguous ids.
-    let mut sorted_colors: Vec<u64> = hole_color.iter().copied().collect();
-    sorted_colors.sort();
-    sorted_colors.dedup();
-    hole_color
-        .iter()
-        .map(|c| sorted_colors.binary_search(c).unwrap() as u32)
-        .collect()
+    // Disconnected holes are all freely permutable under Aut (any permutation
+    // on them is valid). Union them into one orbit.
+    let disconnected_holes: Vec<u32> =
+        (0..h).filter(|&j| hole_adj[j as usize] == 0).collect();
+    for j in disconnected_holes.windows(2) {
+        let (a, b) = (j[0] as usize, j[1] as usize);
+        let ra = uf_find_local(&mut hole_parent, a);
+        let rb = uf_find_local(&mut hole_parent, b);
+        if ra != rb {
+            hole_parent[ra] = rb;
+        }
+    }
+
+    // Compact orbit ids to 0..k.
+    let mut orbit_id: Vec<u32> = vec![0; h as usize];
+    let mut root_to_id: BTreeMap<usize, u32> = BTreeMap::new();
+    let mut next_id: u32 = 0;
+    for j in 0..h as usize {
+        let root = uf_find_local(&mut hole_parent, j);
+        let id = *root_to_id.entry(root).or_insert_with(|| {
+            let c = next_id;
+            next_id += 1;
+            c
+        });
+        orbit_id[j] = id;
+    }
+    orbit_id
+}
+
+/// Local union-find `find` (copy of `uf_find` for use in local scopes).
+fn uf_find_local(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Backtrack over all valid τ's (hole permutations) consistent with a
+/// fixed σ (pigeon permutation). Calls `on_found` with each complete τ.
+fn enumerate_taus(
+    connected_holes: &[u32],
+    hole_adj: &[u128],
+    sigma_p: &[u32],
+    idx: usize,
+    used_holes: u128,
+    tau: &mut Vec<u32>,
+    p: u32,
+    on_found: &mut dyn FnMut(&[u32]),
+) {
+    if idx >= connected_holes.len() {
+        on_found(tau);
+        return;
+    }
+    let j = connected_holes[idx];
+    let adj = hole_adj[j as usize];
+    let mut target_adj: u128 = 0;
+    for i in 0..p {
+        if (adj >> i) & 1 == 1 {
+            target_adj |= 1u128 << sigma_p[i as usize];
+        }
+    }
+    for &jc in connected_holes {
+        if hole_adj[jc as usize] == target_adj && (used_holes >> jc) & 1 == 0 {
+            tau[j as usize] = jc;
+            enumerate_taus(
+                connected_holes,
+                hole_adj,
+                sigma_p,
+                idx + 1,
+                used_holes | (1u128 << jc),
+                tau,
+                p,
+                on_found,
+            );
+        }
+    }
+}
+
+/// Next lexicographic permutation in-place. Returns `true` iff a next
+/// permutation exists (input is not the last in sorted order).
+fn next_permutation(perm: &mut [usize]) -> bool {
+    let n = perm.len();
+    if n <= 1 {
+        return false;
+    }
+    let mut i = n - 1;
+    while i > 0 && perm[i - 1] >= perm[i] {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let mut j = n - 1;
+    while perm[j] <= perm[i - 1] {
+        j -= 1;
+    }
+    perm.swap(i - 1, j);
+    perm[i..].reverse();
+    true
 }
 
 /// Build the orbit-basis NS matrix via BFS over pair-orbit members.
@@ -696,16 +799,51 @@ pub fn build_orbit_matrix(
             let slot = a_of_kappa.entry(kappa_const).or_insert(0u16);
             *slot = (*slot + (prime - 1) as u16) % prime as u16;
         } else {
-            // Hole AMO axiom: one term = x_{p_lo, hole} · x_{p_hi, hole}
-            // with coef 1. Stab(pair)-orbit size = 1 (term is Stab-fixed).
-            let term_bits = (1u128 << 0) | (1u128 << h); // (0, 0) and (1, 0)
-            let product = term_bits | po.mono_rep_bits;
-            if (product.count_ones() as u32) <= d {
-                let pm = PhpMatrix::from_bits(product, p, h);
-                let kappa = orbit_index.of(pm);
-                let slot = a_of_kappa.entry(kappa).or_insert(0u16);
-                *slot = (*slot + 1) % prime as u16;
+            // Hole AMO axiom: term fixed, but pair-orbit members visit
+            // different (axiom_label, m) pairs. The closed-form per-orbit
+            // approach is the same as pigeon's: enumerate Stab(pair)-orbits
+            // of the SINGLE term relative to the specific (a_0, m*) rep.
+            // Simpler path: BFS-walk this pair orbit's members. Cost is
+            // bounded by |pair| which is typically small. Correct always.
+            use std::collections::HashSet;
+            let seed_label = AxiomLabel::Hole(0, 0, 1);
+            let mut visited: HashSet<(AxiomLabel, u128)> = HashSet::new();
+            let mut queue: Vec<(AxiomLabel, u128)> = Vec::new();
+            visited.insert((seed_label, po.mono_rep_bits));
+            queue.push((seed_label, po.mono_rep_bits));
+            let n_gens = (p.saturating_sub(1) + h.saturating_sub(1)) as usize;
+            while let Some((alabel, mb)) = queue.pop() {
+                let terms = axiom_terms_of_label(po.axiom_orbit, alabel, p, h, prime);
+                for (term_bits, coef) in &terms {
+                    let product = term_bits | mb;
+                    if (product.count_ones() as u32) > d {
+                        continue;
+                    }
+                    let pm = PhpMatrix::from_bits(product, p, h);
+                    let kappa = orbit_index.of(pm);
+                    if mono_orbits[kappa].bits == product {
+                        let slot = a_of_kappa.entry(kappa).or_insert(0u16);
+                        *slot = (*slot + *coef as u16) % prime as u16;
+                    }
+                }
+                let m = PhpMatrix::from_bits(mb, p, h);
+                for gi in 0..n_gens {
+                    let img = apply_gen(&m, gi, p, h);
+                    let new_label = apply_gen_to_axiom(alabel, gi, p, h);
+                    let state = (new_label, img.bits);
+                    if visited.insert(state) {
+                        queue.push(state);
+                    }
+                }
             }
+            // This BFS already samples at rep_κ (the `== product` check),
+            // so the result IS M[κ][col] directly — no need to scale by
+            // |pair|/|orbit κ|. Bypass the `a_of_kappa → v` step below
+            // by directly writing to matrix.
+            for (kappa, a_val) in a_of_kappa.iter() {
+                matrix[*kappa][col] = *a_val as u8;
+            }
+            continue;
         }
 
         // matrix[κ][col] = pair_size · A'(κ) · inv(|orbit κ|) mod p.
@@ -1107,17 +1245,390 @@ mod tests {
         assert!(acc.is_one(), "cert does not verify");
     }
 
+    /// Helper: normalize an orbit-id vector so two vectors representing the
+    /// same partition compare equal (classes relabeled in first-occurrence
+    /// order).
+    fn normalize_orbits(orbits: &[u32]) -> Vec<u32> {
+        let mut remap: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut next_id: u32 = 0;
+        orbits
+            .iter()
+            .map(|&c| {
+                *remap.entry(c).or_insert_with(|| {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                })
+            })
+            .collect()
+    }
+
+    /// Build a PhpMatrix's bits from a list of (pigeon, hole) cells.
+    fn mk_bits(cells: &[(u32, u32)], h: u32) -> u128 {
+        cells.iter().fold(0u128, |acc, &(i, j)| acc | (1u128 << (i * h + j)))
+    }
+
+    /// Hand-computed Aut-orbit expectations for specific m*'s.
+    #[test]
+    fn hole_orbits_empty_m_star() {
+        // Empty m*: all holes disconnected, all in one orbit.
+        let orbits = hole_orbits_under_pigeon_stab(0, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn hole_orbits_single_edge_not_row_0() {
+        // m* = {(1, 0)}: hole 0 connected (via pigeon 1), holes 1,2 disconnected.
+        // Stab fixes hole 0; permutes {1, 2}.
+        let m = mk_bits(&[(1, 0)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn hole_orbits_same_pigeon_two_holes() {
+        // m* = {(1, 0), (1, 1)}: pigeon 1 connects to holes 0,1; hole 2 disconnected.
+        // Aut can swap holes 0↔1 (τ=(01), σ fixed). Holes 0,1 in same orbit.
+        let m = mk_bits(&[(1, 0), (1, 1)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn hole_orbits_two_disjoint_edges() {
+        // m* = {(1, 0), (2, 1)}: two disjoint edges; hole 2 disconnected.
+        // Aut can swap (σ=(12), τ=(01)). Holes 0,1 in same orbit.
+        let m = mk_bits(&[(1, 0), (2, 1)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn hole_orbits_path_graph() {
+        // m* = {(1, 0), (1, 2), (2, 1)}: pigeon 1 connects to holes 0 and 2,
+        // pigeon 2 connects to hole 1. Holes 0,2 are symmetric (both
+        // connected to pigeon 1, hole 2 of same multiplicity); hole 1 is
+        // distinguished.
+        let m = mk_bits(&[(1, 0), (1, 2), (2, 1)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn hole_orbits_pigeon_0_connected() {
+        // m* = {(0, 0), (1, 0)}: pigeon 0 AND pigeon 1 connect to hole 0.
+        // Hole 0 has adj {0, 1}. Holes 1,2 disconnected.
+        // Stab fixes pigeon 0; pigeon 1 has unique adj, so σ(1)=1, σ(2)=2.
+        // τ(0) must have adj {0, σ(1)} = {0, 1} — only hole 0. So τ(0)=0.
+        // τ(1), τ(2) can swap.
+        let m = mk_bits(&[(0, 0), (1, 0)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 1, 1]);
+    }
+
+    #[test]
+    fn hole_orbits_row_0_vs_other_row_distinct() {
+        // m* = {(0, 0), (1, 1)}: pigeon 0 → hole 0; pigeon 1 → hole 1.
+        // hole_adj[0] = {0}, hole_adj[1] = {1}. Different (pigeon 0 is distinguished).
+        // No Aut can swap them (σ fixes pigeon 0).
+        let m = mk_bits(&[(0, 0), (1, 1)], 3);
+        let orbits = hole_orbits_under_pigeon_stab(m, 3, 3);
+        assert_eq!(normalize_orbits(&orbits), vec![0, 1, 2]);
+    }
+
+    /// Fast debug: for PHP_{7,6} d=7 specifically, dump the failing
+    /// cell (173, 423) with intermediate state so we can see what the
+    /// closed-form and BFS each compute.
+    #[test]
+    #[ignore]
+    fn dump_failing_cell_php_7_6_d7() {
+        let p = 7u32;
+        let h = 6u32;
+        let d = 7u32;
+        let prime = 11u8;
+        let mono_orbits = enumerate_php_orbit_reps(p, h, d);
+        let (pair_orbits, mu_sizes) = enumerate_php_pair_orbits(p, h, d, &mono_orbits);
+        let target_row = 173usize;
+        let target_col = 423usize;
+        let rep_kappa = mono_orbits[target_row].bits;
+        let po = &pair_orbits[target_col];
+        eprintln!(
+            "row {}: rep_κ = 0x{:x} (popcount {})",
+            target_row,
+            rep_kappa,
+            rep_kappa.count_ones()
+        );
+        eprintln!(
+            "col {}: axiom_orbit={} mu_orbit={} mono_rep=0x{:x} |pair|={}",
+            target_col,
+            po.axiom_orbit,
+            po.mono_orbit,
+            po.mono_rep_bits,
+            po.size
+        );
+        let m_star = po.mono_rep_bits;
+        eprintln!(
+            "m* = 0x{:x} popcount {}",
+            m_star,
+            m_star.count_ones()
+        );
+
+        // Closed-form contribution to cell (173, 423).
+        let orbit_index = OrbitIndex::new(&mono_orbits);
+        let pair_size_mod = (po.size % prime as u64) as u8;
+        let inv_mu_kappa = {
+            let s = mu_sizes[target_row];
+            let s_mod = (s % prime as u64) as u8;
+            mod_inv(s_mod, prime)
+        };
+
+        if po.axiom_orbit == 1 {
+            // Hole axiom branch.
+            let term_bits = (1u128 << 0) | (1u128 << h);
+            let product = term_bits | m_star;
+            eprintln!(
+                "hole axiom: term_bits=0x{:x} product=0x{:x} popcount={}",
+                term_bits, product, product.count_ones()
+            );
+            if (product.count_ones() as u32) <= d {
+                let pm = PhpMatrix::from_bits(product, p, h);
+                let kappa = orbit_index.of(pm);
+                eprintln!(
+                    "  product orbit = {}, target row = {}, match = {}",
+                    kappa, target_row, kappa == target_row
+                );
+                if kappa == target_row {
+                    let a_kappa = 1u16;
+                    let v = (pair_size_mod as u16 * a_kappa) % prime as u16;
+                    let v = (v * inv_mu_kappa as u16) % prime as u16;
+                    eprintln!(
+                        "closed-form cell: A'(κ)={} |pair|mod p={} inv|orbit|={} → v={}",
+                        a_kappa, pair_size_mod, inv_mu_kappa, v
+                    );
+                } else {
+                    eprintln!("closed-form cell: 0 (product orbit {} != target {})", kappa, target_row);
+                }
+            }
+        } else if po.axiom_orbit == 0 {
+            let hole_orbits = hole_orbits_under_pigeon_stab(m_star, p, h);
+            eprintln!("hole_orbits: {:?}", hole_orbits);
+            let mut class_size: Vec<u32> = vec![0; h as usize];
+            for &c in &hole_orbits { class_size[c as usize] += 1; }
+            let mut a_kappa: u16 = 0;
+            let mut orbit_seen: Vec<bool> = vec![false; h as usize];
+            for j in 0..h {
+                let c = hole_orbits[j as usize] as usize;
+                if orbit_seen[c] { continue; }
+                orbit_seen[c] = true;
+                let term_bit = 1u128 << j;
+                let product = term_bit | m_star;
+                if (product.count_ones() as u32) > d { continue; }
+                let pm = PhpMatrix::from_bits(product, p, h);
+                let kappa = orbit_index.of(pm);
+                if kappa == target_row {
+                    eprintln!(
+                        "  hole-orbit rep j={}: product=0x{:x} orbit={} class_size={} → A'(κ) += {}",
+                        j, product, kappa, class_size[c], class_size[c]
+                    );
+                    a_kappa = (a_kappa + class_size[c] as u16) % prime as u16;
+                }
+            }
+            let product_const = m_star;
+            let pm_const = PhpMatrix::from_bits(product_const, p, h);
+            let kappa_const = orbit_index.of(pm_const);
+            if kappa_const == target_row {
+                eprintln!(
+                    "  constant term: product=0x{:x} orbit={} coef={} → A'(κ) += {}",
+                    product_const, kappa_const, prime - 1, prime - 1
+                );
+                a_kappa = (a_kappa + (prime - 1) as u16) % prime as u16;
+            }
+            let v = (pair_size_mod as u16 * a_kappa) % prime as u16;
+            let v = (v * inv_mu_kappa as u16) % prime as u16;
+            eprintln!(
+                "closed-form cell: A'(κ)={} |pair|mod p={} inv|orbit|={} → v={}",
+                a_kappa, pair_size_mod, inv_mu_kappa, v
+            );
+        }
+
+        // BFS scatter for this specific pair orbit.
+        let seed_label = if po.axiom_orbit == 0 {
+            AxiomLabel::Pigeon(0)
+        } else {
+            AxiomLabel::Hole(0, 0, 1)
+        };
+        use std::collections::HashSet;
+        let mut visited: HashSet<(AxiomLabel, u128)> = HashSet::new();
+        let mut queue: Vec<(AxiomLabel, u128)> = Vec::new();
+        visited.insert((seed_label, m_star));
+        queue.push((seed_label, m_star));
+        let n_gens = (p.saturating_sub(1) + h.saturating_sub(1)) as usize;
+        let mut bfs_contribution: u16 = 0;
+        let mut contrib_count = 0;
+        while let Some((alabel, mb)) = queue.pop() {
+            let terms = axiom_terms_of_label(po.axiom_orbit, alabel, p, h, prime);
+            for (term_bits, coef) in &terms {
+                let product = term_bits | mb;
+                if (product.count_ones() as u32) > d { continue; }
+                let pm = PhpMatrix::from_bits(product, p, h);
+                let kappa = orbit_index.of(pm);
+                if kappa == target_row && mono_orbits[kappa].bits == product {
+                    bfs_contribution = (bfs_contribution + *coef as u16) % prime as u16;
+                    contrib_count += 1;
+                    if contrib_count <= 10 {
+                        eprintln!(
+                            "  BFS hit: axiom_label={:?} m=0x{:x} term=0x{:x} coef={}",
+                            alabel, mb, term_bits, coef
+                        );
+                    }
+                }
+            }
+            let m = PhpMatrix::from_bits(mb, p, h);
+            for gi in 0..n_gens {
+                let img = apply_gen(&m, gi, p, h);
+                let new_label = apply_gen_to_axiom(alabel, gi, p, h);
+                let state = (new_label, img.bits);
+                if visited.insert(state) { queue.push(state); }
+            }
+        }
+        eprintln!(
+            "BFS cell: {} triples hit rep_κ, total = {}",
+            contrib_count, bfs_contribution
+        );
+    }
+
+    /// Brute-force reference: enumerate ALL (σ, τ) ∈ S_{P-1} × S_H with
+    /// σ fixing pigeon 0; those preserving m* form Aut; compute hole orbits
+    /// by UF. Trusted reference for validating the fast brute-force in
+    /// `hole_orbits_under_pigeon_stab`.
+    fn brute_hole_orbits(m_bits: u128, p: u32, h: u32) -> Vec<u32> {
+        let cell = |i: u32, j: u32| -> bool { (m_bits >> (i * h + j)) & 1 == 1 };
+        let mut hole_parent: Vec<usize> = (0..h as usize).collect();
+        // Enumerate σ on pigeons 1..P-1 (fix pigeon 0).
+        let mut sigma: Vec<u32> = (0..p).collect();
+        let mut sigma_tail: Vec<u32> = (1..p).collect();
+        loop {
+            sigma[0] = 0;
+            for (idx, &v) in sigma_tail.iter().enumerate() {
+                sigma[idx + 1] = v;
+            }
+            // Enumerate τ on all holes.
+            let mut tau: Vec<u32> = (0..h).collect();
+            loop {
+                // Check (σ, τ) preserves m*: for every (i, j) ∈ m*, (σ(i), τ(j)) ∈ m*.
+                let mut preserves = true;
+                for i in 0..p {
+                    for j in 0..h {
+                        if cell(i, j) != cell(sigma[i as usize], tau[j as usize]) {
+                            preserves = false;
+                            break;
+                        }
+                    }
+                    if !preserves {
+                        break;
+                    }
+                }
+                if preserves {
+                    for j in 0..h {
+                        let a = j as usize;
+                        let b = tau[j as usize] as usize;
+                        let ra = uf_find_local(&mut hole_parent, a);
+                        let rb = uf_find_local(&mut hole_parent, b);
+                        if ra != rb {
+                            hole_parent[ra] = rb;
+                        }
+                    }
+                }
+                if !next_permutation_u32(&mut tau) {
+                    break;
+                }
+            }
+            if !next_permutation_u32(&mut sigma_tail) {
+                break;
+            }
+        }
+        // Compact.
+        let mut orbit_id: Vec<u32> = vec![0; h as usize];
+        let mut remap: BTreeMap<usize, u32> = BTreeMap::new();
+        let mut next_id: u32 = 0;
+        for j in 0..h as usize {
+            let root = uf_find_local(&mut hole_parent, j);
+            let id = *remap.entry(root).or_insert_with(|| {
+                let c = next_id;
+                next_id += 1;
+                c
+            });
+            orbit_id[j] = id;
+        }
+        orbit_id
+    }
+
+    fn next_permutation_u32(perm: &mut [u32]) -> bool {
+        let n = perm.len();
+        if n <= 1 {
+            return false;
+        }
+        let mut i = n - 1;
+        while i > 0 && perm[i - 1] >= perm[i] {
+            i -= 1;
+        }
+        if i == 0 {
+            return false;
+        }
+        let mut j = n - 1;
+        while perm[j] <= perm[i - 1] {
+            j -= 1;
+        }
+        perm.swap(i - 1, j);
+        perm[i..].reverse();
+        true
+    }
+
+    /// Sweep all m*'s of degree ≤ d on PHP_{P, H}, compare fast Aut orbits
+    /// to brute-force. Any mismatch indicates a bug in
+    /// `hole_orbits_under_pigeon_stab`.
+    #[test]
+    fn aut_matches_brute_php_4_3() {
+        let p = 4u32;
+        let h = 3u32;
+        let n_vars = (p * h) as u32;
+        let mut checked = 0;
+        for bits in 0u128..(1u128 << n_vars) {
+            if bits.count_ones() > 5 {
+                continue;
+            }
+            let fast = hole_orbits_under_pigeon_stab(bits, p, h);
+            let brute = brute_hole_orbits(bits, p, h);
+            let fast_n = normalize_orbits(&fast);
+            let brute_n = normalize_orbits(&brute);
+            if fast_n != brute_n {
+                panic!(
+                    "m*=0x{:x}: fast={:?} brute={:?}",
+                    bits, fast_n, brute_n
+                );
+            }
+            checked += 1;
+        }
+        eprintln!("checked {} m*'s on PHP_{{4,3}}", checked);
+    }
+
     /// Cross-check closed-form vs BFS scatter.
     #[test]
     fn scatter_methods_agree_small_cases() {
         for &(p, h, d, prime) in &[
             (3u32, 2u32, 2u32, 5u8),
+            (4, 3, 3, 5),
+            (4, 3, 4, 5),
             (5, 4, 5, 7),
             (5, 4, 6, 7),
+            (5, 4, 7, 7),
+            (5, 4, 8, 11),
+            (5, 4, 10, 11),
             (6, 5, 6, 7),
             (6, 5, 7, 7),
             (6, 5, 7, 11),
             (6, 5, 8, 7),
+            (6, 5, 9, 11),
         ] {
             let (disagreements, first) = compare_scatter_methods(p, h, d, prime);
             if let Some((r, c, cf, bfs)) = first {
