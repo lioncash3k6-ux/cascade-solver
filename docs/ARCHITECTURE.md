@@ -83,9 +83,10 @@ we use the dense path (`--alg-no-orbit`).
 
 * **Industrial SAT**. The orbit search pays off only when symmetry is
   substantial; random industrial instances don't have it.
-* **Ramsey.** Nullstellensatz degree for Ramsey is Ω(n); no fixed-d
-  cert exists. Cascade still has Ramsey tooling via the CDCL legs, but
-  the algebraic path in this document is not the right match.
+* **General Ramsey as s grows.** NS refutation degree grows with s.
+  For fixed s = 3 (R(3,3)) a degree-7 orbit-reduced cert works for
+  all K_n; the algebraic path is documented in `docs/ramsey_ns_invariance.md`.
+  R(4,4) would need degree 13 — not yet attempted.
 * **P vs NP / complexity-theoretic claims.** The polynomial-size NS
   proofs of PHP etc. are well-known properties of a stronger proof
   system than resolution. The contribution is the pipeline, not the
@@ -232,34 +233,26 @@ The `BTreeSet` form is canonical and hashes consistently, but it's
 allocation-heavy. The orbit engine converts to a compact bitmask form
 for the hot path.
 
-### u128 bitmask form
+### `[u64; N_WORDS]` bitmask form
 
-`src/algebra/orbit_ns.rs:31`:
+`src/algebra/orbit_ns.rs`:
 
 ```rust
-type MonoBits = u128;         // bit v-1 set iff variable v in support
+pub(crate) const N_WORDS: usize = 16;      // 1024 bits → covers K_45 (990 edges)
+pub(crate) type MonoBits = [u64; N_WORDS]; // bit v-1 set iff variable v in support
 ```
 
-* `mono_to_bits(m, n)`: `BTreeSet` → `u128`, sets one bit per variable.
-* `bits_to_mono(b)`: `u128` → `BTreeSet`, used only at cert
-  reconstruction time.
 * `apply_bits(b, var_table)`: apply a generator by iterating set bits
-  and mapping each to its image via `var_table`. `O(popcount(b))` bit
-  operations — typically ≤ `d` iterations.
-* Degree via `b.count_ones()`; product of two multilinear monomials
-  via `a | b` (disjoint support required, else degree grows).
+  across all words, mapping each to its image via `var_table`.
+  `O(popcount(b))` iterations, typically ≤ `d`.
+* `b.count_ones()`: sum of popcount over all words (degree).
+* `a | b`: bitwise OR for monomial product (disjoint support required).
+* `MonoBits::ZERO`, `set_bit(i)`, `clear_lowest()`, `trailing_zeros()`,
+  `is_zero()` — defined as methods on `[u64; N_WORDS]`.
 
-The 128-bit cap covers every family with `n_vars ≤ 128`. In practice
-PHP up to `P · H = 128` (e.g. `PHP_{11,11}`, `PHP_{13,9}`) and Ramsey
-up to `n = 16` (120 edges). The cap is asserted at
-`src/algebra/orbit_ns.rs:472` (inside `find_orbit_cert_fp_with_gens`):
-
-```rust
-assert!(n <= 128, "orbit_ns currently supports up to 128 vars (got {}).
-    Bitmask Monomial is u128; widen to [u64; 4] for larger families.", n);
-```
-
-Widening to `[u64; 4]` is mechanical; we have not needed it yet.
+N_WORDS history: 4 (256 bits, K_23) → 8 (512 bits, K_32) → **16 (1024
+bits, K_45)**. Bumping is mechanical: change the const, recompile. The
+current cap covers up to 990 edge-variables (K_45).
 
 ### `PolyP` — polynomials over 𝔽_p
 
@@ -307,47 +300,23 @@ all smaller-degree monomials.
 
 `src/algebra/orbit_ns.rs:138` — the `ColexIndex` struct holds:
 
-* `binom: Vec<Vec<u32>>` — `binom[a][k] = C(a, k)`, size `(n+2)(d+2)`.
-* `prefix: Vec<u32>` — length `d + 2`.
+* `binom: Vec<Vec<u64>>` — `binom[a][k] = C(a, k)`, size `(n+2)(d+2)`.
+* `prefix: Vec<u64>` — length `d + 2`.
 
+Both are **u64** (widened from u32) to handle C(190, 6) ≈ 60 B for K_20+.
+`rank() → usize`, `unrank(usize) → MonoBits`, `len() → usize`.
 Total memory: a few KB. Independent of `n_monos`.
 
 ### `rank`: bits → index
 
-`src/algebra/orbit_ns.rs:181`:
-
-```rust
-fn rank(&self, bits: MonoBits) -> u32 {
-    let k = bits.count_ones();
-    let mut r = self.prefix[k as usize];
-    let mut b = bits;
-    let mut i: u32 = 1;
-    while b != 0 {
-        let v = b.trailing_zeros();       // 0-indexed bit position
-        r += self.binom[v as usize][i as usize];
-        b &= b - 1;
-        i += 1;
-    }
-    r
-}
-```
-
-`O(d)` table lookups. No allocation.
+`src/algebra/orbit_ns.rs:181`. Iterates set bits across all N_WORDS
+words, accumulating the colex contribution of each. Returns `usize`.
+`O(d)` table lookups, no allocation.
 
 ### `unrank`: index → bits
 
-`src/algebra/orbit_ns.rs:196`:
-
-```rust
-fn unrank(&self, r: u32) -> MonoBits {
-    // Find degree k via prefix binary search / scan.
-    // For each i = k, k-1, ..., 1: find largest a with C(a, i) <= rem.
-    // a_i = a + 1; rem -= C(a, i).
-}
-```
-
-Also `O(d)` — one inner while-loop per peeled element, each bounded by
-`n`.
+`src/algebra/orbit_ns.rs:196`. Takes `usize`, returns `MonoBits`.
+`O(d)` — one inner while-loop per peeled element, each bounded by `n`.
 
 ### Enumeration order
 
@@ -457,9 +426,33 @@ uniform charge), this is guaranteed by construction.
 
 ### Phase 5: unknown-orbit enumeration + matrix scatter
 
-This is the dominant phase by time. The "unknowns" are pairs `(i,
-μ_idx)` — axiom index × multiplier monomial index. Each unknown
-corresponds to one scalar coefficient in the NS cert:
+This is the dominant phase by time for most families. Two code paths:
+
+**Ramsey stabilizer fast path** (`ramsey_stab_path` is `Some`):
+
+For R(s,s)/K_n, `Stab(canonical K_s on {0..s-1}) = S_s × S_{n-s}`.
+Instead of BFS over O(n^8) monomial pairs, the 193 canonical orbit
+types are enumerated directly from `graph_canon::enumerate_stab_pair_reps(s, budget)`:
+
+```rust
+for rep in &stab_reps {
+    let orbit_c_size = rep.orbit_c_size(n_verts, s_size); // polynomial in n
+    let mi_bits = rep.to_monobits(n_verts);
+    let mi = colex.rank(mi_bits) as u32;
+    // Push two columns: red axiom + blue axiom at this multiplier type
+    unknown_seeds.push((red_idx, mi));
+    unknown_seeds.push((blue_idx, mi));
+}
+```
+
+Cost: O(193) = O(1) in n. Total pair BFS: 0.022 s regardless of K_n size.
+`orbit_c_size(n) = P(n, s+f) / aut_count` — evaluated per n, not stored in
+the matrix.
+
+**General BFS path** (all other families):
+
+The "unknowns" are pairs `(i, μ_idx)` — axiom index × multiplier monomial
+index. Each unknown corresponds to one scalar coefficient in the NS cert:
 
 ```
 cert = ∑_i A_i · (∑_μ  c_{i,μ}  μ)
@@ -601,6 +594,36 @@ pigeon. Compare to the clausal encoding (a single clause `x(p, 1) ∨
 ... ∨ x(p, H)` plus AMO), which has higher NS degree due to how
 disjunctive encoding interacts with the characteristic.
 
+### PHP explicit cert — `php_cert_explicit`
+
+`src/algebra/php_cert_explicit.rs`. A closed-form NS certificate that
+bypasses the orbit engine entirely: multipliers are constructed directly
+from the combinatorial structure of PHP, without BFS, matrix build, or
+Gaussian elimination.
+
+**Formula.** For PHP_{P,H} at degree P (the tight degree), the multiplier
+for pigeon p totality axiom is:
+
+```
+λ_p = ∑_{S ⊆ [H], |S| = H-P+1}  (-1)^{...} · ∏_{p'≠p} x(p', σ(p'))
+```
+
+(see source for exact signs and index mapping). The identity `∑ λ_i · f_i = 1`
+holds by a combinatorial cancellation argument over 𝔽_p with `p ∤ P!`.
+
+**Complexity.** O(P × H^P) term enumeration. No memory proportional to
+n_monos or n_axioms. No Gaussian elimination.
+
+| Instance | Time | Previous (orbit-BFS) |
+|---|---:|---:|
+| PHP_{7,6} d=7 | 23 ms | 75 s |
+| PHP_{8,7} d=8 | 449 ms | — |
+| PHP_{9,8} d=9 | 12.7 s | — |
+
+The explicit engine is selected automatically when `P > H` and the degree
+matches. The orbit-BFS engine remains as a regression baseline
+(`src/algebra/php_orbit.rs`, `php_pair_orbits.rs`).
+
 ### Count_q (modular counting) — `count_q_partition`
 
 `src/problems.rs:182`. Schema: `UnorderedSubset { size: q }` on a
@@ -646,11 +669,25 @@ Variants:
 
 ### Ramsey (disjunctive encoding) — `ramsey_disjunctive`
 
-`src/problems.rs:74`. For infrastructure / integration-test purposes
-only. Ramsey NS degree is `Ω(n)`, so the algebraic path does not
-actually solve Ramsey at interesting sizes. The CDCL + symmetry legs
-in the rest of cascade handle Ramsey; this factory exists to verify
-the generic engine works on an UnorderedPair / Diagonal combination.
+`src/problems.rs:74`. Schema: `UnorderedPair` on n vertices.
+Group: `Diagonal S_n`.
+
+Axioms: for each s-subset T:
+* **Red K_s**: `∏_{e∈T} (1 − x_e) = 0` — not all-red.
+* **Blue K_s**: `∏_{e∈T} x_e = 0` — not all-blue.
+
+UNSAT iff n ≥ R(s, s) (by definition of Ramsey number).
+
+For s = 3 at degree d = 7, the engine activates the **stabilizer fast path**:
+the canonical K_3 axiom lives on `{1,2,3}`; its stabilizer within S_n is
+`S_3 × S_{n-3}`. The function `enumerate_stab_pair_reps(3, 4)` builds
+193 abstract canonical orbit types in `src/algebra/graph_canon.rs`,
+replacing the O(n^8) BFS with O(1) direct enumeration. The resulting
+291 × 386 matrix has rank 179 for all n ≥ 14, certified UNSAT in < 1 s.
+
+See `docs/ramsey_ns_invariance.md` for the full invariance proof.
+
+CLI: `--problem ramsey:s,s,n --alg-preprocess 7 --alg-p P` (P > n).
 
 ---
 
@@ -883,27 +920,45 @@ Inherited from the SAT solver convention:
 
 ## 11. Performance characteristics
 
-### PHP benchmark trajectory
+### PHP: orbit-BFS engine trajectory
 
-Three sessions of work on the orbit engine:
-
-| | Original | Stage 1 (b34a51a) | Colex (719537a) |
+| | Original | Stage 1 | Colex |
 |---|---|---|---|
 | PHP_{5,4} d=5, 𝔽₇ | 0.25 s / 10 MB | 0.17 s / 10 MB | 0.17 s / 10 MB |
 | PHP_{6,5} d=6, 𝔽₇ | 22 s / 930 MB | 1.7 s / 69 MB | **0.98 s / 35 MB** |
 | PHP_{7,6} d=7, 𝔽₁₁ | OOM | 260 s / 3.05 GB | **75 s / 886 MB** |
 | PHP_{8,7} d=7, 𝔽₁₁ | timeout / 40 GB | 60 min / 22.8 GB | **14 min / 5.5 GB** |
 
-PHP_{8,7} d=7 correctly returns "no cert" because PHP_{P, P-1}
-requires `d ≥ P`; `d = 8` is the real frontier.
+### PHP: explicit closed-form cert
 
-### Phase breakdown (PHP_{7,6} d=7, 𝔽₁₁)
+No BFS, no matrix, no Gaussian elimination. O(P × H^P).
 
-From `CASCADE_ALG_TIMING=1` on current head:
+| Instance | Time | Peak RAM |
+|---|---:|---:|
+| PHP_{7,6} d=7 | 23 ms | < 1 MB |
+| PHP_{8,7} d=8 | 449 ms | < 1 MB |
+| PHP_{9,8} d=9 | 12.7 s | < 1 MB |
+
+3,200× speedup over orbit-BFS on PHP_{7,6}.
+
+### Ramsey R(3,3)/K_n: direct orbit enumeration
+
+193 canonical types enumerated once, O(1) in n.
+Matrix build and Gaussian elimination: < 1 s for any n.
+
+| K_n | Pair step | Total | Rank |
+|---|---:|---:|---:|
+| K_14..K_40 | 0.022 s | 0.6–1.1 s | 179 |
+
+Previously (stab BFS): K_25 took 318 s; K_30 took ~1500 s.
+Speedup: >14,000×.
+
+### Phase breakdown (PHP_{7,6} d=7, 𝔽₁₁, orbit-BFS engine)
+
+From `CASCADE_ALG_TIMING=1`:
 
 ```
-enumerate_bits_up_to:  0.24 s   33.2M monomials
-colex index build:     0.00 s   binom 44 × 9 = 396 entries
+colex index build:     0.00 s   binom 44 × 9 entries
 var_tables:            0.00 s   11 generators
 monomial_orbits:      12.1 s   347 orbits from 33.2M
 axiom_action_table:    0.00 s   133 axioms × 11 gens
@@ -913,13 +968,10 @@ verify:                4.7 s
 TOTAL:                75 s
 ```
 
-Pair BFS + matrix scatter dominates (77 % of wall time). Monomial
-orbits (16 %) is the next chunk.
-
-### Memory inventory (PHP_{7,6} d=7, 𝔽₁₁)
+### Memory inventory (PHP_{7,6} d=7, 𝔽₁₁, orbit-BFS engine)
 
 ```
-monos_bits (Vec<u128>):          533 MB   (33M × 16B)
+monos_bits (Vec<MonoBits>):      533 MB   (33M × 16B)
 mono_orbit_id (Vec<u32>):        133 MB   (33M × 4B)
 pair_visited bitset:             550 MB   ((133 × 33M) / 8)
 matrix + misc:                     4 MB
@@ -928,22 +980,20 @@ ColexIndex (binom + prefix):      <1 KB
 peak ≈ 886 MB (measured via /usr/bin/time -v)
 ```
 
-Previously: plus 1.4 GB `mono_action`, plus ~1.5 GB `bits_index`
-HashMap, plus ~530 MB HashMap overhead. Both dropped now.
-
 ### Scaling considerations
 
 * **`n_monos` grows as `∑_{k ≤ d} C(n, k)`.** For PHP_{P,H}: `n =
   P·H`, `d = P`. At PHP_{10,9}, `n = 90`, `d = 10`: `∑_{k ≤ 10} C(90,
-  k) ≈ 10¹²`. Beyond enumeration; needs direct orbit enumeration
-  (real research).
-* **Pair BFS time scales as `n_axioms · n_monos · n_gens`.** At PHP
-  scale the `n_axioms` factor is small (≤ 200), but `n_monos · n_gens`
-  can be billions.
+  k) ≈ 10¹²`. The explicit cert avoids enumerating monomials; it is
+  O(P × H^P) instead.
+* **For Ramsey with the stabilizer fast path**, `n_monos` is never
+  enumerated; only 193 canonical representatives are instantiated.
+  The pair BFS is O(1) in n.
 * **`|G|` controls orbit reduction efficiency.** Larger `|G|` →
   smaller orbits → fewer matrix columns. For PHP_{7,6}, `|G| = 7!·6!
-  = 3.6M`; the 33M monomials collapse to 347 orbits, a factor of ≈
-  95,000×.
+  = 3.6M`; the 33M monomials collapse to 347 orbits (≈ 95,000×).
+  For Ramsey, `|G| = n!`; the orbit-reduced matrix is 291 × 386
+  independent of n.
 
 ---
 

@@ -8,7 +8,7 @@
 
 use crate::algebra::ns_fp::PolyP;
 use crate::algebra::poly::Monomial;
-use crate::tuple_schema::{BaseSet, GroupSpec, TupleKind, TupleVarSchema};
+use crate::tuple_schema::{BaseSet, Generator, GroupSpec, TupleKind, TupleVarSchema};
 use std::collections::BTreeMap;
 
 /// Functional pigeonhole principle PHP_{P,H}.
@@ -129,6 +129,284 @@ pub fn ramsey_disjunctive(
     }
 
     (schema, axioms)
+}
+
+/// Ramsey R(s, t) on K_n with **symmetry-breaking linear axioms** added.
+///
+/// Research probe: does fixing `k` disjoint edges to red (linear axioms
+/// `x_{e_i} − 1 = 0`) lower the NS closing degree of the *slice* relative
+/// to the unrestricted instance?
+///
+/// The edges are `{0,1}, {2,3}, ..., {2k-2, 2k-1}` (vertices 0-indexed from
+/// the S_n base 1..=n in tuple_schema). Requires `2k ≤ n`.
+///
+/// Breaks `S_n` symmetry. Use `--alg-no-orbit` (dense NS) or construct a
+/// stabilizer-subgroup generator set for orbit reduction; the default
+/// `schema.generators()` will panic in closure check.
+///
+/// Proves UNSAT of the slice only (edges `e_1..e_k` all red). Full-instance
+/// UNSAT requires a case-split cover or a color-swap symmetry argument.
+pub fn ramsey_sbp_fix_k_edges(
+    s: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    assert!(
+        2 * k <= n,
+        "ramsey_sbp_fix_k_edges: need 2k ≤ n (got k={}, n={})",
+        k,
+        n
+    );
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    // Fix k disjoint edges to red: x_{2i-1, 2i} − 1 = 0 for i = 1..=k.
+    // (tuple_schema uses 1-indexed vertices.)
+    for i in 0..k {
+        let u = 2 * i + 1;
+        let v = 2 * i + 2;
+        let var_id = schema.var_of_tuple(&[u, v]);
+        let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+        terms.insert(Monomial::single(var_id), 1);
+        terms.insert(Monomial::one(), prime - 1); // −1 mod p
+        axioms.push(PolyP { p: prime, terms });
+    }
+    (schema, axioms)
+}
+
+/// Ramsey R(s, t) on K_n with the **entire neighborhood of vertex 1 fixed**:
+/// edges `{1,2}..{1,r+1}` red (r_deg = r), edges `{1,r+2}..{1,n}` blue.
+/// Stabilizer is `{1} × S_r × S_{n-1-r}` (permute red neighbors + blue
+/// neighbors independently, vertex 1 fixed).
+pub fn ramsey_sbp_full_nbhd(
+    s: u32,
+    t: u32,
+    n: u32,
+    r: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    assert!(r + 1 <= n);
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    // Red edges: 1-j for j in 2..=r+1.
+    for j in 2..=(r + 1) {
+        let var_id = schema.var_of_tuple(&[1, j]);
+        let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+        terms.insert(Monomial::single(var_id), 1);
+        terms.insert(Monomial::one(), prime - 1);
+        axioms.push(PolyP { p: prime, terms });
+    }
+    // Blue edges: 1-j for j in r+2..=n.
+    for j in (r + 2)..=n {
+        let var_id = schema.var_of_tuple(&[1, j]);
+        let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+        terms.insert(Monomial::single(var_id), 1);
+        axioms.push(PolyP { p: prime, terms });
+    }
+    (schema, axioms)
+}
+
+/// Stabilizer generators for `ramsey_sbp_full_nbhd(s, t, n, r)`:
+/// `{1} × S_r × S_{n-1-r}`.
+pub fn ramsey_full_nbhd_stabilizer_gens(n: u32, r: u32) -> Vec<Generator> {
+    assert!(r + 1 <= n);
+    let n_us = n as usize;
+    let r_us = r as usize;
+    let mut gens: Vec<Generator> = Vec::new();
+    // S_r on red neighbors {2..=r+1}: positions 1..r (0-indexed).
+    for i in 1..r_us {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    // S_{n-1-r} on blue neighbors {r+2..=n}: positions r+1..n-1.
+    for i in (r_us + 1)..n_us.saturating_sub(1) {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    gens
+}
+
+/// Ramsey R(s, t) on K_n with a **blue star of degree k at vertex 1** fixed
+/// (edges `{1,2}..{1,k+1}` all blue, i.e. `x_{1,j} = 0`).
+pub fn ramsey_sbp_blue_star(
+    s: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    assert!(k + 1 <= n);
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    for j in 2..=(k + 1) {
+        let var_id = schema.var_of_tuple(&[1, j]);
+        let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+        terms.insert(Monomial::single(var_id), 1);
+        axioms.push(PolyP { p: prime, terms });
+    }
+    (schema, axioms)
+}
+
+/// Ramsey R(s, t) on K_n with a **red star of degree k at vertex 1** fixed.
+/// Edges `{1,2}, {1,3}, ..., {1, k+1}` all red. For `k ≥ 2`, this constrains
+/// vertex 1's red-neighborhood without (by itself) forcing any K_3.
+pub fn ramsey_sbp_red_star(
+    s: u32,
+    t: u32,
+    n: u32,
+    k: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    assert!(k + 1 <= n);
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    for j in 2..=(k + 1) {
+        let var_id = schema.var_of_tuple(&[1, j]);
+        let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+        terms.insert(Monomial::single(var_id), 1);
+        terms.insert(Monomial::one(), prime - 1);
+        axioms.push(PolyP { p: prime, terms });
+    }
+    (schema, axioms)
+}
+
+/// Ramsey R(s, t) on K_n with **a fixed red K_m clique** added as SBP axioms.
+/// For `m ≥ s`, the red-clique ban immediately contradicts ⇒ degree-3
+/// closure. Useful as a "trivial sanity" end of the SBP-strength axis.
+pub fn ramsey_sbp_red_clique(
+    s: u32,
+    t: u32,
+    n: u32,
+    m: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    assert!(m <= n);
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    // Fix every edge inside K_m on vertices {1..=m} to red.
+    for u in 1..=m {
+        for v in (u + 1)..=m {
+            let var_id = schema.var_of_tuple(&[u, v]);
+            let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+            terms.insert(Monomial::single(var_id), 1);
+            terms.insert(Monomial::one(), prime - 1);
+            axioms.push(PolyP { p: prime, terms });
+        }
+    }
+    (schema, axioms)
+}
+
+/// Ramsey R(s, t) on K_n with a **S_n-invariant linear slice** added:
+/// `(∑_e x_e) − r = 0`. Restricts to assignments with exactly `r` red edges.
+///
+/// Unlike [`ramsey_sbp_fix_k_edges`], this axiom IS S_n-invariant, so the
+/// full `schema.generators()` work — no stabilizer needed. Control for
+/// "does adding any linear axiom drop NS degree, or is the SBP structure
+/// specifically doing the work?"
+pub fn ramsey_slice_edge_count(
+    s: u32,
+    t: u32,
+    n: u32,
+    r: u32,
+    prime: u8,
+) -> (TupleVarSchema, Vec<PolyP>) {
+    let (schema, mut axioms) = ramsey_disjunctive(s, t, n, prime);
+    // Add axiom (∑_e x_e) − r = 0 (mod p).
+    let mut terms: BTreeMap<Monomial, u8> = BTreeMap::new();
+    for u in 1..=n {
+        for v in (u + 1)..=n {
+            let var_id = schema.var_of_tuple(&[u, v]);
+            terms.insert(Monomial::single(var_id), 1);
+        }
+    }
+    // Constant term: −r mod p.
+    let neg_r = ((prime as u32) - (r % prime as u32)) % prime as u32;
+    if neg_r != 0 {
+        terms.insert(Monomial::one(), neg_r as u8);
+    }
+    axioms.push(PolyP { p: prime, terms });
+    (schema, axioms)
+}
+
+/// Stabilizer-subgroup generators for `ramsey_sbp_red_star(s, t, n, k)`.
+/// Fixing k red edges all incident to vertex 1: stabilizer = {1} × S_k × S_{n−k−1}.
+pub fn ramsey_redstar_stabilizer_gens(n: u32, k: u32) -> Vec<Generator> {
+    assert!(k + 1 <= n);
+    let n_us = n as usize;
+    let k_us = k as usize;
+    let mut gens: Vec<Generator> = Vec::new();
+    // S_k on leaves {2..=k+1}: positions 1..k (0-indexed).
+    for i in 1..k_us {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    // S_{n-k-1} on remaining {k+2..=n}: positions k+1..n-1.
+    for i in (k_us + 1)..n_us.saturating_sub(1) {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    gens
+}
+
+/// Stabilizer-subgroup generators for `ramsey_sbp_red_clique(s, t, n, m)`.
+/// The clique on vertices `{1..=m}` has setwise stabilizer `S_m × S_{n−m}`.
+pub fn ramsey_redclique_stabilizer_gens(n: u32, m: u32) -> Vec<Generator> {
+    assert!(m <= n);
+    let n_us = n as usize;
+    let m_us = m as usize;
+    let mut gens: Vec<Generator> = Vec::new();
+    // S_m on {1..=m}: adjacent transpositions (positions 0..m-1).
+    for i in 0..m_us.saturating_sub(1) {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    // S_{n−m} on {m+1..=n}: adjacent transpositions (positions m..n-1).
+    for i in m_us..n_us.saturating_sub(1) {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    gens
+}
+
+/// Stabilizer-subgroup generators for `ramsey_sbp_fix_k_edges(s, t, n, k)`.
+///
+/// The SBP fixes edges `{2i−1, 2i}` for `i = 1..=k` (1-indexed vertices).
+/// Its setwise stabilizer in `S_n` is generated by:
+///
+/// * For each fixed edge, the internal swap of its two vertices.
+/// * Adjacent transpositions among the remaining `n − 2k` free vertices
+///   `{2k+1, 2k+2, ..., n}`.
+///
+/// This generates `(S_2)^k × S_{n−2k}` (a proper subgroup of `S_n`). The
+/// SBP axiom set is setwise closed under this group: each edge axiom
+/// `x_{2i-1, 2i} − 1` is fixed by its internal swap, and the free-vertex
+/// transpositions move only variables disjoint from the SBP edges.
+///
+/// Missing from this generator set: the "swap two SBP edges" wreath action
+/// (permuting the list of fixed edges). Adding it would require a swap
+/// of `{vertex 2i−1, vertex 2i}` with `{vertex 2j−1, vertex 2j}`
+/// simultaneously — not an adjacent transposition, so a separate generator.
+/// Omitted for now; not needed for the experiments at hand.
+pub fn ramsey_sbp_stabilizer_gens(n: u32, k: u32) -> Vec<Generator> {
+    assert!(2 * k <= n);
+    let n_us = n as usize;
+    let mut gens: Vec<Generator> = Vec::new();
+    // Internal swap of each fixed edge: positions 2i, 2i+1 (0-indexed).
+    for i in 0..k as usize {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(2 * i, 2 * i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    // Adjacent transpositions among free vertices: positions 2k..n−1.
+    let start = 2 * k as usize;
+    for i in start..n_us.saturating_sub(1) {
+        let mut p: Vec<u32> = (0..n).collect();
+        p.swap(i, i + 1);
+        gens.push(Generator { perms: vec![p] });
+    }
+    gens
 }
 
 /// Count_q / modular counting principle on the complete q-uniform hypergraph.

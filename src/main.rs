@@ -350,6 +350,36 @@ fn main() -> ExitCode {
                 ("ramsey", [s, t, n]) => {
                     cascade::problems::ramsey_disjunctive(*s, *t, *n, alg_prime)
                 }
+                ("ramsey-sbp", [s, t, n, k]) => {
+                    cascade::problems::ramsey_sbp_fix_k_edges(
+                        *s, *t, *n, *k, alg_prime,
+                    )
+                }
+                ("ramsey-slice", [s, t, n, r]) => {
+                    cascade::problems::ramsey_slice_edge_count(
+                        *s, *t, *n, *r, alg_prime,
+                    )
+                }
+                ("ramsey-redclique", [s, t, n, m]) => {
+                    cascade::problems::ramsey_sbp_red_clique(
+                        *s, *t, *n, *m, alg_prime,
+                    )
+                }
+                ("ramsey-redstar", [s, t, n, k]) => {
+                    cascade::problems::ramsey_sbp_red_star(
+                        *s, *t, *n, *k, alg_prime,
+                    )
+                }
+                ("ramsey-bluestar", [s, t, n, k]) => {
+                    cascade::problems::ramsey_sbp_blue_star(
+                        *s, *t, *n, *k, alg_prime,
+                    )
+                }
+                ("ramsey-fullnbhd", [s, t, n, r]) => {
+                    cascade::problems::ramsey_sbp_full_nbhd(
+                        *s, *t, *n, *r, alg_prime,
+                    )
+                }
                 ("count", [n, q]) => {
                     cascade::problems::count_q_partition(*n, *q, alg_prime)
                 }
@@ -372,8 +402,8 @@ fn main() -> ExitCode {
                 _ => {
                     eprintln!(
                         "--problem: unsupported family '{}' or wrong arg count. \
-                         Supported: php:P,H | ramsey:s,t,n | count:n,q | \
-                         tseitin-kn:n[,c] | tseitin-cycle:n[,c] | tseitin-petersen",
+                         Supported: php:P,H | ramsey:s,t,n | ramsey-sbp:s,t,n,k | \
+                         count:n,q | tseitin-kn:n[,c] | tseitin-cycle:n[,c] | tseitin-petersen",
                         family
                     );
                     return ExitCode::from(2);
@@ -448,6 +478,53 @@ fn main() -> ExitCode {
             let res = if alg_no_orbit {
                 cascade::algebra::ns_fp::find_ns_p_from_axioms(
                     &axioms, schema.n_vars(), d, alg_prime,
+                )
+            } else if family == "ramsey-sbp" {
+                // Use the stabilizer subgroup — the full S_n would reject
+                // the SBP axioms in the closure check. Build generators for
+                // (S_2)^k × S_{n−2k} instead.
+                let (n_arg, k_arg) = match args_vec.as_slice() {
+                    [_s, _t, n, k] => (*n, *k),
+                    _ => unreachable!("ramsey-sbp arg count checked above"),
+                };
+                let gens = cascade::problems::ramsey_sbp_stabilizer_gens(
+                    n_arg, k_arg,
+                );
+                cascade::algebra::orbit_ns::find_orbit_cert_fp_with_gens(
+                    &schema, &axioms, &gens, d, alg_prime,
+                )
+            } else if family == "ramsey-redclique" {
+                let (n_arg, m_arg) = match args_vec.as_slice() {
+                    [_s, _t, n, m] => (*n, *m),
+                    _ => unreachable!("ramsey-redclique arg count checked above"),
+                };
+                let gens = cascade::problems::ramsey_redclique_stabilizer_gens(
+                    n_arg, m_arg,
+                );
+                cascade::algebra::orbit_ns::find_orbit_cert_fp_with_gens(
+                    &schema, &axioms, &gens, d, alg_prime,
+                )
+            } else if family == "ramsey-fullnbhd" {
+                let (n_arg, r_arg) = match args_vec.as_slice() {
+                    [_s, _t, n, r] => (*n, *r),
+                    _ => unreachable!("ramsey-fullnbhd arg count checked above"),
+                };
+                let gens = cascade::problems::ramsey_full_nbhd_stabilizer_gens(
+                    n_arg, r_arg,
+                );
+                cascade::algebra::orbit_ns::find_orbit_cert_fp_with_gens(
+                    &schema, &axioms, &gens, d, alg_prime,
+                )
+            } else if family == "ramsey-redstar" || family == "ramsey-bluestar" {
+                let (n_arg, k_arg) = match args_vec.as_slice() {
+                    [_s, _t, n, k] => (*n, *k),
+                    _ => unreachable!("ramsey-*star arg count checked above"),
+                };
+                let gens = cascade::problems::ramsey_redstar_stabilizer_gens(
+                    n_arg, k_arg,
+                );
+                cascade::algebra::orbit_ns::find_orbit_cert_fp_with_gens(
+                    &schema, &axioms, &gens, d, alg_prime,
                 )
             } else {
                 cascade::algebra::orbit_ns::find_orbit_cert_fp(
