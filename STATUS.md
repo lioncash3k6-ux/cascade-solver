@@ -1,7 +1,15 @@
-# Cascade v0.6 — Status
+# Cascade v0.6 — Status (updated 2026-04-22)
 
-## Headline
+## Headlines
 
+**Algebraic engine:**
+- **PHP explicit cert**: O(P × H^P) closed-form multipliers, no orbit BFS, no
+  Gaussian elimination. PHP_{7,6}: 23 ms (was 75 s, 3,200×). PHP_{9,8}: 12.7 s.
+- **R(3,3)/K_n uniform cert**: single 291×386 matrix, rank 179, certifies UNSAT
+  at degree 7 for **all n ≥ 11 simultaneously** in < 1 s. Rank proved over ℤ
+  (verified at 7 primes). Direct O(1)-in-n orbit enumeration (193 canonical types).
+
+**CDCL + symmetry:**
 **Online symmetry propagator live inside CaDiCaL via IPASIR-UP.** All 9
 Ramsey benchmarks verify end-to-end with the propagator active under
 `--certified`, including R(4,5)/K_25. Pure-online mode beats v0.5 on
@@ -115,11 +123,33 @@ matches satsuma's (Schreier-Sims selection, future work).
 - `CASCADE_ONLINE_SYM_OVERLAY=1` — force overlay (diagnostic; unsound)
 - `CASCADE_SYM_INVERT_GENS=1` — apply g⁻¹ instead of g (diagnostic)
 
+## Algebraic results
+
+### PHP explicit cert (`src/algebra/php_cert_explicit.rs`)
+
+| Instance | Time | vs orbit-BFS |
+|---|---:|---|
+| PHP_{5,4} d=5 | < 1 ms | — |
+| PHP_{6,5} d=6 | 2 ms | — |
+| PHP_{7,6} d=7 | **23 ms** | 75 s → 23 ms (3,200×) |
+| PHP_{8,7} d=8 | **449 ms** | — |
+| PHP_{9,8} d=9 | **12.7 s** | — |
+
+### R(3,3)/K_n uniform cert (`src/algebra/orbit_ns.rs`, `src/algebra/graph_canon.rs`)
+
+| K_n | Time | Rank | Status |
+|---|---:|---:|---|
+| K_11..K_40 | 0.6–1.1 s | 179 | UNSAT, uniform cert |
+
+Matrix: 291 rows × 386 cols, constant for n ≥ 14.
+Proof: `docs/ramsey_ns_invariance.md`.
+
 ## Tests
 
-**122 passing, 1 ignored** (documented overlay convention test).
+**~228 passing, 1 pre-existing failure** (php_pair_orbits scatter PHP_{6,5} d=9),
+1 ignored (overlay convention).
 
-- 109 lib tests
+- 109+ lib tests (including 16 graph_canon, 2 stab-orbit tests)
 - 3 composite_parity integration (bit-identical bare-vs-composite)
 - 3 online_sym_integration (propagator live inside CaDiCaL)
 - 2 satsuma_generators (real satsuma binary on R(3,3)/K_6 and K_9)

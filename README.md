@@ -26,16 +26,16 @@ regimes we have measured, not as a general-purpose solver.
 **Does not do.**
 
 * **Industrial SAT.** Kissat wins here; wrong regime for this tool.
-* **Ramsey numbers.** NS degree is `Ω(n)` (confirmed from own data), so
-  the algebraic leg cannot close Ramsey problems. Ramsey work in this
-  repo uses the CDCL + symmetry legs only.
+* **General Ramsey R(s,s) as s grows.** NS refutation degree grows
+  with s; the algebraic leg handles specific fixed-s families (see
+  §Ramsey below). The CDCL + symmetry legs cover Ramsey search.
 * **Proving P vs NP / breaking SAT.** The observed polynomial NS proofs
   of PHP etc. are in a *stronger proof system* than resolution, which is
   expected and well-known. The contribution is the specific combination
   of orbit reduction, characteristic variation, and independent cert
   verification, not the existence of the proofs themselves.
 
-## Problem families (Stages 1–3, 2026-04-20)
+## Problem families (updated 2026-04-22)
 
 Pigeonhole, Count_q, and Tseitin. Each has a CLI entrypoint that feeds
 a generic orbit-reduced Nullstellensatz engine over `𝔽_p`. Every UNSAT
@@ -48,19 +48,51 @@ cascade --alg-preprocess D --alg-p P --problem FAMILY[:args] input.cnf
 
 ### PHP (functional encoding)
 
-All measurements on the current head (colex perfect-hash, commit
-`a436daa`). `/usr/bin/time -v`, single 24-core Linux box, RSS peak
-reported by the kernel.
+Two engines for PHP: the **explicit closed-form cert** (`--alg-explicit`,
+`src/algebra/php_cert_explicit.rs`) and the **orbit-BFS engine** (fallback).
+The explicit cert is O(P × H^P) — no Gaussian elimination, no orbit BFS,
+no memory — and is 650× faster on PHP_{7,6}.
 
-| Instance | Setting | Time | Peak RAM | Verdict |
+| Instance | Engine | Time | Peak RAM | Verdict |
 |---|---|---:|---:|---|
-| PHP_{5,4} d=5 | 𝔽₇, orbit | 0.17 s | 10 MB | cert |
-| PHP_{6,5} d=6 | 𝔽₇, orbit | 0.98 s | 35 MB | cert |
-| PHP_{7,6} d=7 | 𝔽₁₁, orbit | 75 s | 886 MB | cert |
-| PHP_{8,7} d=7 | 𝔽₁₁, orbit | 14 min | 5.5 GB | no cert (correct: `PHP_{P,P-1}` needs `d ≥ P`) |
-| PHP_{8,7} d=8 | 𝔽₁₁, orbit | — | — | open frontier; estimated 20–40 GB and a few hours |
+| PHP_{5,4} d=5 | explicit | < 1 ms | < 1 MB | cert |
+| PHP_{6,5} d=6 | explicit | 2 ms | < 1 MB | cert |
+| PHP_{7,6} d=7 | explicit | **23 ms** | < 1 MB | cert |
+| PHP_{8,7} d=8 | explicit | **449 ms** | < 1 MB | cert |
+| PHP_{9,8} d=9 | explicit | **12.7 s** | < 1 MB | cert |
+| PHP_{7,6} d=7 | orbit-BFS, 𝔽₁₁ | 75 s | 886 MB | cert (regression baseline) |
+| PHP_{8,7} d=7 | orbit-BFS, 𝔽₁₁ | 14 min | 5.5 GB | no cert (correct: needs `d ≥ P`) |
 
-CLI: `--problem php:P,H`.
+CLI: `--problem php:P,H`. The explicit engine is used automatically when
+available. Degree `d ≥ P` is required; for `d < P` the instance is
+provably unsolvable by NS at that degree and the engine correctly returns
+"no cert".
+
+### Ramsey (algebraic — uniform certificate)
+
+For R(3,3)/K_n the orbit-reduced NS engine proves infeasibility at degree 7
+with a **single linear system valid for all n ≥ 11 simultaneously**.
+
+```
+291 × 386 matrix, rank 179, constant for all n ≥ 14.
+Rank 179 verified over primes {13,17,19,23,29,31,37} → holds over ℤ.
+```
+
+| Instance | Time | Pair step | Rank | Verdict |
+|---|---:|---:|---:|---|
+| K_11 | 0.6 s | 0.022 s | 179 | UNSAT cert |
+| K_20 | 0.6 s | 0.022 s | 179 | UNSAT cert |
+| K_30 | 0.8 s | 0.022 s | 179 | UNSAT cert |
+| K_40 | 1.1 s | 0.022 s | 179 | UNSAT cert |
+
+The pair step is O(1) in n — 193 canonical orbit types are enumerated
+directly (`src/algebra/graph_canon.rs::enumerate_stab_pair_reps`) instead
+of running an O(n^8) BFS. The certificate is equivariant under S_n; orbit
+sizes are polynomials in n evaluated at runtime.
+
+See `docs/ramsey_ns_invariance.md` for the invariance proof.
+
+CLI: `--problem ramsey:3,3,N --alg-preprocess 7 --alg-p P` (any prime `P > N`).
 
 ### Count_q (modular counting principle)
 
@@ -261,7 +293,14 @@ Short summary: legs on a shared propagator bus.
 The `cb_decide` symmetry hook (~20 LOC in `src/symmetry/online.rs`) is
 the largest group-aware empirical win; see the Ramsey table below.
 
-## Ramsey (CDCL + symmetry legs only)
+## Ramsey — two legs
+
+### Algebraic leg (R(3,3), all n ≥ 11)
+
+Single uniform NS certificate at degree 7. See §Ramsey above and
+`docs/ramsey_ns_invariance.md`.
+
+### CDCL + symmetry leg (search instances)
 
 | Instance | v0.5 | v0.6 best | Δ | Setting |
 |---|---:|---:|---|---|
@@ -271,9 +310,7 @@ the largest group-aware empirical win; see the Ramsey table below.
 | R(4,4) / K_17 SAT | 1,700 | 270 | −84 % | `CASCADE_SYM_DECIDE=20` |
 | R(4,5) / K_25 | 0 | 0 | = | any (certified) |
 
-All verified end-to-end (satsuma equisat + CaDiCaL DRAT). No algebraic
-leg involvement — NS degree is `Ω(n)` for Ramsey so the algebraic path
-is not a fit.
+All verified end-to-end (satsuma equisat + CaDiCaL DRAT).
 
 ## Layout
 
@@ -295,11 +332,18 @@ src/
     poly.rs               multilinear polynomials over 𝔽₂
     ns.rs                 naive NS over 𝔽₂
     ns_fp.rs              dense NS over 𝔽_p
-    orbit_ns.rs           generic orbit-reduced NS + ColexIndex
-    php_orbit.rs          PHP-specific engine (regression baseline)
+    orbit_ns.rs           generic orbit-reduced NS + ColexIndex (MonoBits [u64;16])
+    graph_canon.rs        canonical labeling + orbit enumeration for K_n edge-sets;
+                          stab-orbit reps for Ramsey (enumerate_stab_pair_reps)
+    php_orbit.rs          PHP orbit-BFS engine (regression baseline)
+    php_cert_explicit.rs  PHP closed-form cert O(P×H^P), no BFS, no Gauss
     ns_cert.rs            serializable cert format + in-solver verifier
     ns_to_pb.rs           VeriPB lowering for linear-axiom families
   bin/cascade_cert_verify.rs   standalone cert verifier
+docs/
+  ARCHITECTURE.md         comprehensive internals walk-through
+  TUTORIAL.md             hands-on CNF → verified cert walkthrough
+  ramsey_ns_invariance.md formal proof: R(3,3)/K_n cert is n-independent
 scripts/
   reproduce.sh            end-to-end demonstration runner
 docs/
@@ -311,7 +355,7 @@ docs/
 
 ```bash
 cargo build --release
-cargo test --release      # 180 tests, ~2 min
+cargo test --release      # ~228 tests, ~30 min (1 pre-existing failure in php_pair_orbits)
 ```
 
 ## Honest limitations
@@ -319,19 +363,18 @@ cargo test --release      # 180 tests, ~2 min
 * **Orbit reduction requires `p ∤ |G|`.** For Count_q with `p = q ≤ n`,
   the orbit path is unusable; we fall back to the dense engine, which
   runs out at roughly `n = 7, d = 5`.
-* **Pair BFS + matrix scatter is the hot path at PHP_{8,7} d=7 scale**
-  (about 640 s on its own, ~77 % of wall time). Factored bit-swap
-  generators would reduce each `apply_bits` call from O(d) to O(1),
-  the natural next speedup.
-* **PHP_{10,9}** needs `d = 10` on 90 vars, `∑_{k ≤ 10} C(90, k) ≈ 10¹²`
-  monomials — beyond anything we can enumerate. Direct orbit enumeration
-  without per-monomial materialization is genuine research work.
+* **PHP_{10,9} explicit cert** needs d = 10 at 90 vars. The explicit
+  engine is O(P × H^P) = O(10 × 9^10 ≈ 35 B) — borderline; estimated
+  several hours. PHP_{9,8} at 12.7 s is the current frontier.
 * **VeriPB lowering is linear-axiom only.** Count_q and Tseitin (on
   regular graphs with uniform charge) lower cleanly; PHP's quadratic
   AMO axioms need a richer proof structure, not yet implemented.
 * **Tseitin custom-Aut reduction** (cycle, hypercube, Petersen) is wired
   (`find_orbit_cert_fp_with_gens`) but the public factories still default
   to `S_n`, which works only for K_n.
+* **Ramsey R(4,4) algebraic cert** needs degree 13 (= C(4,2) + budget).
+  Matrix size scales exponentially with s; R(3,3) at degree 7 is the
+  confirmed constant-n frontier.
 * **No formal complexity claims** beyond reporting measured degrees and
   times. Expressions like "polynomial" or "exponential" in the text
   refer to well-known proof-complexity facts about the underlying
