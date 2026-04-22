@@ -26,10 +26,10 @@ use std::collections::BTreeMap;
 /// or multiply.
 ///
 /// Backed by `[u64; N_WORDS]` for `N_WORDS · 64` capacity. Currently
-/// 512 bits (8 words), covering PHP up to P·H = 512 and Ramsey up to
-/// K_32 (496 edges). For larger families bump `N_WORDS` or switch to
+/// 1024 bits (16 words), covering PHP up to P·H = 1024 and Ramsey up to
+/// K_45 (990 edges). For larger families bump `N_WORDS` or switch to
 /// a dynamic bitset.
-const N_WORDS: usize = 8;
+const N_WORDS: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Debug)]
 pub(crate) struct MonoBits {
@@ -881,55 +881,34 @@ pub fn find_orbit_cert_fp_with_gens(
     };
 
     if let Some((s_size, n_red, budget)) = ramsey_stab_path {
-        // Fast path: stabilizer-based monomial BFS.
-        // Stab(canonical K_s on vertices {0,..,s-1}) = S_s × S_{n-s}.
-        // Generators = all adjacent-transposition var_tables EXCEPT var_tables[s_size-1]
-        // (the (s_size-1 ↔ s_size) swap which crosses the boundary).
-        let stab_gens: Vec<usize> = (0..var_tables.len())
-            .filter(|&gi| gi != s_size - 1)
-            .collect();
+        // Direct enumeration of canonical pair orbit types — O(1) in n.
+        // orbit_c_size(n) = P(n, s+f) / aut_count  (falling factorial / aut group size).
+        // Replaces the O(max_mi) = O(n^8) monomial BFS with 193 constant-time lookups.
+        use super::graph_canon::enumerate_stab_pair_reps;
+        let n_verts = schema.bases[0].size;
+        let stab_reps = enumerate_stab_pair_reps(s_size, budget);
 
-        let max_mi = colex.len_up_to_degree(budget);
-        let mut mono_visited = vec![false; max_mi];
-
-        // Canonical axiom indices: red=0, blue=n_red (first of each type).
         let red_idx = 0u32;
         let blue_idx = n_red as u32;
 
-        // orbit_c_size = C(n,s) × stab_orbit_size.
-        // orbit size of canonical axiom = C(n,s) = n_red.
-        let axiom_orbit_size = n_red as u64;
+        for rep in &stab_reps {
+            let orbit_c_size = rep.orbit_c_size(n_verts, s_size);
+            if orbit_c_size == 0 { continue; }
 
-        for start_mi in 0..max_mi {
-            if mono_visited[start_mi] {
-                continue;
-            }
-            mono_visited[start_mi] = true;
-            let mut sub_orbit_size = 1u64;
-            let mut queue = vec![start_mi as u32];
-            while let Some(cmi) = queue.pop() {
-                let bits = colex.bits_at(cmi as usize);
-                for &gi in &stab_gens {
-                    let nmi = colex.rank(apply_bits(bits, &var_tables[gi]));
-                    if !mono_visited[nmi] {
-                        mono_visited[nmi] = true;
-                        sub_orbit_size += 1;
-                        queue.push(nmi as u32);
-                    }
-                }
-            }
+            // Convert canonical edges to MonoBits in K_n, then rank for seed storage.
+            let mi_bits = rep.to_monobits(n_verts);
+            let mi = colex.rank(mi_bits) as u32;
 
-            let orbit_c_size = axiom_orbit_size * sub_orbit_size;
-            total_pairs += sub_orbit_size as usize * 2; // red + blue orbits
+            total_pairs += rep.orbit_c_size(n_verts, s_size) as usize * 2;
 
             // Red canonical pair orbit
-            unknown_seeds.push((red_idx, start_mi as u32));
+            unknown_seeds.push((red_idx, mi));
             orbit_c_sizes.push(orbit_c_size);
             for r in matrix_rows.iter_mut() { r.push(0); }
             rhs.push(0);
 
             // Blue canonical pair orbit
-            unknown_seeds.push((blue_idx, start_mi as u32));
+            unknown_seeds.push((blue_idx, mi));
             orbit_c_sizes.push(orbit_c_size);
             for r in matrix_rows.iter_mut() { r.push(0); }
             rhs.push(0);

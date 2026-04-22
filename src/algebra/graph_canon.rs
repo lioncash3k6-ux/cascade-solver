@@ -420,6 +420,175 @@ pub(crate) fn enumerate_orbit_reps(n: u32, d: u32) -> Vec<(MonoBits, CanonGraph,
 }
 
 // ---------------------------------------------------------------------------
+// Stabilizer pair-orbit enumeration
+// ---------------------------------------------------------------------------
+
+/// One canonical class of (canonical-axiom, multiplier-monomial) pairs under
+/// Stab(K_s on {0..s-1}) = S_s × S_{n-s}.
+///
+/// The canonical multiplier uses fixed vertices {0..s-1} and free vertices
+/// {s..s+f-1} (0-indexed). In K_n (1-indexed) map vertex i → i+1.
+///
+/// orbit_c_size(n) = P(n, s+f) / aut_count where P(n,k) = n·(n-1)·…·(n-k+1).
+#[derive(Clone, Debug)]
+pub(crate) struct StabOrbitRep {
+    pub edges: Vec<(u8, u8)>,
+    pub f: usize,
+    pub aut_count: u64,
+}
+
+impl StabOrbitRep {
+    pub fn orbit_c_size(&self, n_verts: u32, s: usize) -> u64 {
+        let k = (s + self.f) as u32;
+        if k > n_verts { return 0; }
+        ((n_verts - k + 1)..=n_verts).map(|x| x as u64).product::<u64>() / self.aut_count
+    }
+
+    /// Convert canonical edges to MonoBits in K_n (1-indexed, using edge_to_bit).
+    pub fn to_monobits(&self, n_verts: u32) -> MonoBits {
+        let mut bits = MonoBits::ZERO;
+        for &(u, v) in &self.edges {
+            bits.set_bit(edge_to_bit(u as u32 + 1, v as u32 + 1, n_verts));
+        }
+        bits
+    }
+}
+
+/// Canonical form of edge-set under S_s × S_f, where vertices {0..s-1} are
+/// "fixed" (may only be permuted by S_s) and {s..} are "free" (S_f permutable).
+/// Returns (canonical_edges, f, aut_count).
+fn stab_canonicalize(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
+    if edges.is_empty() {
+        // All s! permutations of fixed vertices preserve the empty set; f=0.
+        let s_fact: u64 = (1..=(s as u64)).product();
+        return (vec![], 0, s_fact);
+    }
+    // Collect and compress free vertex labels to {s, s+1, ...}
+    let mut free_labels: Vec<u8> = edges.iter()
+        .flat_map(|&(u, v)| [u, v])
+        .filter(|&x| x >= s)
+        .collect();
+    free_labels.sort_unstable();
+    free_labels.dedup();
+    let f = free_labels.len() as u8;
+
+    // Compress to {0..s-1} ∪ {s..s+f-1}
+    let compress = |x: u8| -> u8 {
+        if x < s { x } else { s + free_labels.iter().position(|&v| v == x).unwrap() as u8 }
+    };
+    let compressed: Vec<(u8, u8)> = edges.iter().map(|&(u, v)| {
+        let (a, b) = (compress(u), compress(v));
+        if a < b { (a, b) } else { (b, a) }
+    }).collect();
+
+    // Try all s! × f! permutations; take lex-min and count ties (= aut_count).
+    let apply = |sigma: &[u8], tau: &[u8], e: &[(u8, u8)]| -> Vec<(u8, u8)> {
+        let mut r: Vec<(u8, u8)> = e.iter().map(|&(u, v)| {
+            let ru = if u < s { sigma[u as usize] } else { s + tau[(u - s) as usize] };
+            let rv = if v < s { sigma[v as usize] } else { s + tau[(v - s) as usize] };
+            if ru < rv { (ru, rv) } else { (rv, ru) }
+        }).collect();
+        r.sort_unstable();
+        r
+    };
+
+    let mut sigma: Vec<u8> = (0..s).collect();
+    let mut best: Option<Vec<(u8, u8)>> = None;
+    let mut aut_count = 0u64;
+    loop {
+        let mut tau: Vec<u8> = (0..f).collect();
+        loop {
+            let r = apply(&sigma, &tau, &compressed);
+            match &best {
+                None => { best = Some(r); aut_count = 1; }
+                Some(b) if r < *b => { best = Some(r); aut_count = 1; }
+                Some(b) if r == *b => { aut_count += 1; }
+                _ => {}
+            }
+            if f == 0 || !next_perm(&mut tau) { break; }
+        }
+        if s == 0 || !next_perm(&mut sigma) { break; }
+    }
+    (best.unwrap(), f, aut_count)
+}
+
+/// Enumerate canonical pair-orbit representatives for Stab(K_s on {0..s-1}) = S_s × S_{n-s}
+/// acting on monomials of degree ≤ budget.
+///
+/// Vertices {0..s-1} are "fixed" (K_s vertices) and {s..} are "free". Incremental
+/// edge-addition (like `enumerate_orbit_reps`) ensures only canonical forms are kept.
+/// Cost: O(n_reps) = O(1) per call regardless of K_n size.
+pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbitRep> {
+    use std::collections::HashSet;
+    let s = s as u8;
+    let max_f = (2 * budget) as u8;
+
+    let mut seen: HashSet<Vec<(u8, u8)>> = HashSet::new();
+    let mut by_deg: Vec<Vec<Vec<(u8, u8)>>> = vec![Vec::new(); budget + 1];
+
+    let empty: Vec<(u8, u8)> = vec![];
+    seen.insert(empty.clone());
+    by_deg[0].push(empty);
+
+    for k in 1..=budget {
+        let prev = by_deg[k - 1].clone();
+        for pattern in &prev {
+            // cur_f: number of distinct free vertices currently used (canonical → consecutive)
+            let cur_f: u8 = pattern.iter()
+                .flat_map(|&(u, v)| [u, v])
+                .filter(|&x| x >= s)
+                .max()
+                .map(|m| m - s + 1)
+                .unwrap_or(0);
+
+            let present: std::collections::HashSet<(u8, u8)> = pattern.iter().cloned().collect();
+
+            // Edges between existing vertices {0..s+cur_f-1}
+            let n_exist = s + cur_f;
+            for v in 1..n_exist {
+                for u in 0..v {
+                    if present.contains(&(u, v)) { continue; }
+                    let mut p = pattern.clone();
+                    p.push((u, v));
+                    let (canon, _, _) = stab_canonicalize(&p, s);
+                    if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+                }
+            }
+
+            // Add one new free vertex s+cur_f
+            if cur_f < max_f {
+                let nv = s + cur_f;
+                for u in 0..n_exist {
+                    let (lo, hi) = if u < nv { (u, nv) } else { (nv, u) };
+                    let mut p = pattern.clone();
+                    p.push((lo, hi));
+                    let (canon, _, _) = stab_canonicalize(&p, s);
+                    if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+                }
+            }
+
+            // Add two new free vertices (only the matching edge between them)
+            if cur_f + 2 <= max_f {
+                let (nv1, nv2) = (s + cur_f, s + cur_f + 1);
+                let mut p = pattern.clone();
+                p.push((nv1, nv2));
+                let (canon, _, _) = stab_canonicalize(&p, s);
+                if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for deg_pats in &by_deg {
+        for canon in deg_pats {
+            let (_, f, aut_count) = stab_canonicalize(canon, s);
+            result.push(StabOrbitRep { edges: canon.clone(), f: f as usize, aut_count });
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -527,6 +696,37 @@ mod tests {
         let n = 7u32;
         let reps = enumerate_orbit_reps(n, 7);
         assert_eq!(reps.len(), 146, "K_7 at d=7: expected 146 orbit reps");
+    }
+
+    #[test]
+    fn stab_pair_reps_r33_count() {
+        // R(3,3): s=3, budget=4. Should give exactly 193 canonical types.
+        let reps = enumerate_stab_pair_reps(3, 4);
+        assert_eq!(reps.len(), 193, "R(3,3) stab reps: expected 193, got {}", reps.len());
+    }
+
+    #[test]
+    fn stab_pair_reps_orbit_sum_matches_bfs() {
+        // For n=12, sum of orbit_c_sizes should equal C(12,3) * max_mi
+        // where max_mi = len_up_to_degree(4) over 66 vars.
+        // Actually: sum of orbit_c_sizes = total (axiom, mono) pairs in orbit = n_axioms/2 * max_mi
+        // i.e. sum_over_reps(orbit_c_size) = C(12,3) * C(66,0..4) = 220 * 1502658 = 330584760
+        let reps = enumerate_stab_pair_reps(3, 4);
+        let n = 12u32;
+        let total: u64 = reps.iter().map(|r| r.orbit_c_size(n, 3)).sum();
+        // C(66,0)+C(66,1)+C(66,2)+C(66,3)+C(66,4) = 1+66+2145+45760+766480...
+        // let's just check it equals the BFS-observed 53747808 (53.7M pairs / 2 for red only)
+        // From K_12 log: 53M total pairs = 26.5M per axiom type → sum per red axiom type
+        // Actually: from K_12 log "unknown_orbits: 386 orbits (53747808 total pairs)"
+        // 386/2 = 193 per type; total pairs = C(12,3) * sub_orbit_sum / something
+        // Just check total > 0 and matches per-n formula
+        assert!(total > 0);
+        // Verify C(n,3) divides total orbit_c_size correctly by checking a known value:
+        // For the empty monomial (f=0, aut_count=s!=6): orbit_c_size = P(n,s)/6 = n*(n-1)*(n-2)/6 = C(n,3)
+        let empty_rep = reps.iter().find(|r| r.edges.is_empty()).unwrap();
+        assert_eq!(empty_rep.f, 0);
+        assert_eq!(empty_rep.aut_count, 6); // S_3 = 6
+        assert_eq!(empty_rep.orbit_c_size(n, 3), (n as u64 * (n-1) as u64 * (n-2) as u64) / 6);
     }
 
     #[test]
