@@ -79,13 +79,18 @@ This abstract description is **independent of n**: the free vertices are labelle
 {4,...,3+f} for some f ≤ 2·budget = 8, and n appears only in the
 **orbit size formula** (see §4).
 
-**Consequence.** The set of orbit types — i.e., the columns of M — is the same
-for every n ≥ 3 + max_f. Concretely, max_f ≤ 8 so n ≥ 11 suffices; empirically
-n ≥ 6 already gives the same set (since all 193 types fit in K_6).
+**Consequence.** The set of pair orbit types — i.e., the columns of M — is the
+same for every n ≥ s + max_f = 3 + 8 = 11. Empirical check confirms: 386
+columns from K_11 onward.
+
+The row set (monomial orbits of degree ≤ budget under S_n) also stabilizes,
+but slightly later: 291 rows from K_14 onward. The rank reaches its final
+value 179 already at K_11 (even with fewer rows, the extra rows beyond K_11
+are all linearly dependent on the existing ones).
 
 The **rows** of M (monomial orbits) are similarly n-independent: they are abstract
 edge-set types on ≤ 2d = 14 vertices, and their count stabilizes at 291 for
-n ≥ 11.
+n ≥ 14.
 
 ---
 
@@ -133,14 +138,14 @@ Verification: `cargo test stab_pair_reps_r33_count` asserts `reps.len() == 193`.
 
 The matrix build with output `291 rows × 386 cols` was confirmed identical for:
 
-| K_n  | n (verts) | Pair BFS | Total  | Rank |
-|------|-----------|----------|--------|------|
-| K_11 | 11        | 0.022s   | 0.6s   | 179  |
-| K_13 | 13        | 0.022s   | 0.6s   | 179  |
-| K_20 | 20        | 0.022s   | 0.6s   | 179  |
-| K_25 | 25        | 0.022s   | 0.7s   | 179  |
-| K_30 | 30        | 0.022s   | 0.8s   | 179  |
-| K_40 | 40        | 0.022s   | 1.1s   | 179  |
+| K_n  | n (verts) | Rows×Cols   | Pair BFS | Total  | Rank |
+|------|-----------|-------------|----------|--------|------|
+| K_11 | 11        | 285 × 386   | 0.022s   | 0.6s   | 179  |
+| K_14 | 14        | 291 × 386   | 0.022s   | 0.6s   | 179  |
+| K_20 | 20        | 291 × 386   | 0.022s   | 0.6s   | 179  |
+| K_25 | 25        | 291 × 386   | 0.022s   | 0.7s   | 179  |
+| K_30 | 30        | 291 × 386   | 0.022s   | 0.8s   | 179  |
+| K_40 | 40        | 291 × 386   | 0.022s   | 1.1s   | 179  |
 
 The pair BFS time is n-independent (0.022s) because it evaluates the 193
 orbit types directly instead of iterating C(n,2)^budget monomials.
@@ -178,8 +183,9 @@ row corresponding to the constant monomial 1). This is the NS witness condition:
   ∑_τ λ_τ · (orbit contribution of type τ) = 1
 
 Because orbit_c_size(n) is a polynomial in n that is strictly positive for all
-n ≥ s + f_max (i.e., n ≥ 11, and empirically n ≥ 6), the witness λ is valid
-for **every K_n with n ≥ 6**, not just a specific n.
+n ≥ s + f_max = 11, and rank 179 is achieved from K_11 onward, the witness λ
+is valid for **every K_n with n ≥ 11**. (For n = 6..10, the reduced instances
+also certify UNSAT but with smaller matrices and lower ranks.)
 
 The output `2 axioms` in the verify step reflects that the solution uses only
 the canonical red-K_3 and blue-K_3 axiom seeds (orbit representatives); all
@@ -202,4 +208,6 @@ appear only as weights in the original (unreduced) NS equation, not in the
 matrix itself.
 
 **Computational cost**: one matrix build (< 1s) + Gaussian elimination (< 1ms).
-Valid for all n ≥ 6 without re-running for each n.
+Valid for all n ≥ 11 (full column set) / n ≥ 14 (full row/column set) without
+re-running for each n. For n < 11 the same engine runs with smaller matrices
+and also certifies UNSAT.
