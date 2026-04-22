@@ -744,9 +744,8 @@ pub fn find_orbit_cert_fp_with_gens(
 
     // For UnorderedPair+Diagonal+full-S_n (Ramsey K_n): use the formula path that
     // avoids building the O(n_monos)-entry orbit_id array.  This path eliminates
-    // the monomial_orbits step entirely (was 591 s for K_12) and computes the
-    // matrix directly from ~386 seed pairs via O(seeds × axiom_terms)
-    // canonicalize calls.  All other schemas use the BFS fallback.
+    // the monomial_orbits step entirely and computes the matrix directly from
+    // the stab-path canonical seeds via O(seeds × axiom_terms) canonicalize calls.
     let is_ramsey_formula_path = {
         use crate::tuple_schema::{GroupSpec, TupleKind};
         matches!(schema.tuple_kind, TupleKind::UnorderedPair)
@@ -755,11 +754,116 @@ pub fn find_orbit_cert_fp_with_gens(
             && gens.len() == schema.bases[0].size.saturating_sub(1) as usize
     };
 
-    // Shared: build orbit info.  For formula path this is instantaneous; for
-    // the BFS path it dominates runtime at large n.
+    // Precompute axiom terms as (bits, coef) pairs — needed early for lazy c2o build.
+    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms
+        .iter()
+        .map(|a| {
+            a.terms
+                .iter()
+                .map(|(m, c)| (mono_to_bits(m, n), *c))
+                .collect()
+        })
+        .collect();
+
+    // Axiom metadata needed for stab path detection.
+    let axiom_degrees: Vec<usize> = axioms.iter().map(|a| a.degree()).collect();
+    let n_axioms = axioms.len();
+
+    // Pre-detect R(s,t) stab path before building formula_data, so we can
+    // replace the expensive enumerate_orbit_reps with a lazy product scan.
+    let pre_stab_path: Option<(usize, usize, usize, usize, usize, usize)> = {
+        use crate::tuple_schema::binom;
+        let nv = schema.bases[0].size as usize;
+        let red_deg = axiom_degrees.get(0).copied().unwrap_or(0);
+        let s_f = (1.0 + (1.0 + 8.0 * red_deg as f64).sqrt()) / 2.0;
+        let s = s_f.round() as usize;
+        let csk2 = s.saturating_mul(s.saturating_sub(1)) / 2;
+        let n_red = binom(nv as u32, s as u32) as usize;
+        let red_ok = is_ramsey_formula_path
+            && s >= 2 && csk2 == red_deg && n_red <= n_axioms
+            && axiom_degrees[..n_red].iter().all(|&deg| deg == red_deg);
+        if red_ok {
+            let blue_deg = axiom_degrees.get(n_red).copied().unwrap_or(0);
+            let t_f = (1.0 + (1.0 + 8.0 * blue_deg as f64).sqrt()) / 2.0;
+            let t = t_f.round() as usize;
+            let ctk2 = t.saturating_mul(t.saturating_sub(1)) / 2;
+            let n_blue = binom(nv as u32, t as u32) as usize;
+            let blue_ok = t >= s && ctk2 == blue_deg && n_red + n_blue == n_axioms
+                && d >= blue_deg
+                && axiom_degrees[n_red..].iter().all(|&deg| deg == blue_deg);
+            if blue_ok { Some((s, t, n_red, n_blue, d - red_deg, d - blue_deg)) } else { None }
+        } else {
+            None
+        }
+    };
+
+    // Build orbit info. For the stab path: build a lazy c2o from actual products
+    // (avoids expensive enumerate_orbit_reps at high degree). For other formula paths:
+    // use enumerate_orbit_reps. For BFS paths: on-the-fly monomial orbit BFS.
     let t0 = std::time::Instant::now();
-    let (n_mono_orbits, mono_orbit_id, mono_orbit_rep, formula_data) = if is_ramsey_formula_path {
-        use super::graph_canon::{canonicalize, enumerate_orbit_reps, monobits_to_edges, CanonGraph};
+    let (n_mono_orbits, mono_orbit_id, mono_orbit_rep, formula_data) = if let Some(
+        (pre_s, pre_t, pre_n_red, _pre_n_blue, pre_br, pre_bt),
+    ) = pre_stab_path
+    {
+        // Lazy c2o: enumerate only the canonical product graphs that arise from
+        // stab seeds, not all C(n_edges, d) orbit classes.
+        use super::graph_canon::{
+            canonicalize, enumerate_stab_pair_reps, monobits_to_edges, orbit_size, CanonGraph,
+            StabOrbitRep,
+        };
+        use std::collections::HashMap;
+        let n_verts = schema.bases[0].size;
+
+        let red_reps = enumerate_stab_pair_reps(pre_s, pre_br, n_verts as usize - pre_s);
+        let blue_reps = enumerate_stab_pair_reps(pre_t, pre_bt, n_verts as usize - pre_t);
+
+        // Collect (ai, mi_bits) for all seeds with nonzero orbit size.
+        let mut seed_mi_bits: Vec<(u32, MonoBits)> = Vec::new();
+        for rep in &red_reps {
+            if rep.orbit_c_size(n_verts, pre_s) == 0 { continue; }
+            seed_mi_bits.push((0u32, rep.to_monobits(n_verts)));
+        }
+        let blue_ai = pre_n_red as u32;
+        for rep in &blue_reps {
+            if rep.orbit_c_size(n_verts, pre_t) == 0 { continue; }
+            seed_mi_bits.push((blue_ai, rep.to_monobits(n_verts)));
+        }
+
+        // Scan all products → build lazy c2o (empty graph = row 0).
+        // Also build bits_to_orbit: MonoBits → orbit_r to skip re-canonicalizing
+        // in the matrix scatter step.
+        let mut lazy_c2o: HashMap<CanonGraph, (u32, u64)> = HashMap::new();
+        lazy_c2o.insert(CanonGraph::empty(), (0, 1u64));
+        // Maps product MonoBits → (orbit_r, orbit_r_size) so the matrix scatter
+        // can skip the canonicalize call for products already seen during the build.
+        let mut bits_to_orbit: HashMap<MonoBits, (u32, u64)> = HashMap::new();
+
+        for &(ai, mi_bits) in &seed_mi_bits {
+            for &(term_bits, _coef) in &axiom_bits[ai as usize] {
+                let product = term_bits | mi_bits;
+                if product.count_ones() as u32 > d as u32 { continue; }
+                if bits_to_orbit.contains_key(&product) { continue; }
+                let prod_edges = monobits_to_edges(product, n_verts);
+                let (canon_g, aut) = canonicalize(&prod_edges);
+                let next = lazy_c2o.len() as u32;
+                let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
+                    let sz = orbit_size(&canon_g, aut, n_verts);
+                    (next, sz)
+                });
+                bits_to_orbit.insert(product, (orbit_r, orbit_r_size));
+            }
+        }
+
+        let n = lazy_c2o.len();
+        if verbose {
+            eprintln!(
+                "c [alg-timing] monomial_orbits (lazy stab): {} product orbits in {:.3}s",
+                n, t0.elapsed().as_secs_f64()
+            );
+        }
+        (n, Vec::<u32>::new(), Vec::<u32>::new(), Some((n_verts, lazy_c2o, bits_to_orbit, red_reps, blue_reps)))
+    } else if is_ramsey_formula_path {
+        use super::graph_canon::{enumerate_orbit_reps, CanonGraph, StabOrbitRep};
         use std::collections::HashMap;
         let n_verts = schema.bases[0].size;
         let reps = enumerate_orbit_reps(n_verts, d as u32);
@@ -771,20 +875,17 @@ pub fn find_orbit_cert_fp_with_gens(
         if verbose {
             eprintln!(
                 "c [alg-timing] monomial_orbits (formula): {} orbits in {:.3}s",
-                n,
-                t0.elapsed().as_secs_f64()
+                n, t0.elapsed().as_secs_f64()
             );
         }
-        // Dummy empty orbit_id / orbit_rep — not used on the formula path.
-        (n, Vec::<u32>::new(), Vec::<u32>::new(), Some((n_verts, c2o)))
+        (n, Vec::<u32>::new(), Vec::<u32>::new(), Some((n_verts, c2o, HashMap::new(), Vec::<StabOrbitRep>::new(), Vec::<StabOrbitRep>::new())))
     } else {
         let (oid, orep) = monomial_orbits_on_the_fly(schema, gens, n_monos, &colex, &var_tables);
         let n = orep.len();
         if verbose {
             eprintln!(
                 "c [alg-timing] monomial_orbits (on-the-fly): {} orbits from {} monos in {:.3}s",
-                n, n_monos,
-                t0.elapsed().as_secs_f64()
+                n, n_monos, t0.elapsed().as_secs_f64()
             );
         }
         (n, oid, orep, None)
@@ -800,36 +901,8 @@ pub fn find_orbit_cert_fp_with_gens(
         );
     }
 
-    // Precompute axiom terms as (bits, coef) pairs — used by both the BFS
-    // matrix scatter and the cert-reconstruction pass.
-    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms
-        .iter()
-        .map(|a| {
-            a.terms
-                .iter()
-                .map(|(m, c)| (mono_to_bits(m, n), *c))
-                .collect()
-        })
-        .collect();
-
     // Unknown orbits: (axiom_idx, multiplier_mono_idx) pairs under the group.
-    //
-    // For Ramsey K_n with R(s,s) axioms (formula path): skip the O(n^11) pair BFS.
-    // Instead, enumerate pair-orbit canonical seeds by:
-    //   1. Detecting the stabilizer Stab(canonical_axiom) = S_s × S_{n-s}.
-    //      These are all S_n adjacent-transposition generators EXCEPT the one
-    //      crossing the boundary, i.e. var_tables[s-1] (the (s-1 ↔ s) swap).
-    //   2. Running a monomial BFS under those n-2 stabilizer generators.
-    //      Visits O(C(n_edges, budget)) ≈ O(n^{2s}) monomials — constant relative
-    //      to n for fixed s — vs O(n^{2s+3}) for the full pair BFS.
-    //   3. For each canonical mono m (first in its stab-orbit), adding ONE pair
-    //      orbit per axiom type (red + blue), with
-    //        orbit_c_size = C(n,s) × stab_orbit_size_of_m.
-    //
-    // For PHP and other schemas: use the original pair BFS.
     let t0 = std::time::Instant::now();
-    let axiom_degrees: Vec<usize> = axioms.iter().map(|a| a.degree()).collect();
-    let n_axioms = axioms.len();
     // global_max_mi = largest budget window across all axioms
     let global_max_mi = axiom_degrees
         .iter()
@@ -855,63 +928,67 @@ pub fn find_orbit_cert_fp_with_gens(
     // Per-orbit size (only populated on the formula path; empty on BFS path).
     let mut orbit_c_sizes: Vec<u64> = Vec::new();
 
-    // Detect R(s,s)/K_n case for the stabilizer-based fast path.
-    // Conditions: formula path active, n_axioms = 2*C(n,s), uniform axiom degree.
-    let ramsey_stab_path: Option<(usize, usize, usize)> = if formula_data.is_some() {
-        let n_verts = schema.bases[0].size as usize;
-        // Max degree of red axioms = C(s,2). Infer s from degree of first axiom.
-        let max_red_deg = axiom_degrees.get(0).copied().unwrap_or(0);
-        // C(s,2) = max_red_deg → s = (1 + sqrt(1+8*d))/2
-        let s_float = (1.0 + (1.0 + 8.0 * max_red_deg as f64).sqrt()) / 2.0;
-        let s = s_float.round() as usize;
-        // Verify: C(s,2) == max_red_deg, n_axioms == 2*C(n,s), all axioms same degree
-        use crate::tuple_schema::binom;
-        let n_red = binom(n_verts as u32, s as u32) as usize;
-        let csk2 = s * (s - 1) / 2;
-        let all_same_deg = axiom_degrees.iter().all(|&d_i| d_i == max_red_deg);
-        if s >= 2 && csk2 == max_red_deg && n_axioms == 2 * n_red && all_same_deg {
-            // budget = d - max_red_deg (same for both axiom types)
-            let budget = d.saturating_sub(max_red_deg);
-            Some((s, n_red, budget))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    if let Some((s_size, n_red, budget)) = ramsey_stab_path {
+    // pre_stab_path carries (s, t, n_red, n_blue, budget_red, budget_blue) if
+    // the R(s,t) stab path was activated (pre-detected above). When active,
+    // formula_data already holds the lazy c2o built from actual products.
+    if let Some((s_size, t_size, n_red, _n_blue, budget_red, budget_blue)) = pre_stab_path {
         // Direct enumeration of canonical pair orbit types — O(1) in n.
-        // orbit_c_size(n) = P(n, s+f) / aut_count  (falling factorial / aut group size).
-        // Replaces the O(max_mi) = O(n^8) monomial BFS with 193 constant-time lookups.
-        use super::graph_canon::enumerate_stab_pair_reps;
+        // For red axioms: stabilizer of canonical K_s = S_s × S_{n-s}.
+        // For blue axioms: stabilizer of canonical K_t = S_t × S_{n-t}.
+        // Each gives independent pair-orbit reps; orbit sizes are polynomials in n.
         let n_verts = schema.bases[0].size;
-        let stab_reps = enumerate_stab_pair_reps(s_size, budget);
 
+        // Reuse reps computed in the lazy c2o build — same (s, budget, max_free) args.
+        let (red_stab_reps, blue_stab_reps) = match formula_data {
+            Some((_, _, _, ref r, ref b)) => (r, b),
+            _ => panic!("stab path requires formula_data with stab reps"),
+        };
         let red_idx = 0u32;
         let blue_idx = n_red as u32;
 
-        for rep in &stab_reps {
-            let orbit_c_size = rep.orbit_c_size(n_verts, s_size);
-            if orbit_c_size == 0 { continue; }
+        // Pass 1: collect valid reps (orbit_c_size > 0) without touching matrix_rows yet.
+        let valid_red: Vec<(MonoBits, u64)> = red_stab_reps.iter()
+            .filter_map(|rep| {
+                let sz = rep.orbit_c_size(n_verts, s_size);
+                if sz > 0 { Some((rep.to_monobits(n_verts), sz)) } else { None }
+            })
+            .collect();
+        let valid_blue: Vec<(MonoBits, u64)> = blue_stab_reps.iter()
+            .filter_map(|rep| {
+                let sz = rep.orbit_c_size(n_verts, t_size);
+                if sz > 0 { Some((rep.to_monobits(n_verts), sz)) } else { None }
+            })
+            .collect();
 
-            // Convert canonical edges to MonoBits in K_n, then rank for seed storage.
-            let mi_bits = rep.to_monobits(n_verts);
-            let mi = colex.rank(mi_bits) as u32;
+        // Pre-allocate all matrix rows at once — O(n_rows × n_cols) sequential fill
+        // instead of incremental Vec::push calls.
+        let n_cols_stab = valid_red.len() + valid_blue.len();
+        for r in matrix_rows.iter_mut() { *r = vec![0u8; n_cols_stab]; }
+        rhs.resize(n_cols_stab, 0u8);
 
-            total_pairs += rep.orbit_c_size(n_verts, s_size) as usize * 2;
-
-            // Red canonical pair orbit
+        // Pass 2: fill unknown_seeds and orbit_c_sizes.
+        for (mi_bits, orbit_c_size) in &valid_red {
+            let mi = colex.rank(*mi_bits) as u32;
+            total_pairs += *orbit_c_size as usize;
             unknown_seeds.push((red_idx, mi));
-            orbit_c_sizes.push(orbit_c_size);
-            for r in matrix_rows.iter_mut() { r.push(0); }
-            rhs.push(0);
-
-            // Blue canonical pair orbit
+            orbit_c_sizes.push(*orbit_c_size);
+        }
+        for (mi_bits, orbit_c_size) in &valid_blue {
+            let mi = colex.rank(*mi_bits) as u32;
+            total_pairs += *orbit_c_size as usize;
             unknown_seeds.push((blue_idx, mi));
-            orbit_c_sizes.push(orbit_c_size);
-            for r in matrix_rows.iter_mut() { r.push(0); }
-            rhs.push(0);
+            orbit_c_sizes.push(*orbit_c_size);
+        }
+
+        if verbose {
+            eprintln!(
+                "c [alg-timing] stab path R({},{}): {} red reps (budget {}), {} blue reps (budget {})",
+                s_size, t_size,
+                red_stab_reps.iter().filter(|r| r.orbit_c_size(n_verts, s_size) > 0).count(),
+                budget_red,
+                blue_stab_reps.iter().filter(|r| r.orbit_c_size(n_verts, t_size) > 0).count(),
+                budget_blue,
+            );
         }
     } else {
         // General pair BFS path (PHP, non-R(s,s), or BFS formula path).
@@ -1016,7 +1093,7 @@ pub fn find_orbit_cert_fp_with_gens(
     //   M[r][c] = ∑_{members} scatter = (|orbit_c| / orbit_size(r)) × seed_coef_sum(r)
     // where orbit_size(r) is the monomial-orbit size from enumerate_orbit_reps.
     // This avoids storing the O(n_monos) orbit_id array.
-    if let Some((n_verts, ref c2o)) = formula_data {
+    if let Some((n_verts, ref c2o, ref bits_to_orbit, _, _)) = formula_data {
         use super::graph_canon::{canonicalize, monobits_to_edges};
         for (col, &(ai, mi)) in unknown_seeds.iter().enumerate() {
             let mi_bits = colex.bits_at(mi as usize);
@@ -1026,10 +1103,19 @@ pub fn find_orbit_cert_fp_with_gens(
                 if (product.count_ones() as u32) > colex.d {
                     continue;
                 }
-                let prod_edges = monobits_to_edges(product, n_verts);
-                let (canon_g, _aut) = canonicalize(&prod_edges);
-                if let Some(&(orbit_r, orbit_r_size)) = c2o.get(&canon_g) {
-                    let inv_r = mod_inv((orbit_r_size % (p as u64)) as u8, p);
+                // Use bits→orbit cache when available (stab path); fall back to
+                // canonicalize for the formula path where bits_to_orbit is empty.
+                let orbit_r_and_size: Option<(u32, u64)> = if let Some(&v) = bits_to_orbit.get(&product) {
+                    Some(v)
+                } else {
+                    let prod_edges = monobits_to_edges(product, n_verts);
+                    let (canon_g, _aut) = canonicalize(&prod_edges);
+                    c2o.get(&canon_g).copied()
+                };
+                if let Some((orbit_r, orbit_r_size)) = orbit_r_and_size {
+                    let r_mod_p = (orbit_r_size % (p as u64)) as u8;
+                    if r_mod_p == 0 { continue; } // p | |orbit_r|: skip (unsound mod p)
+                    let inv_r = mod_inv(r_mod_p, p);
                     let scale = (orbit_c_mod as u16 * inv_r as u16 % p as u16) as u8;
                     let contrib = (coef as u16 * scale as u16 % p as u16) as u8;
                     matrix_rows[orbit_r as usize][col] =
@@ -1143,7 +1229,7 @@ pub fn find_orbit_cert_fp_with_gens(
     // already solved and the consistency check above already verified.
     // Therefore we skip the O(n^11) reenumerate_orbit_members step and return
     // the solution directly.  Cert emission (--alg-cert) uses the BFS path.
-    if ramsey_stab_path.is_some() {
+    if pre_stab_path.is_some() {
         let t0 = std::time::Instant::now();
         // Fast algebraic verify: check M×sol = e_0 holds in the actual matrix.
         // This is trivially true by construction (Gaussian elim + consistency).

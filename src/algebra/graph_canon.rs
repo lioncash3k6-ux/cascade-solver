@@ -8,20 +8,20 @@
 //! * A degree-d edge-set monomial in K_n is an orbit-representative iff it
 //!   is the lex-minimum labeling of its isomorphism class.
 //! * Each connected component of d edges has ≤ d+1 vertices (tree bound), so
-//!   each component has ≤ 8 vertices for d ≤ 7. Brute-force k! canonical
-//!   labeling is feasible for k ≤ 8 (8! = 40 320).
+//!   each component has ≤ d+1 vertices. Brute-force k! canonical
+//!   labeling is feasible for k ≤ 10 (10! = 3.6 M).
 //! * orbit_size = P(n, k) / |Aut(H)| where k = number of active vertices in
 //!   the canonical graph H and |Aut(H)| is the automorphism group size.
 
 /// A canonical simple graph on vertices 0..n_verts−1.
-/// Edges stored as sorted (u, v) pairs with u < v, packed as `(u << 4) | v`
-/// (both u, v fit in 4 bits since max vertices = 14 = 2 × 7 edges).
+/// Edges stored as sorted (u, v) pairs with u < v, packed as `(u as u16) << 8 | v as u16`.
+/// Supports up to 20 edges and vertices 0..=254 — sufficient for degree ≤ 20 and K_n (n ≤ 255).
 /// The edge list is the lex-minimum over all vertex relabelings.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub(crate) struct CanonGraph {
     pub n_verts: u8,
     pub n_edges: u8,
-    pub edges: [u8; 7], // packed: (u << 4) | v, up to 7 edges
+    pub edges: [u16; 20], // packed: (u as u16) << 8 | v as u16, up to 20 edges
 }
 
 impl CanonGraph {
@@ -30,7 +30,7 @@ impl CanonGraph {
     }
 
     fn from_sorted_edges(edges: &[(u8, u8)]) -> Self {
-        debug_assert!(edges.len() <= 7);
+        debug_assert!(edges.len() <= 20);
         let n_verts = edges
             .iter()
             .flat_map(|&(u, v)| [u, v])
@@ -41,7 +41,7 @@ impl CanonGraph {
         g.n_verts = n_verts;
         g.n_edges = edges.len() as u8;
         for (i, &(u, v)) in edges.iter().enumerate() {
-            g.edges[i] = (u << 4) | v;
+            g.edges[i] = (u as u16) << 8 | v as u16;
         }
         g
     }
@@ -49,7 +49,7 @@ impl CanonGraph {
     pub fn edge_iter(&self) -> impl Iterator<Item = (u8, u8)> + '_ {
         self.edges[..self.n_edges as usize]
             .iter()
-            .map(|&e| (e >> 4, e & 0x0f))
+            .map(|&e| ((e >> 8) as u8, (e & 0xff) as u8))
     }
 }
 
@@ -93,34 +93,193 @@ fn relabel(edges: &[(u8, u8)], perm: &[u8]) -> Vec<(u8, u8)> {
     r
 }
 
-/// Brute-force canonical form for a CONNECTED graph on n_verts ≤ 8 vertices.
-/// Returns the lex-minimum edge list and the automorphism group size.
+/// Branch-and-bound canonical form for a CONNECTED graph.
+/// Assigns new labels 0..n-1 to old vertices one at a time; prunes branches
+/// whose partial edge list is already lex-greater than the current best.
+/// For asymmetric graphs (aut=1) this runs in O(n²) instead of O(n!).
 fn canon_connected(edges: &[(u8, u8)], n_verts: u8) -> (Vec<(u8, u8)>, u64) {
-    debug_assert!(n_verts <= 8, "brute-force canon: n_verts={} > 8", n_verts);
-    let mut perm: Vec<u8> = (0..n_verts).collect();
-    let mut best: Option<Vec<(u8, u8)>> = None;
+    let n = n_verts as usize;
+    let ne = edges.len();
+
+    let mut adj = [0u32; 20];
+    for &(u, v) in edges {
+        adj[u as usize] |= 1 << v;
+        adj[v as usize] |= 1 << u;
+    }
+
+    let mut best: Vec<(u8, u8)> = vec![(n_verts, n_verts); ne]; // sentinel (all-max)
     let mut aut = 0u64;
-    loop {
-        let r = relabel(edges, &perm);
-        match &best {
-            None => {
-                best = Some(r.clone());
-                aut = 1;
-            }
-            Some(b) if r < *b => {
-                best = Some(r);
-                aut = 1;
-            }
-            Some(b) if r == *b => {
-                aut += 1;
-            }
-            _ => {}
+    let mut inv = [n_verts; 20]; // inv[old] = new label; n_verts = unassigned
+    let mut used = 0u32;
+    let mut partial: Vec<(u8, u8)> = Vec::with_capacity(ne);
+
+    canon_bt(&adj, &mut inv, &mut used, 0, n, n_verts, &mut partial, &mut best, &mut aut);
+    (best, aut)
+}
+
+fn canon_bt(
+    adj: &[u32; 20],
+    inv: &mut [u8; 20],
+    used: &mut u32,
+    pos: usize,
+    n: usize,
+    sentinel: u8,
+    partial: &mut Vec<(u8, u8)>,
+    best: &mut Vec<(u8, u8)>,
+    aut: &mut u64,
+) {
+    if pos == n {
+        match partial.as_slice().cmp(best.as_slice()) {
+            std::cmp::Ordering::Less    => { *best = partial.clone(); *aut = 1; }
+            std::cmp::Ordering::Equal   => { *aut += 1; }
+            std::cmp::Ordering::Greater => {}
         }
-        if !next_perm(&mut perm) {
-            break;
+        return;
+    }
+
+    for old in 0..n {
+        if *used >> old & 1 != 0 { continue; }
+
+        // New edges when old vertex `old` receives label `pos`:
+        // (min(inv[x], pos), max(inv[x], pos)) for each already-assigned neighbor x.
+        let save_len = partial.len();
+        let mut nbrs = adj[old] & *used;
+        while nbrs != 0 {
+            let x = nbrs.trailing_zeros() as usize;
+            nbrs &= nbrs - 1;
+            let j = inv[x] as usize;
+            let a = j.min(pos) as u8;
+            let b = j.max(pos) as u8;
+            partial.push((a, b));
+        }
+        partial[save_len..].sort_unstable();
+
+        // Prune: skip if partial is already lex-greater than best's prefix.
+        if partial.as_slice().cmp(&best[..partial.len()]) != std::cmp::Ordering::Greater {
+            inv[old] = pos as u8;
+            *used |= 1 << old;
+            canon_bt(adj, inv, used, pos + 1, n, sentinel, partial, best, aut);
+            inv[old] = sentinel;
+            *used &= !(1 << old);
+        }
+
+        partial.truncate(save_len);
+    }
+}
+
+/// Branch-and-bound canonical form under S_s × S_f.
+/// Fixed vertices 0..s-1 map only to labels 0..s-1; free vertices s..s+f-1
+/// map only to labels s..s+f-1. Prunes branches whose partial edge list
+/// already exceeds the current best (same logic as canon_bt).
+fn stab_canon_bt(
+    adj: &[u32; 20],
+    s: usize,
+    f: usize,
+    inv: &mut [u8; 20],   // inv[old] = new label; (s+f) = unassigned
+    used_fixed: &mut u32, // bitmask over OLD fixed vertices 0..s-1
+    used_free: &mut u32,  // bitmask over OLD free vertex OFFSETS 0..f-1 (vertex s+j ↔ bit j)
+    pos: usize,
+    partial: &mut Vec<(u8, u8)>,
+    best: &mut Vec<(u8, u8)>,
+    aut: &mut u64,
+) {
+    let n = s + f;
+    if pos == n {
+        match partial.as_slice().cmp(best.as_slice()) {
+            std::cmp::Ordering::Less  => { *best = partial.clone(); *aut = 1; }
+            std::cmp::Ordering::Equal => { *aut += 1; }
+            _                         => {}
+        }
+        return;
+    }
+    // Combined bitmask of all assigned vertices (for adjacency queries).
+    let used_all = *used_fixed | (*used_free << s);
+
+    if pos < s {
+        // Assign a fixed label: try each unassigned old fixed vertex.
+        for old in 0..s {
+            if *used_fixed >> old & 1 != 0 { continue; }
+            let save_len = partial.len();
+            let mut nbrs = adj[old] & used_all;
+            while nbrs != 0 {
+                let x = nbrs.trailing_zeros() as usize;
+                nbrs &= nbrs - 1;
+                let j = inv[x] as usize;
+                partial.push((j.min(pos) as u8, j.max(pos) as u8));
+            }
+            partial[save_len..].sort_unstable();
+            if partial.as_slice().cmp(&best[..partial.len()]) != std::cmp::Ordering::Greater {
+                inv[old] = pos as u8;
+                *used_fixed |= 1 << old;
+                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut);
+                inv[old] = n as u8;
+                *used_fixed &= !(1 << old);
+            }
+            partial.truncate(save_len);
+        }
+    } else {
+        // Assign a free label: try each unassigned old free vertex.
+        for old_j in 0..f {
+            if *used_free >> old_j & 1 != 0 { continue; }
+            let old = s + old_j;
+            let save_len = partial.len();
+            let mut nbrs = adj[old] & used_all;
+            while nbrs != 0 {
+                let x = nbrs.trailing_zeros() as usize;
+                nbrs &= nbrs - 1;
+                let j = inv[x] as usize;
+                partial.push((j.min(pos) as u8, j.max(pos) as u8));
+            }
+            partial[save_len..].sort_unstable();
+            if partial.as_slice().cmp(&best[..partial.len()]) != std::cmp::Ordering::Greater {
+                inv[old] = pos as u8;
+                *used_free |= 1 << old_j;
+                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut);
+                inv[old] = n as u8;
+                *used_free &= !(1 << old_j);
+            }
+            partial.truncate(save_len);
         }
     }
-    (best.unwrap(), aut)
+}
+
+/// B&B stab_canonicalize: same semantics as stab_canonicalize but uses
+/// branch-and-bound instead of brute-force permutation enumeration.
+fn stab_canon_bb(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
+    if edges.is_empty() {
+        let s_fact: u64 = (1..=(s as u64)).product();
+        return (vec![], 0, s_fact);
+    }
+    // Compress free vertex labels to s, s+1, ...
+    let mut free_labels: Vec<u8> = edges.iter()
+        .flat_map(|&(u, v)| [u, v])
+        .filter(|&x| x >= s)
+        .collect();
+    free_labels.sort_unstable();
+    free_labels.dedup();
+    let f = free_labels.len();
+    let n = s as usize + f;
+
+    let remap = |x: u8| -> u8 {
+        if x < s { x } else { s + free_labels.partition_point(|&v| v < x) as u8 }
+    };
+    let mut adj = [0u32; 20];
+    for &(u, v) in edges {
+        let (ru, rv) = (remap(u) as usize, remap(v) as usize);
+        adj[ru] |= 1 << rv;
+        adj[rv] |= 1 << ru;
+    }
+    let ne = edges.len();
+    let sentinel = n as u8;
+    let mut best: Vec<(u8, u8)> = vec![(sentinel, sentinel); ne];
+    let mut aut = 0u64;
+    let mut inv = [sentinel; 20];
+    let mut used_fixed = 0u32;
+    let mut used_free = 0u32;
+    let mut partial: Vec<(u8, u8)> = Vec::with_capacity(ne);
+    stab_canon_bt(&adj, s as usize, f, &mut inv, &mut used_fixed, &mut used_free,
+                  0, &mut partial, &mut best, &mut aut);
+    (best, f as u8, aut)
 }
 
 /// Union-find for connected components.
@@ -518,10 +677,10 @@ fn stab_canonicalize(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
 /// Vertices {0..s-1} are "fixed" (K_s vertices) and {s..} are "free". Incremental
 /// edge-addition (like `enumerate_orbit_reps`) ensures only canonical forms are kept.
 /// Cost: O(n_reps) = O(1) per call regardless of K_n size.
-pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbitRep> {
+pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize) -> Vec<StabOrbitRep> {
     use std::collections::HashSet;
     let s = s as u8;
-    let max_f = (2 * budget) as u8;
+    let max_f = (max_free.min(2 * budget)) as u8;
 
     let mut seen: HashSet<Vec<(u8, u8)>> = HashSet::new();
     let mut by_deg: Vec<Vec<Vec<(u8, u8)>>> = vec![Vec::new(); budget + 1];
@@ -550,7 +709,7 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbit
                     if present.contains(&(u, v)) { continue; }
                     let mut p = pattern.clone();
                     p.push((u, v));
-                    let (canon, _, _) = stab_canonicalize(&p, s);
+                    let (canon, _, _) = stab_canon_bb(&p, s);
                     if seen.insert(canon.clone()) { by_deg[k].push(canon); }
                 }
             }
@@ -562,7 +721,7 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbit
                     let (lo, hi) = if u < nv { (u, nv) } else { (nv, u) };
                     let mut p = pattern.clone();
                     p.push((lo, hi));
-                    let (canon, _, _) = stab_canonicalize(&p, s);
+                    let (canon, _, _) = stab_canon_bb(&p, s);
                     if seen.insert(canon.clone()) { by_deg[k].push(canon); }
                 }
             }
@@ -572,7 +731,7 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbit
                 let (nv1, nv2) = (s + cur_f, s + cur_f + 1);
                 let mut p = pattern.clone();
                 p.push((nv1, nv2));
-                let (canon, _, _) = stab_canonicalize(&p, s);
+                let (canon, _, _) = stab_canon_bb(&p, s);
                 if seen.insert(canon.clone()) { by_deg[k].push(canon); }
             }
         }
@@ -581,7 +740,7 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize) -> Vec<StabOrbit
     let mut result = Vec::new();
     for deg_pats in &by_deg {
         for canon in deg_pats {
-            let (_, f, aut_count) = stab_canonicalize(canon, s);
+            let (_, f, aut_count) = stab_canon_bb(canon, s);
             result.push(StabOrbitRep { edges: canon.clone(), f: f as usize, aut_count });
         }
     }
@@ -701,7 +860,7 @@ mod tests {
     #[test]
     fn stab_pair_reps_r33_count() {
         // R(3,3): s=3, budget=4. Should give exactly 193 canonical types.
-        let reps = enumerate_stab_pair_reps(3, 4);
+        let reps = enumerate_stab_pair_reps(3, 4, usize::MAX);
         assert_eq!(reps.len(), 193, "R(3,3) stab reps: expected 193, got {}", reps.len());
     }
 
@@ -711,7 +870,7 @@ mod tests {
         // where max_mi = len_up_to_degree(4) over 66 vars.
         // Actually: sum of orbit_c_sizes = total (axiom, mono) pairs in orbit = n_axioms/2 * max_mi
         // i.e. sum_over_reps(orbit_c_size) = C(12,3) * C(66,0..4) = 220 * 1502658 = 330584760
-        let reps = enumerate_stab_pair_reps(3, 4);
+        let reps = enumerate_stab_pair_reps(3, 4, usize::MAX);
         let n = 12u32;
         let total: u64 = reps.iter().map(|r| r.orbit_c_size(n, 3)).sum();
         // C(66,0)+C(66,1)+C(66,2)+C(66,3)+C(66,4) = 1+66+2145+45760+766480...
