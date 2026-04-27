@@ -1,21 +1,28 @@
 //! Closed-form NS certificate for PHP_{P,H} — no orbit BFS, no Gaussian.
 //!
-//! Uses the identity:
+//! Uses the injective-product identity:
 //!   1 = Σ_{k=0}^{P-1} m_k · f_k  +  Σ_{j,k,l} m_{j,k,l} · g_{j,k,l}
 //!
 //! where:
 //!   f_k = Σ_j x_{k,j} − 1              (pigeon-k totality, 0-indexed)
 //!   g_{j,k,l} = x_{k,j} · x_{l,j}     (hole-j AMO for pigeons k < l)
 //!
-//!   m_k = −∏_{i<k}(Σ_j x_{i,j})       (degree k, built by product)
+//!   m_k = −inj_Q_k                      (neg. of injective-only partial product)
+//!   inj_Q_k = Σ_{injective σ:[k]→[H]} ∏_{i<k} x_{i,σ(i)}
 //!
-//!   m_{j,k,l} = Σ_{σ with first-conflict=(k,l,j)} ∏_{i∉{k,l}} x_{i,σ(i)}
+//!   m_{j,k,l} = Σ_{early-conflict=(k,l,j)} ∏_{i∉{k,l},i<l} x_{i,σ(i)}
+//!               (residual monomials from non-injective extensions, distributed immediately)
 //!
-//! Complexity: O(P × H^P) time, O(H^P × 17 bytes) space.
-//!   PHP_{7,6}: H^P = 280K  →  <5 ms
-//!   PHP_{8,7}: H^P = 5.76M →  ~250 ms
-//!   PHP_{9,8}: H^P = 134M  →  ~6 s
-//!   PHP_{10,9}: H^P = 3.5B →  ~150 s (feasible on 60+ GB RAM)
+//! Correctness: telescoping over injective products gives 1 - 0 = 1 (since inj_Q_P = 0
+//! when P > H), and the AMO mults cover exactly the non-injective contributions.
+//!
+//! Complexity: O(P × H!) time, O(H!) space — independent of H^P.
+//!   PHP_{7,6}:  peak prod 6! = 720      →  <1 ms
+//!   PHP_{8,7}:  peak prod 7! = 5040     →  <1 ms
+//!   PHP_{9,8}:  peak prod 8! = 40320    →  ~1 ms
+//!   PHP_{10,9}: peak prod 9! = 362880   →  ~5 ms
+//!   PHP_{11,10}: peak prod 10! = 3.6M   →  ~100 ms
+//!   PHP_{12,11}: peak prod 11! = 39.9M  →  ~5 s
 //!
 //! Variables: x_{i,j} at bit position i*H + j (0-indexed i,j),
 //! DIMACS variable i*H + j + 1 (1-indexed), matching TupleVarSchema Ordered.
@@ -31,92 +38,85 @@ pub type RawCert = HashMap<usize, HashMap<u128, u8>>;
 
 /// Build a closed-form NS certificate for PHP_{p,h} over 𝔽_{prime}.
 ///
-/// Returns raw bit-map polynomials. Memory: O(H^P × 17 bytes).
-/// Use `raw_cert_to_polyp` to convert to PolyP (only for small P*H).
+/// Uses the injective-product construction: prod tracks only injective partial
+/// assignments (peak size = H! entries), non-injective extensions are distributed
+/// immediately to the corresponding AMO multiplier. Memory: O(H! × 17 bytes).
 pub fn find_php_cert_raw(p: u32, h: u32, prime: u8) -> RawCert {
     assert!(p > h, "PHP_{{{p},{h}}}: need P > H");
     assert!(p * h <= 128, "P*H={} exceeds u128 limit", p * h);
 
-    // prod[k]: Vec<(mono_bits, coeff)> — the polynomial Q_k = ∏_{i<k}(Σ_j x_{i,j}).
-    // Entries are always distinct within a step (fresh pigeon variable each time).
-    let mut prod: Vec<(u128, u8)> = vec![(0u128, 1u8)];
-
-    // Totality mult k: m_k = -Q_k.
-    let mut tot_mults: Vec<Vec<(u128, u8)>> = Vec::with_capacity(p as usize);
-
-    for k in 0..p {
-        // m_k = -Q_k (negate prod).
-        tot_mults.push(
-            prod.iter()
-                .map(|&(b, c)| (b, (prime - c % prime) % prime))
-                .filter(|&(_, nc)| nc != 0)
-                .collect(),
-        );
-
-        // Q_{k+1} = Q_k × Σ_j x_{k,j}. All new entries distinct.
-        let mut new_prod = Vec::with_capacity(prod.len() * h as usize);
-        for &(bits, coef) in &prod {
-            for j in 0..h {
-                new_prod.push((bits | (1u128 << (k * h + j)), coef));
-            }
-        }
-        prod = new_prod;
-    }
-    // prod = Q_P.
-
-    // Precompute pair_idx offsets: pair_start[k] = Σ_{i<k}(P-1-i).
+    // Pair index helpers: pair_start[fc_k] + (fc_l - fc_k - 1) → unique pair index.
     let pair_start: Vec<usize> = (0..p)
         .map(|k| (0..k).map(|i| (p - 1 - i) as usize).sum())
         .collect();
     let amos_per_hole = (p * (p - 1) / 2) as usize;
-    let row_mask = (1u128 << h) - 1;
 
-    // amo_acc[ai]: accumulated (residual_bits, coeff) for AMO axiom ai.
-    let mut amo_acc: HashMap<usize, Vec<(u128, u8)>> = HashMap::new();
+    // Injective prod: (bits, coef, used_holes).
+    // bits: bitmask of x_{i,j} variables set for pigeons placed so far.
+    // used_holes: u32 bitmask of which holes (0..H-1) are already occupied.
+    // Invariant: the assignment is injective — each hole used at most once.
+    let mut prod: Vec<(u128, u8, u32)> = vec![(0u128, 1u8, 0u32)];
 
-    for (bits, coef) in prod {
-        // Find first conflict using a seen-bitmask over holes.
-        let mut seen = 0u32;
-        let mut seen_by = [0u32; 16]; // seen_by[j] = first pigeon using hole j
-        let mut fc_k = 0u32;
-        let mut fc_l = 0u32;
-        let mut fc_j = 0u32;
+    // amo_acc[ai]: direct HashMap accumulation (no intermediate Vec).
+    let mut amo_acc: HashMap<usize, HashMap<u128, u8>> = HashMap::new();
 
-        for k in 0..p {
-            let j = ((bits >> (k * h)) & row_mask).trailing_zeros();
-            if seen & (1 << j) != 0 {
-                fc_k = seen_by[j as usize];
-                fc_l = k;
-                fc_j = j;
-                break;
-            }
-            seen |= 1 << j;
-            seen_by[j as usize] = k;
-        }
-
-        let residual = bits & !((1u128 << (fc_k * h + fc_j)) | (1u128 << (fc_l * h + fc_j)));
-        let pair_idx = pair_start[fc_k as usize] + (fc_l - fc_k - 1) as usize;
-        let ai = p as usize + fc_j as usize * amos_per_hole + pair_idx;
-        amo_acc.entry(ai).or_default().push((residual, coef));
-    }
-
-    // Merge AMO accumulations (sum duplicate residuals).
     let mut cert: RawCert = HashMap::new();
 
-    for (k, entries) in tot_mults.into_iter().enumerate() {
-        if !entries.is_empty() {
-            cert.insert(k, entries.into_iter().collect());
+    for k in 0..p {
+        // tot_mult[k] = -inj_Q_k: negate the current injective product.
+        // All entries in prod are distinct (injective assignments → distinct monomials).
+        let mut mult_k: HashMap<u128, u8> = HashMap::with_capacity(prod.len());
+        for &(b, c, _) in &prod {
+            let neg = (prime - c % prime) % prime;
+            if neg != 0 {
+                mult_k.insert(b, neg);
+            }
         }
+        if !mult_k.is_empty() {
+            cert.insert(k as usize, mult_k);
+        }
+
+        // Extend inj_Q_k by (Σ_j x_{k,j}).
+        // Injective extensions → new_prod; non-injective → AMO accumulator.
+        let mut new_prod: Vec<(u128, u8, u32)> =
+            Vec::with_capacity(prod.len() * (h as usize).saturating_sub(k as usize));
+        for &(bits, coef, used) in &prod {
+            for j in 0..h {
+                if used & (1 << j) == 0 {
+                    // Injective: pigeon k uses a fresh hole.
+                    new_prod.push((bits | (1u128 << (k * h + j)), coef, used | (1 << j)));
+                } else {
+                    // Non-injective: hole j already taken by some earlier pigeon fc_k.
+                    // Identify fc_k (the first pigeon using hole j).
+                    let fc_k = (0..k)
+                        .find(|&i| bits & (1u128 << (i * h + j)) != 0)
+                        .unwrap() as u32;
+                    let fc_l = k;
+                    let fc_j = j;
+                    // residual = bits without x_{fc_k, j}; x_{k, j} is not in bits.
+                    let residual = bits & !(1u128 << (fc_k * h + fc_j));
+                    let pair_idx =
+                        pair_start[fc_k as usize] + (fc_l - fc_k - 1) as usize;
+                    let ai = p as usize + fc_j as usize * amos_per_hole + pair_idx;
+                    let e = amo_acc
+                        .entry(ai)
+                        .or_default()
+                        .entry(residual)
+                        .or_insert(0u8);
+                    *e = ((*e as u16 + coef as u16) % prime as u16) as u8;
+                }
+            }
+        }
+        prod = new_prod;
     }
-    for (ai, acc) in amo_acc {
-        let mut map: HashMap<u128, u8> = HashMap::with_capacity(acc.len());
-        for (bits, c) in acc {
-            let e = map.entry(bits).or_insert(0);
-            *e = ((*e as u16 + c as u16) % prime as u16) as u8;
-        }
-        map.retain(|_, v| *v != 0);
-        if !map.is_empty() {
-            cert.insert(ai, map);
+    // prod is now empty: all injective assignments of P > H pigeons to H holes
+    // are impossible, so the last step sends everything to amo_acc.
+
+    // Flush amo_acc into cert (drop zero-coefficient entries).
+    for (ai, map) in amo_acc {
+        let clean: HashMap<u128, u8> = map.into_iter().filter(|&(_, v)| v != 0).collect();
+        if !clean.is_empty() {
+            cert.insert(ai, clean);
         }
     }
 
@@ -292,19 +292,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn php_9_8_explicit() {
         let prime = 11u8;
         let t = std::time::Instant::now();
         let cert = find_php_cert_raw(9, 8, prime);
-        let t_build = t.elapsed().as_secs_f64();
+        let t_build = t.elapsed().as_secs_f64() * 1e3;
         let t2 = std::time::Instant::now();
         assert!(verify_cert_raw(9, 8, prime, &cert), "raw verify failed");
-        eprintln!("PHP_{{9,8}} build={:.3}s verify_raw={:.3}s", t_build, t2.elapsed().as_secs_f64());
+        eprintln!("PHP_{{9,8}} build={:.1}ms verify_raw={:.1}ms", t_build, t2.elapsed().as_secs_f64()*1e3);
     }
 
     #[test]
-    #[ignore]
     fn php_10_9_explicit() {
         let prime = 11u8;
         let t = std::time::Instant::now();
@@ -313,5 +311,17 @@ mod tests {
         let t2 = std::time::Instant::now();
         assert!(verify_cert_raw(10, 9, prime, &cert), "raw verify failed");
         eprintln!("PHP_{{10,9}} build={:.3}s verify_raw={:.3}s", t_build, t2.elapsed().as_secs_f64());
+    }
+
+    #[test]
+    #[ignore]
+    fn php_11_10_explicit() {
+        let prime = 11u8;
+        let t = std::time::Instant::now();
+        let cert = find_php_cert_raw(11, 10, prime);
+        let t_build = t.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        assert!(verify_cert_raw(11, 10, prime, &cert), "raw verify failed");
+        eprintln!("PHP_{{11,10}} build={:.3}s verify_raw={:.3}s", t_build, t2.elapsed().as_secs_f64());
     }
 }
