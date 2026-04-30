@@ -677,7 +677,27 @@ fn stab_canonicalize(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
 /// Vertices {0..s-1} are "fixed" (K_s vertices) and {s..} are "free". Incremental
 /// edge-addition (like `enumerate_orbit_reps`) ensures only canonical forms are kept.
 /// Cost: O(n_reps) = O(1) per call regardless of K_n size.
+/// A candidate pattern represented as a fixed-size array to avoid heap allocation.
+/// `len` edges are stored as (u8, u8) pairs in `edges[0..len]`.
+/// Max budget is 20 (hard limit from stab_canon_bb's adj array).
+#[derive(Clone, Copy)]
+struct CandidatePat {
+    edges: [(u8, u8); 20],
+    len: u8,
+}
+
+impl CandidatePat {
+    fn from_slice(s: &[(u8, u8)]) -> Self {
+        let mut c = CandidatePat { edges: [(0, 0); 20], len: s.len() as u8 };
+        c.edges[..s.len()].copy_from_slice(s);
+        c
+    }
+    fn as_slice(&self) -> &[(u8, u8)] { &self.edges[..self.len as usize] }
+    fn push(&mut self, e: (u8, u8)) { self.edges[self.len as usize] = e; self.len += 1; }
+}
+
 pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize) -> Vec<StabOrbitRep> {
+    use rayon::prelude::*;
     use std::collections::HashSet;
     let s = s as u8;
     let max_f = (max_free.min(2 * budget)) as u8;
@@ -690,60 +710,75 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize)
     by_deg[0].push(empty);
 
     for k in 1..=budget {
-        let prev = by_deg[k - 1].clone();
-        for pattern in &prev {
-            // cur_f: number of distinct free vertices currently used (canonical → consecutive)
+        let prev = &by_deg[k - 1];
+
+        // Collect all candidate patterns into a flat Vec of fixed-size structs.
+        // No heap allocation per candidate — avoids fragmentation.
+        let mut candidates: Vec<CandidatePat> = Vec::new();
+        for pattern in prev {
+            let base = CandidatePat::from_slice(pattern);
             let cur_f: u8 = pattern.iter()
                 .flat_map(|&(u, v)| [u, v])
                 .filter(|&x| x >= s)
                 .max()
                 .map(|m| m - s + 1)
                 .unwrap_or(0);
-
-            let present: std::collections::HashSet<(u8, u8)> = pattern.iter().cloned().collect();
+            // Stack-allocated presence lookup (up to 20×20).
+            let mut present = [[false; 20]; 20];
+            for &(u, v) in pattern { present[u as usize][v as usize] = true; }
+            let n_exist = s + cur_f;
 
             // Edges between existing vertices {0..s+cur_f-1}
-            let n_exist = s + cur_f;
             for v in 1..n_exist {
                 for u in 0..v {
-                    if present.contains(&(u, v)) { continue; }
-                    let mut p = pattern.clone();
+                    if present[u as usize][v as usize] { continue; }
+                    let mut p = base;
                     p.push((u, v));
-                    let (canon, _, _) = stab_canon_bb(&p, s);
-                    if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+                    candidates.push(p);
                 }
             }
-
             // Add one new free vertex s+cur_f
             if cur_f < max_f {
                 let nv = s + cur_f;
                 for u in 0..n_exist {
                     let (lo, hi) = if u < nv { (u, nv) } else { (nv, u) };
-                    let mut p = pattern.clone();
+                    let mut p = base;
                     p.push((lo, hi));
-                    let (canon, _, _) = stab_canon_bb(&p, s);
-                    if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+                    candidates.push(p);
                 }
             }
-
             // Add two new free vertices (only the matching edge between them)
             if cur_f + 2 <= max_f {
                 let (nv1, nv2) = (s + cur_f, s + cur_f + 1);
-                let mut p = pattern.clone();
+                let mut p = base;
                 p.push((nv1, nv2));
-                let (canon, _, _) = stab_canon_bb(&p, s);
-                if seen.insert(canon.clone()) { by_deg[k].push(canon); }
+                candidates.push(p);
+            }
+        }
+
+        // Parallel: canonicalize all candidates. Each call is independent and allocation-free
+        // at the call site (stab_canon_bb allocates internally but only on the local stack/heap).
+        let canon_results: Vec<Vec<(u8, u8)>> = candidates.par_iter()
+            .map(|p| { let (canon, _, _) = stab_canon_bb(p.as_slice(), s); canon })
+            .collect();
+
+        // Sequential dedup into global seen.
+        for canon in canon_results {
+            if seen.insert(canon.clone()) {
+                by_deg[k].push(canon);
             }
         }
     }
 
-    let mut result = Vec::new();
-    for deg_pats in &by_deg {
-        for canon in deg_pats {
-            let (_, f, aut_count) = stab_canon_bb(canon, s);
-            result.push(StabOrbitRep { edges: canon.clone(), f: f as usize, aut_count });
-        }
-    }
+    // Parallel result assembly: recompute (f, aut_count) for each canonical pattern.
+    let result: Vec<StabOrbitRep> = by_deg.par_iter()
+        .flat_map(|deg_pats| {
+            deg_pats.par_iter().map(|canon| {
+                let (_, f, aut_count) = stab_canon_bb(canon, s);
+                StabOrbitRep { edges: canon.clone(), f: f as usize, aut_count }
+            })
+        })
+        .collect();
     result
 }
 

@@ -12,6 +12,10 @@
 //! Two-file proof: --equisat-proof and --proof together prove the BARE CNF
 //! is UNSAT (or SAT with the model).
 
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use cascade::backend::cadical::CaDiCaL;
 use cascade::backend::{Backend, BackendProofFormat, Verdict};
 use cascade::bcp::{bcp_cascade, BcpResult};

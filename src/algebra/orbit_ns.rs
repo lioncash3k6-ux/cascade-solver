@@ -18,6 +18,7 @@
 use super::ns_fp::PolyP;
 use super::poly::Monomial;
 use crate::tuple_schema::{Generator, TupleVarSchema};
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 /// Fixed-capacity bitmask monomial representation. Bit `v-1` is set iff
@@ -814,10 +815,17 @@ pub fn find_orbit_cert_fp_with_gens(
         use std::collections::HashMap;
         let n_verts = schema.bases[0].size;
 
+        let t_reps = std::time::Instant::now();
         let red_reps = enumerate_stab_pair_reps(pre_s, pre_br, n_verts as usize - pre_s);
-        let blue_reps = enumerate_stab_pair_reps(pre_t, pre_bt, n_verts as usize - pre_t);
+        let blue_reps = if pre_t == pre_s && pre_bt == pre_br {
+            red_reps.clone()
+        } else {
+            enumerate_stab_pair_reps(pre_t, pre_bt, n_verts as usize - pre_t)
+        };
+        if verbose { eprintln!("c [alg-timing] enumerate_stab_pair_reps: {:.3}s ({} red, {} blue)", t_reps.elapsed().as_secs_f64(), red_reps.len(), blue_reps.len()); }
 
         // Collect (ai, mi_bits) for all seeds with nonzero orbit size.
+        let t_monobits = std::time::Instant::now();
         let mut seed_mi_bits: Vec<(u32, MonoBits)> = Vec::new();
         for rep in &red_reps {
             if rep.orbit_c_size(n_verts, pre_s) == 0 { continue; }
@@ -828,6 +836,7 @@ pub fn find_orbit_cert_fp_with_gens(
             if rep.orbit_c_size(n_verts, pre_t) == 0 { continue; }
             seed_mi_bits.push((blue_ai, rep.to_monobits(n_verts)));
         }
+        if verbose { eprintln!("c [alg-timing] to_monobits: {:.3}s ({} seeds)", t_monobits.elapsed().as_secs_f64(), seed_mi_bits.len()); }
 
         // Scan all products → build lazy c2o (empty graph = row 0).
         // Also build bits_to_orbit: MonoBits → orbit_r to skip re-canonicalizing
@@ -838,21 +847,44 @@ pub fn find_orbit_cert_fp_with_gens(
         // can skip the canonicalize call for products already seen during the build.
         let mut bits_to_orbit: HashMap<MonoBits, (u32, u64)> = HashMap::new();
 
-        for &(ai, mi_bits) in &seed_mi_bits {
-            for &(term_bits, _coef) in &axiom_bits[ai as usize] {
-                let product = term_bits | mi_bits;
-                if product.count_ones() as u32 > d as u32 { continue; }
-                if bits_to_orbit.contains_key(&product) { continue; }
-                let prod_edges = monobits_to_edges(product, n_verts);
-                let (canon_g, aut) = canonicalize(&prod_edges);
-                let next = lazy_c2o.len() as u32;
-                let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
-                    let sz = orbit_size(&canon_g, aut, n_verts);
-                    (next, sz)
-                });
-                bits_to_orbit.insert(product, (orbit_r, orbit_r_size));
+        // Collect all unique products needing canonicalization.
+        let t_dedup = std::time::Instant::now();
+        let mut products_to_canon: Vec<MonoBits> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<MonoBits> = std::collections::HashSet::new();
+            for &(ai, mi_bits) in &seed_mi_bits {
+                for &(term_bits, _coef) in &axiom_bits[ai as usize] {
+                    let product = term_bits | mi_bits;
+                    if product.count_ones() as u32 > d as u32 { continue; }
+                    if seen.insert(product) {
+                        products_to_canon.push(product);
+                    }
+                }
             }
         }
+        if verbose { eprintln!("c [alg-timing] product dedup: {:.3}s ({} unique)", t_dedup.elapsed().as_secs_f64(), products_to_canon.len()); }
+        // Canonicalize all products in parallel.
+        let t_canon = std::time::Instant::now();
+        let canon_results: Vec<(MonoBits, CanonGraph, u64)> = products_to_canon
+            .par_iter()
+            .map(|&product| {
+                let prod_edges = monobits_to_edges(product, n_verts);
+                let (canon_g, aut) = canonicalize(&prod_edges);
+                (product, canon_g, aut)
+            })
+            .collect();
+        if verbose { eprintln!("c [alg-timing] product canon (par): {:.3}s", t_canon.elapsed().as_secs_f64()); }
+        let t_insert = std::time::Instant::now();
+        // Insert results sequentially to build lazy_c2o and bits_to_orbit.
+        for (product, canon_g, aut) in canon_results {
+            let next = lazy_c2o.len() as u32;
+            let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
+                let sz = orbit_size(&canon_g, aut, n_verts);
+                (next, sz)
+            });
+            bits_to_orbit.insert(product, (orbit_r, orbit_r_size));
+        }
+        if verbose { eprintln!("c [alg-timing] orbit insert: {:.3}s", t_insert.elapsed().as_secs_f64()); }
 
         let n = lazy_c2o.len();
         if verbose {
@@ -913,7 +945,7 @@ pub fn find_orbit_cert_fp_with_gens(
 
     // Seed of each unknown orbit (first pair that started its BFS) — enough
     // to re-enumerate members on demand during cert reconstruction.
-    let mut unknown_seeds: Vec<(u32, u32)> = Vec::new();
+    let mut unknown_seeds: Vec<(u32, usize)> = Vec::new();
 
     let n_rows = n_mono_orbits;
 
@@ -968,13 +1000,13 @@ pub fn find_orbit_cert_fp_with_gens(
 
         // Pass 2: fill unknown_seeds and orbit_c_sizes.
         for (mi_bits, orbit_c_size) in &valid_red {
-            let mi = colex.rank(*mi_bits) as u32;
+            let mi = colex.rank(*mi_bits);
             total_pairs += *orbit_c_size as usize;
             unknown_seeds.push((red_idx, mi));
             orbit_c_sizes.push(*orbit_c_size);
         }
         for (mi_bits, orbit_c_size) in &valid_blue {
-            let mi = colex.rank(*mi_bits) as u32;
+            let mi = colex.rank(*mi_bits);
             total_pairs += *orbit_c_size as usize;
             unknown_seeds.push((blue_idx, mi));
             orbit_c_sizes.push(*orbit_c_size);
@@ -1014,7 +1046,7 @@ pub fn find_orbit_cert_fp_with_gens(
                 pair_visited[word] |= bit;
 
                 let col = unknown_seeds.len();
-                unknown_seeds.push((i as u32, mi as u32));
+                unknown_seeds.push((i as u32, mi));
                 for r in matrix_rows.iter_mut() {
                     r.push(0);
                 }
@@ -1096,7 +1128,7 @@ pub fn find_orbit_cert_fp_with_gens(
     if let Some((n_verts, ref c2o, ref bits_to_orbit, _, _)) = formula_data {
         use super::graph_canon::{canonicalize, monobits_to_edges};
         for (col, &(ai, mi)) in unknown_seeds.iter().enumerate() {
-            let mi_bits = colex.bits_at(mi as usize);
+            let mi_bits = colex.bits_at(mi);
             let orbit_c_mod = (orbit_c_sizes[col] % (p as u64)) as u8;
             for &(term_bits, coef) in &axiom_bits[ai as usize] {
                 let product = term_bits | mi_bits;
@@ -1176,20 +1208,20 @@ pub fn find_orbit_cert_fp_with_gens(
             }
         }
         pivot_row_of_col[col] = Some(row);
-        for r in 0..n_rows {
-            if r == row {
-                continue;
-            }
-            let k = matrix[r][col];
-            if k == 0 {
-                continue;
-            }
-            let neg_k = p - k;
+        // Snapshot the pivot row so we can update all other rows in parallel.
+        let pivot_snap: Vec<u8> = matrix[row].clone();
+        let p_u16 = p as u16;
+        let (before, rest) = matrix.split_at_mut(row);
+        let (_, after) = rest.split_at_mut(1); // rest[0] is pivot row
+        before.par_iter_mut().chain(after.par_iter_mut()).for_each(|row_data| {
+            let k = row_data[col];
+            if k == 0 { return; }
+            let neg_k = (p - k) as u16;
             for c in col..=n_cols {
-                let prod = (neg_k as u16 * matrix[row][c] as u16) % p as u16;
-                matrix[r][c] = ((matrix[r][c] as u16 + prod) % p as u16) as u8;
+                let prod = neg_k * pivot_snap[c] as u16 % p_u16;
+                row_data[c] = ((row_data[c] as u16 + prod) % p_u16) as u8;
             }
-        }
+        });
         row += 1;
     }
     if verbose {
@@ -1240,7 +1272,7 @@ pub fn find_orbit_cert_fp_with_gens(
             if coef == 0 { continue; }
             let (seed_ai, seed_mi) = unknown_seeds[col];
             let entry = mults.entry(seed_ai as usize).or_insert_with(|| PolyP::zero(p));
-            let mu_mono = bits_to_mono(colex.bits_at(seed_mi as usize));
+            let mu_mono = bits_to_mono(colex.bits_at(seed_mi));
             let term = PolyP::single(p, mu_mono, coef);
             entry.add_assign(&term);
         }
@@ -1260,7 +1292,8 @@ pub fn find_orbit_cert_fp_with_gens(
         if coef == 0 {
             continue;
         }
-        let seed = unknown_seeds[col];
+        let (seed_ai_r, seed_mi_r) = unknown_seeds[col];
+        let seed = (seed_ai_r, seed_mi_r as u32); // BFS path: n_monos ≤ u32::MAX by assertion
         let members = reenumerate_orbit_members(
             n_monos,
             &colex,

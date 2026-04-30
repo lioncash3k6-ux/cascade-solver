@@ -23,6 +23,10 @@ codegen-units = 1
 debug = 1
 overflow-checks = false
 
+[dependencies]
+rayon = "1"
+mimalloc = { version = "0.1", default-features = false }
+
 [build-dependencies]
 cc = "1"
 
