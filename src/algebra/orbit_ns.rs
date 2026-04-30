@@ -21,6 +21,12 @@ use crate::tuple_schema::{Generator, TupleVarSchema};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 
+/// Raw pointer wrapper that is Send+Sync for use in parallel GE row elimination.
+/// SAFETY: caller must guarantee no two threads alias the same row.
+struct RowPtr(*mut Vec<u8>);
+unsafe impl Send for RowPtr {}
+unsafe impl Sync for RowPtr {}
+
 /// Fixed-capacity bitmask monomial representation. Bit `v-1` is set iff
 /// variable `v` is in the monomial support. Keeps the engine in purely
 /// integer arithmetic for monomial operations — no allocation per apply
@@ -1208,20 +1214,29 @@ pub fn find_orbit_cert_fp_with_gens(
             }
         }
         pivot_row_of_col[col] = Some(row);
-        // Snapshot the pivot row so we can update all other rows in parallel.
-        let pivot_snap: Vec<u8> = matrix[row].clone();
-        let p_u16 = p as u16;
-        let (before, rest) = matrix.split_at_mut(row);
-        let (_, after) = rest.split_at_mut(1); // rest[0] is pivot row
-        before.par_iter_mut().chain(after.par_iter_mut()).for_each(|row_data| {
-            let k = row_data[col];
-            if k == 0 { return; }
-            let neg_k = (p - k) as u16;
-            for c in col..=n_cols {
-                let prod = neg_k * pivot_snap[c] as u16 % p_u16;
-                row_data[c] = ((row_data[c] as u16 + prod) % p_u16) as u8;
-            }
-        });
+        // Collect nonzero row indices (sequential pass — avoids scheduling trivial tasks).
+        let nonzero_rows: Vec<usize> = (0..n_rows)
+            .filter(|&r| r != row && matrix[r][col] != 0)
+            .collect();
+        if !nonzero_rows.is_empty() {
+            let p_u16 = p as u16;
+            let pivot_snap: Vec<u8> = matrix[row].clone();
+            // Collect RowPtrs for the nonzero rows.
+            // SAFETY: indices in nonzero_rows are distinct and != row (pivot row).
+            // Each par iteration accesses a unique row with no aliasing.
+            let row_ptrs: Vec<RowPtr> = nonzero_rows.iter()
+                .map(|&r| RowPtr(unsafe { matrix.as_mut_ptr().add(r) }))
+                .collect();
+            row_ptrs.par_iter().for_each(|rp| {
+                let row_data = unsafe { &mut *rp.0 };
+                let k = row_data[col];
+                let neg_k = (p - k) as u16;
+                for c in col..=n_cols {
+                    let prod = neg_k * pivot_snap[c] as u16 % p_u16;
+                    row_data[c] = ((row_data[c] as u16 + prod) % p_u16) as u8;
+                }
+            });
+        }
         row += 1;
     }
     if verbose {
