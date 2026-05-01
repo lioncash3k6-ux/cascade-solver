@@ -821,7 +821,17 @@ fn sparse_wiedemann_large_prime(
             n_rows, n_cols, nnz, p_work, k_len);
     }
 
-    for trial in 0..16u32 {
+    // For heavily overdetermined systems (m >> n) the system is likely inconsistent;
+    // run at most 3 trials to avoid spending many minutes on guaranteed failures.
+    let max_trials: u32 = if n_rows > 4 * n_cols { 3 } else { 16 };
+
+    // Pre-allocate matvec buffers outside the trial loop to eliminate per-iteration
+    // heap allocations (~1 MB each, k_len×2 calls per trial = 500 GB+ churn at d=14).
+    let mut cv_buf = vec![0u64; n_rows];
+    let mut cv_t_buf = vec![0u64; n_cols];
+    let mut acc_t_buf = vec![0u128; n_cols];
+
+    for trial in 0..max_trials {
         // Random left vector u ∈ F_{p_work}^{n_rows}.
         let mut rng = 0x9e3779b97f4a7c15u64
             ^ (n_cols as u64).wrapping_mul(6364136223846793005)
@@ -832,17 +842,34 @@ fn sparse_wiedemann_large_prime(
         }).collect();
 
         // Phase 1: Krylov sequence s[k] = u · (M')^k b over F_{p_work}, M' = AA^T.
+        // Use pre-allocated buffers to avoid per-iteration heap allocations.
         let mut seq: Vec<u64> = Vec::with_capacity(k_len);
-        let mut cv = b_rhs.clone();
+        cv_buf.copy_from_slice(&b_rhs);
         for _ in 0..k_len {
             let dot = {
                 let mut acc = 0u128;
-                for (&ui, &ci) in u.iter().zip(cv.iter()) { acc += ui as u128 * ci as u128; }
+                for (&ui, &ci) in u.iter().zip(cv_buf.iter()) { acc += ui as u128 * ci as u128; }
                 (acc % p_work as u128) as u64
             };
             seq.push(dot);
-            let at_c = matvec_T_fp64(rows, &cv, n_cols, p_work);
-            cv = matvec_fp64(rows, &at_c, n_cols, p_work);
+            // matvec_T: A^T × cv_buf → cv_t_buf
+            acc_t_buf.iter_mut().for_each(|v| *v = 0);
+            for (i, row) in rows.iter().enumerate() {
+                let xi = cv_buf[i];
+                if xi == 0 { continue; }
+                for &(c, a) in row {
+                    let col = c as usize;
+                    if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
+                }
+            }
+            for (j, v) in cv_t_buf.iter_mut().enumerate() { *v = (acc_t_buf[j] % p_work as u128) as u64; }
+            // matvec: A × cv_t_buf → cv_buf
+            use rayon::prelude::*;
+            rows.par_iter().zip(cv_buf.par_iter_mut()).for_each(|(row, yi)| {
+                let mut acc = 0u128;
+                for &(c, a) in row { if (c as usize) < n_cols { acc += a as u128 * cv_t_buf[c as usize] as u128; } }
+                *yi = (acc % p_work as u128) as u64;
+            });
         }
 
         if verbose {
@@ -862,33 +889,64 @@ fn sparse_wiedemann_large_prime(
         if deg_q == 0 || q[0] == 0 { continue; }
 
         // Phase 3: z = q_0^{-1} * (-q_1 b - q_2 M'b - ... - q_d (M')^{d-1} b), then x = A^T z.
+        // Reuse pre-allocated buffers (cv_buf for v, cv_t_buf for A^T v intermediates).
         let q0_inv = mod_inv_u64(q[0], p_work);
         let mut z_acc = vec![0u64; n_rows];
         {
-            let mut v = b_rhs.clone();
+            cv_buf.copy_from_slice(&b_rhs); // v = b
             for j in 0..deg_q {
                 let coef = q[j + 1];
                 if coef != 0 {
                     let neg_c = (p_work - coef) * q0_inv % p_work;
-                    for (za, &vv) in z_acc.iter_mut().zip(v.iter()) {
+                    for (za, &vv) in z_acc.iter_mut().zip(cv_buf.iter()) {
                         *za = (*za + neg_c * vv) % p_work;
                     }
                 }
                 if j + 1 < deg_q {
-                    let at_v = matvec_T_fp64(rows, &v, n_cols, p_work);
-                    v = matvec_fp64(rows, &at_v, n_cols, p_work);
+                    // v = A A^T v, reusing buffers
+                    acc_t_buf.iter_mut().for_each(|v| *v = 0);
+                    for (i, row) in rows.iter().enumerate() {
+                        let xi = cv_buf[i];
+                        if xi == 0 { continue; }
+                        for &(c, a) in row {
+                            let col = c as usize;
+                            if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
+                        }
+                    }
+                    for (j2, v2) in cv_t_buf.iter_mut().enumerate() { *v2 = (acc_t_buf[j2] % p_work as u128) as u64; }
+                    use rayon::prelude::*;
+                    rows.par_iter().zip(cv_buf.par_iter_mut()).for_each(|(row, yi)| {
+                        let mut acc = 0u128;
+                        for &(c, a) in row { if (c as usize) < n_cols { acc += a as u128 * cv_t_buf[c as usize] as u128; } }
+                        *yi = (acc % p_work as u128) as u64;
+                    });
                 }
             }
         }
-        let x_sol = matvec_T_fp64(rows, &z_acc, n_cols, p_work);
+        // x = A^T z_acc
+        acc_t_buf.iter_mut().for_each(|v| *v = 0);
+        for (i, row) in rows.iter().enumerate() {
+            let xi = z_acc[i];
+            if xi == 0 { continue; }
+            for &(c, a) in row {
+                let col = c as usize;
+                if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
+            }
+        }
+        let x_sol: Vec<u64> = acc_t_buf.iter().map(|&v| (v % p_work as u128) as u64).collect();
 
         if verbose {
             eprintln!("c [alg-timing] wiedemann_lp phase3 (trial {}): {:.3}s", trial, t0.elapsed().as_secs_f64());
         }
 
-        // Verify A*x = b over F_{p_work}.
-        let ax = matvec_fp64(rows, &x_sol, n_cols, p_work);
-        if ax == b_rhs {
+        // Verify A*x = b over F_{p_work} (reuse cv_buf as output).
+        use rayon::prelude::*;
+        rows.par_iter().zip(cv_buf.par_iter_mut()).for_each(|(row, yi)| {
+            let mut acc = 0u128;
+            for &(c, a) in row { if (c as usize) < n_cols { acc += a as u128 * x_sol[c as usize] as u128; } }
+            *yi = (acc % p_work as u128) as u64;
+        });
+        if cv_buf == b_rhs {
             if verbose {
                 eprintln!("c [alg-timing] wiedemann_lp: {:.3}s (VERIFIED, trial {})",
                     t0.elapsed().as_secs_f64(), trial);
@@ -896,7 +954,7 @@ fn sparse_wiedemann_large_prime(
             return Some(x_sol);
         }
         if verbose {
-            let mismatches = ax.iter().zip(b_rhs.iter()).filter(|(a, b)| a != b).count();
+            let mismatches = cv_buf.iter().zip(b_rhs.iter()).filter(|(a, b)| a != b).count();
             eprintln!("c [alg-timing] wiedemann_lp trial {}: verification failed ({} mismatches), retrying",
                 trial, mismatches);
         }
@@ -1849,22 +1907,38 @@ pub fn find_orbit_cert_fp_with_gens(
         let s_f = (1.0 + (1.0 + 8.0 * red_deg as f64).sqrt()) / 2.0;
         let s = s_f.round() as usize;
         let csk2 = s.saturating_mul(s.saturating_sub(1)) / 2;
-        let n_red = binom(nv as u32, s as u32) as usize;
-        let red_ok = is_ramsey_formula_path
-            && s >= 2 && csk2 == red_deg && n_red <= n_axioms
-            && axiom_degrees[..n_red].iter().all(|&deg| deg == red_deg);
-        if red_ok {
-            let blue_deg = axiom_degrees.get(n_red).copied().unwrap_or(0);
+
+        // Orbit-rep-only mode: exactly 2 axioms (one red rep + one blue rep).
+        // ramsey_disjunctive uses this when the full blue list would be huge.
+        // blue_ai = 1 (index of the blue rep in axiom_bits).
+        if n_axioms == 2 && is_ramsey_formula_path && s >= 2 && csk2 == red_deg {
+            let blue_deg = axiom_degrees.get(1).copied().unwrap_or(0);
             let t_f = (1.0 + (1.0 + 8.0 * blue_deg as f64).sqrt()) / 2.0;
             let t = t_f.round() as usize;
             let ctk2 = t.saturating_mul(t.saturating_sub(1)) / 2;
-            let n_blue = binom(nv as u32, t as u32) as usize;
-            let blue_ok = t >= s && ctk2 == blue_deg && n_red + n_blue == n_axioms
-                && d >= blue_deg
-                && axiom_degrees[n_red..].iter().all(|&deg| deg == blue_deg);
-            if blue_ok { Some((s, t, n_red, n_blue, d - red_deg, d - blue_deg)) } else { None }
+            if t >= s && ctk2 == blue_deg && d >= blue_deg {
+                Some((s, t, 1, 1, d - red_deg, d - blue_deg))
+            } else {
+                None
+            }
         } else {
-            None
+            let n_red = binom(nv as u32, s as u32) as usize;
+            let red_ok = is_ramsey_formula_path
+                && s >= 2 && csk2 == red_deg && n_red <= n_axioms
+                && axiom_degrees[..n_red].iter().all(|&deg| deg == red_deg);
+            if red_ok {
+                let blue_deg = axiom_degrees.get(n_red).copied().unwrap_or(0);
+                let t_f = (1.0 + (1.0 + 8.0 * blue_deg as f64).sqrt()) / 2.0;
+                let t = t_f.round() as usize;
+                let ctk2 = t.saturating_mul(t.saturating_sub(1)) / 2;
+                let n_blue = binom(nv as u32, t as u32) as usize;
+                let blue_ok = t >= s && ctk2 == blue_deg && n_red + n_blue == n_axioms
+                    && d >= blue_deg
+                    && axiom_degrees[n_red..].iter().all(|&deg| deg == blue_deg);
+                if blue_ok { Some((s, t, n_red, n_blue, d - red_deg, d - blue_deg)) } else { None }
+            } else {
+                None
+            }
         }
     };
 
@@ -1994,8 +2068,16 @@ pub fn find_orbit_cert_fp_with_gens(
     };
 
     // Axiom action under group.
+    // Skipped for the stab path (orbit-rep-only or full R(s,t)): axiom_action
+    // is only used in the BFS pair-orbit path, which returns before reaching
+    // the reenumerate_orbit_members call.  Building it for orbit-rep-only
+    // mode (n_axioms == 2) would panic since 2 axioms are not closed under S_n.
     let t0 = std::time::Instant::now();
-    let axiom_action = axiom_action_table(schema, axioms, &gens);
+    let axiom_action: Vec<Vec<usize>> = if pre_stab_path.is_some() {
+        Vec::new() // unused on stab path
+    } else {
+        axiom_action_table(schema, axioms, &gens)
+    };
     if verbose {
         eprintln!(
             "c [alg-timing] axiom_action_table: {:.3}s",

@@ -8,7 +8,7 @@
 
 use crate::algebra::ns_fp::PolyP;
 use crate::algebra::poly::Monomial;
-use crate::tuple_schema::{BaseSet, Generator, GroupSpec, TupleKind, TupleVarSchema};
+use crate::tuple_schema::{binom, BaseSet, Generator, GroupSpec, TupleKind, TupleVarSchema};
 use std::collections::BTreeMap;
 
 /// Functional pigeonhole principle PHP_{P,H}.
@@ -84,6 +84,44 @@ pub fn ramsey_disjunctive(
     };
 
     let mut axioms: Vec<PolyP> = Vec::new();
+
+    // Orbit-rep-only mode: when the full blue axiom list would be huge
+    // (binom(n,t) × 2^(t*(t-1)/2) > 5M terms), return exactly 2 axioms:
+    // the canonical red K_s rep and the canonical blue K_t rep.
+    // The stab path in orbit_ns detects n_axioms==2 and handles accordingly.
+    let blue_terms_total =
+        (binom(n, t) as u64).saturating_mul(1u64 << (t * (t - 1) / 2));
+    if blue_terms_total > 5_000_000 {
+        // First red axiom: K_s on vertices {1,...,s}
+        let mut red_vars: Vec<u32> = Vec::new();
+        for i in 1..=s {
+            for j in (i + 1)..=s {
+                red_vars.push(schema.var_of_tuple(&[i, j]));
+            }
+        }
+        let mut red_terms = BTreeMap::new();
+        red_terms.insert(Monomial::from_vars(red_vars), 1u8);
+        axioms.push(PolyP { p: prime, terms: red_terms });
+
+        // First blue axiom: ∏(1-x_e) for K_t on vertices {1,...,t}
+        let mut blue_factors: Vec<PolyP> = Vec::new();
+        for i in 1..=t {
+            for j in (i + 1)..=t {
+                let v = schema.var_of_tuple(&[i, j]);
+                let mut f = BTreeMap::new();
+                f.insert(Monomial::one(), 1u8);
+                f.insert(Monomial::single(v), prime - 1);
+                blue_factors.push(PolyP { p: prime, terms: f });
+            }
+        }
+        let mut blue_acc = PolyP::one(prime);
+        for f in &blue_factors {
+            blue_acc = blue_acc.mul(f);
+        }
+        axioms.push(blue_acc);
+
+        return (schema, axioms);
+    }
 
     // Red K_s ban: for each S ⊆ [n] with |S| = s, the polynomial
     // ∏_{{a,b} ⊆ S} x({a,b})  = 1 iff all edges in S are red (violation).
