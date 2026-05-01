@@ -825,11 +825,27 @@ fn sparse_wiedemann_large_prime(
     // run at most 3 trials to avoid spending many minutes on guaranteed failures.
     let max_trials: u32 = if n_rows > 4 * n_cols { 3 } else { 16 };
 
-    // Pre-allocate matvec buffers outside the trial loop to eliminate per-iteration
-    // heap allocations (~1 MB each, k_len×2 calls per trial = 500 GB+ churn at d=14).
+    // Pre-allocate matvec buffers (reused across all trials).
     let mut cv_buf = vec![0u64; n_rows];
     let mut cv_t_buf = vec![0u64; n_cols];
-    let mut acc_t_buf = vec![0u128; n_cols];
+    // Column-major CSR view of A for A^T × x (gather, not scatter).
+    // Contiguous col_data avoids per-column Vec pointer chasing.
+    // Gather is embarrassingly parallel: no accumulator zeroing, no reduce step.
+    let mut col_start = vec![0usize; n_cols + 1];
+    for row in rows.iter() {
+        for &(c, _) in row { let col = c as usize; if col < n_cols { col_start[col + 1] += 1; } }
+    }
+    for j in 0..n_cols { col_start[j + 1] += col_start[j]; }
+    let mut col_data = vec![(0u32, 0u64); nnz];
+    {
+        let mut pos = col_start[..n_cols].to_vec(); // fill pointers
+        for (i, row) in rows.iter().enumerate() {
+            for &(c, a) in row {
+                let col = c as usize;
+                if col < n_cols { col_data[pos[col]] = (i as u32, a); pos[col] += 1; }
+            }
+        }
+    }
 
     for trial in 0..max_trials {
         // Random left vector u ∈ F_{p_work}^{n_rows}.
@@ -852,17 +868,18 @@ fn sparse_wiedemann_large_prime(
                 (acc % p_work as u128) as u64
             };
             seq.push(dot);
-            // matvec_T: A^T × cv_buf → cv_t_buf
-            acc_t_buf.iter_mut().for_each(|v| *v = 0);
-            for (i, row) in rows.iter().enumerate() {
-                let xi = cv_buf[i];
-                if xi == 0 { continue; }
-                for &(c, a) in row {
-                    let col = c as usize;
-                    if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
-                }
+            // matvec_T: A^T × cv_buf → cv_t_buf  (parallel CSR gather, no zero-fill)
+            {
+                use rayon::prelude::*;
+                let cv_ref: &[u64] = &cv_buf;
+                cv_t_buf.par_iter_mut().enumerate().for_each(|(j, v)| {
+                    let mut acc = 0u128;
+                    for &(i, a) in &col_data[col_start[j]..col_start[j + 1]] {
+                        acc += a as u128 * cv_ref[i as usize] as u128;
+                    }
+                    *v = (acc % p_work as u128) as u64;
+                });
             }
-            for (j, v) in cv_t_buf.iter_mut().enumerate() { *v = (acc_t_buf[j] % p_work as u128) as u64; }
             // matvec: A × cv_t_buf → cv_buf
             use rayon::prelude::*;
             rows.par_iter().zip(cv_buf.par_iter_mut()).for_each(|(row, yi)| {
@@ -903,17 +920,18 @@ fn sparse_wiedemann_large_prime(
                     }
                 }
                 if j + 1 < deg_q {
-                    // v = A A^T v, reusing buffers
-                    acc_t_buf.iter_mut().for_each(|v| *v = 0);
-                    for (i, row) in rows.iter().enumerate() {
-                        let xi = cv_buf[i];
-                        if xi == 0 { continue; }
-                        for &(c, a) in row {
-                            let col = c as usize;
-                            if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
-                        }
+                    // v = A A^T v  (CSR gather A^T, then par matvec A)
+                    {
+                        use rayon::prelude::*;
+                        let cv_ref: &[u64] = &cv_buf;
+                        cv_t_buf.par_iter_mut().enumerate().for_each(|(j2, v2)| {
+                            let mut acc = 0u128;
+                            for &(i, a) in &col_data[col_start[j2]..col_start[j2 + 1]] {
+                                acc += a as u128 * cv_ref[i as usize] as u128;
+                            }
+                            *v2 = (acc % p_work as u128) as u64;
+                        });
                     }
-                    for (j2, v2) in cv_t_buf.iter_mut().enumerate() { *v2 = (acc_t_buf[j2] % p_work as u128) as u64; }
                     use rayon::prelude::*;
                     rows.par_iter().zip(cv_buf.par_iter_mut()).for_each(|(row, yi)| {
                         let mut acc = 0u128;
@@ -923,17 +941,19 @@ fn sparse_wiedemann_large_prime(
                 }
             }
         }
-        // x = A^T z_acc
-        acc_t_buf.iter_mut().for_each(|v| *v = 0);
-        for (i, row) in rows.iter().enumerate() {
-            let xi = z_acc[i];
-            if xi == 0 { continue; }
-            for &(c, a) in row {
-                let col = c as usize;
-                if col < n_cols { acc_t_buf[col] += a as u128 * xi as u128; }
-            }
+        // x = A^T z_acc  (parallel CSR gather into cv_t_buf, reused as x_sol)
+        {
+            use rayon::prelude::*;
+            let z_ref: &[u64] = &z_acc;
+            cv_t_buf.par_iter_mut().enumerate().for_each(|(j, v)| {
+                let mut acc = 0u128;
+                for &(i, a) in &col_data[col_start[j]..col_start[j + 1]] {
+                    acc += a as u128 * z_ref[i as usize] as u128;
+                }
+                *v = (acc % p_work as u128) as u64;
+            });
         }
-        let x_sol: Vec<u64> = acc_t_buf.iter().map(|&v| (v % p_work as u128) as u64).collect();
+        let x_sol: Vec<u64> = cv_t_buf.clone();
 
         if verbose {
             eprintln!("c [alg-timing] wiedemann_lp phase3 (trial {}): {:.3}s", trial, t0.elapsed().as_secs_f64());
