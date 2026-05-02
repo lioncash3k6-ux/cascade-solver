@@ -6,6 +6,7 @@
 #include "cadical.hpp"
 #include <vector>
 #include <cstring>
+#include <chrono>
 
 /* Bridge class: dispatches C++ virtual calls to C function pointers */
 class FFIPropagator : public CaDiCaL::ExternalPropagator {
@@ -91,11 +92,26 @@ public:
     }
 };
 
-/* Opaque handle wraps solver + propagator + learner */
+/* Wall-clock terminator: fires once the deadline is passed. */
+class TimeTerminator : public CaDiCaL::Terminator {
+    std::chrono::steady_clock::time_point deadline;
+public:
+    TimeTerminator(double secs) {
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::duration<double>(secs));
+        deadline = std::chrono::steady_clock::now() + ns;
+    }
+    bool terminate() override {
+        return std::chrono::steady_clock::now() >= deadline;
+    }
+};
+
+/* Opaque handle wraps solver + propagator + learner + optional terminator */
 struct CaDiCaLSolver {
     CaDiCaL::Solver *solver;
     FFIPropagator *propagator;
     FFILearner *learner;
+    TimeTerminator *terminator;
 };
 
 extern "C" {
@@ -105,11 +121,16 @@ CaDiCaLSolver *cadical_ffi_new(void) {
     s->solver = new CaDiCaL::Solver;
     s->propagator = nullptr;
     s->learner = nullptr;
+    s->terminator = nullptr;
     return s;
 }
 
 void cadical_ffi_delete(CaDiCaLSolver *s) {
     if (!s) return;
+    if (s->terminator) {
+        s->solver->disconnect_terminator();
+        delete s->terminator;
+    }
     if (s->learner) {
         s->solver->disconnect_learner();
         delete s->learner;
@@ -203,6 +224,23 @@ int64_t cadical_ffi_propagations(CaDiCaLSolver *s) {
 
 int cadical_ffi_vars(CaDiCaLSolver *s) {
     return s->solver->vars();
+}
+
+void cadical_ffi_connect_timeout(CaDiCaLSolver *s, double secs) {
+    if (s->terminator) {
+        s->solver->disconnect_terminator();
+        delete s->terminator;
+    }
+    s->terminator = new TimeTerminator(secs);
+    s->solver->connect_terminator(s->terminator);
+}
+
+void cadical_ffi_disconnect_timeout(CaDiCaLSolver *s) {
+    if (s->terminator) {
+        s->solver->disconnect_terminator();
+        delete s->terminator;
+        s->terminator = nullptr;
+    }
 }
 
 } /* extern "C" */

@@ -48,6 +48,8 @@ extern "C" {
     fn cadical_ffi_close_proof(s: *mut CaDiCaLSolverOpaque);
     fn cadical_ffi_conflicts(s: *mut CaDiCaLSolverOpaque) -> i64;
     fn cadical_ffi_vars(s: *mut CaDiCaLSolverOpaque) -> c_int;
+    fn cadical_ffi_connect_timeout(s: *mut CaDiCaLSolverOpaque, secs: f64);
+    fn cadical_ffi_disconnect_timeout(s: *mut CaDiCaLSolverOpaque);
 }
 
 /// Result of a CaDiCaL solve call.
@@ -219,6 +221,16 @@ impl Solver {
     pub fn set(&mut self, name: &str, val: i32) {
         let cname = CString::new(name).unwrap();
         unsafe { cadical_ffi_set(self.ptr, cname.as_ptr(), val) }
+    }
+
+    /// Connect a wall-clock timeout: CaDiCaL terminates after `secs` seconds.
+    pub fn connect_timeout(&mut self, secs: f64) {
+        unsafe { cadical_ffi_connect_timeout(self.ptr, secs) }
+    }
+
+    /// Disconnect the wall-clock timeout (also called automatically on drop).
+    pub fn disconnect_timeout(&mut self) {
+        unsafe { cadical_ffi_disconnect_timeout(self.ptr) }
     }
 
     /// Enable DRAT proof tracing to a file.

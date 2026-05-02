@@ -86,6 +86,12 @@ int64_t cadical_ffi_propagations(CaDiCaLSolver *s);
 /* Number of variables */
 int cadical_ffi_vars(CaDiCaLSolver *s);
 
+/* Wall-clock timeout: connect a Terminator that fires after `secs` seconds.
+ * Must be called before cadical_ffi_solve(). Automatically disconnected and
+ * freed when the solver is deleted or cadical_ffi_disconnect_timeout is called. */
+void cadical_ffi_connect_timeout(CaDiCaLSolver *s, double secs);
+void cadical_ffi_disconnect_timeout(CaDiCaLSolver *s);
+
 #ifdef __cplusplus
 }
 #endif

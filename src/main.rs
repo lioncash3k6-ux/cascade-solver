@@ -1417,6 +1417,10 @@ fn main() -> ExitCode {
 
             let mut solver = cadical_ffi::Solver::new();
 
+            if let Some(t) = timeout {
+                solver.connect_timeout(t as f64);
+            }
+
             // Enable proof tracing if requested
             let biclique_proof_path = if proof.is_some() || certified {
                 let p = scratch_path(&input, "_biclique.drat");
@@ -1777,7 +1781,7 @@ fn main() -> ExitCode {
         let mut solver = cadical_ffi::Solver::new();
 
         if let Some(t) = timeout {
-            solver.set("limit", t as i32);
+            solver.connect_timeout(t as f64);
         }
 
         // Enable proof tracing if requested.
