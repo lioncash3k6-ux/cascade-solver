@@ -2207,6 +2207,11 @@ pub(crate) struct RowBarcodeCollector {
     /// rhs_patterns[i] = (degree, Vec<u8>) where vec[orbit_id] = e_∅ coefficient after GE.
     /// Tracks whether φ_d (the dual obstruction) rotates or stays proportional across degrees.
     pub rhs_patterns: Vec<(usize, Vec<u8>)>,
+    /// Column coupling counts: (degree, prev_blocking_orbit, n_productive, n_total_cols).
+    /// n_productive = #{columns c : M[B_{d-1}, c] ≠ 0} — columns that couple to the current
+    /// obstruction direction. n_total_cols = n_cols_pruned at that degree step.
+    /// Computed BEFORE GE augmentation on the raw orbit matrix rows.
+    pub coupling_counts: Vec<(usize, u32, usize, usize)>,
     /// The prime p used in the GE (set on first record() call).
     pub p: u8,
 }
@@ -2382,6 +2387,22 @@ impl RowBarcodeCollector {
                     d_prev, d_cur, common, supp_prev, supp_cur, jaccard, prop_str);
             }
         }
+
+        // Column coupling proxy: for each degree d, show how many columns have nonzero entries
+        // at physical orbit B_prev (= blocking GE-logical-position treated as physical index).
+        // NOTE: B_prev is the GE logical position of the blocking orbit, not its physical orbit ID.
+        // Using it as a physical index is a proxy; the true blocking orbit (orbit 0, the constant
+        // term) has zero LHS entries at d≥axiom_deg+1, so direct coupling to it is always 0.
+        // n_productive=0 when B_prev=0 or the proxy orbit has no column entries.
+        if !self.coupling_counts.is_empty() {
+            eprintln!("  [barcode] column coupling proxy (M[physical_orbit_B_prev, c] ≠ 0):");
+            for &(deg, b_prev, n_prod, n_total) in &self.coupling_counts {
+                let frac = if n_total == 0 { 0.0f64 } else { n_prod as f64 / n_total as f64 };
+                let tag = if n_prod == 0 { " [proxy-zero]" } else { "" };
+                eprintln!("    d={:2}: B_prev={:4}  coupling={:6}/{:6} ({:.2}%){}",
+                    deg, b_prev, n_prod, n_total, 100.0 * frac, tag);
+            }
+        }
     }
 }
 
@@ -2404,6 +2425,9 @@ pub(crate) struct WarmStartState {
     /// Cancellation barcode: per-orbit-row lifetime tracking across degree steps.
     /// None = barcode collection disabled (default); Some = collecting.
     pub(crate) barcode: Option<RowBarcodeCollector>,
+    /// Blocking orbit ID from the previous GE step, for column coupling analysis.
+    /// Set after each barcode-enabled GE; used to count productive columns at the next degree.
+    pub(crate) last_blocking_orbit: Option<u32>,
 }
 
 impl WarmStartState {
@@ -2418,6 +2442,7 @@ impl WarmStartState {
             logged_b2o_len: 0,
             kernel_algebra: None,
             barcode: None,
+            last_blocking_orbit: None,
         }
     }
 }
@@ -3350,6 +3375,24 @@ fn find_orbit_cert_fp_inner(
                 t0.elapsed().as_secs_f64()
             );
         }
+        // Column coupling: count how many columns couple to the previous blocking orbit B_{d-1}.
+        // A column c "couples" iff M[B_{d-1}, c] ≠ 0.  Columns that don't couple can never
+        // change φ_{d-1}, making this a "dead" degree transition for the obstruction.
+        // Must be computed BEFORE augmentation (which prepends extra rows, shifting indices).
+        if let Some(ref mut ws) = warm {
+            if let Some(ref mut bc) = ws.barcode {
+                if let Some(b_prev) = ws.last_blocking_orbit {
+                    let b_idx = b_prev as usize;
+                    if b_idx < sparse_rows.len() {
+                        let n_productive = sparse_rows[b_idx].iter()
+                            .filter(|&&(c, _)| c < n_cols_pruned as u32)
+                            .count();
+                        bc.coupling_counts.push((d, b_prev, n_productive, n_cols_pruned));
+                    }
+                }
+            }
+        }
+
         // G_d measurement: augment sparse_rows with pivot rows from lower-degree solutions.
         // Prepending pivot-enforcement rows (drop_pivot_cols=false) forces the GE/Wiedemann
         // solution into the quotient A_d / I_{<d} without remapping columns.
@@ -3387,10 +3430,12 @@ fn find_orbit_cert_fp_inner(
                 sparse_rows, n_cols_pruned, p, verbose, GE_FILL_LIMIT,
                 n_rows, &mut row_classes, &mut residual_norm, &mut blocking_ids, &mut rhs_pattern,
             );
+            let first_blocking = blocking_ids.first().copied();
             if let Some(ref mut ws) = warm {
                 if let Some(ref mut bc) = ws.barcode {
                     bc.record(d, n_rows, &row_classes, residual_norm, blocking_ids, rhs_pattern, p);
                 }
+                ws.last_blocking_orbit = first_blocking;
             }
             r
         } else {
