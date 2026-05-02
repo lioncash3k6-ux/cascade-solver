@@ -102,16 +102,16 @@ fn canon_connected(edges: &[(u8, u8)], n_verts: u8) -> (Vec<(u8, u8)>, u64) {
     let n = n_verts as usize;
     let ne = edges.len();
 
-    let mut adj = [0u32; 20];
+    let mut adj = [0u64; 64];
     for &(u, v) in edges {
-        adj[u as usize] |= 1 << v;
-        adj[v as usize] |= 1 << u;
+        adj[u as usize] |= 1u64 << v;
+        adj[v as usize] |= 1u64 << u;
     }
 
     let mut best: Vec<(u8, u8)> = vec![(n_verts, n_verts); ne]; // sentinel (all-max)
     let mut aut = 0u64;
-    let mut inv = [n_verts; 20]; // inv[old] = new label; n_verts = unassigned
-    let mut used = 0u32;
+    let mut inv = [n_verts; 64]; // inv[old] = new label; n_verts = unassigned
+    let mut used = 0u64;
     let mut partial: Vec<(u8, u8)> = Vec::with_capacity(ne);
 
     canon_bt(&adj, &mut inv, &mut used, 0, n, n_verts, &mut partial, &mut best, &mut aut);
@@ -119,9 +119,9 @@ fn canon_connected(edges: &[(u8, u8)], n_verts: u8) -> (Vec<(u8, u8)>, u64) {
 }
 
 fn canon_bt(
-    adj: &[u32; 20],
-    inv: &mut [u8; 20],
-    used: &mut u32,
+    adj: &[u64; 64],
+    inv: &mut [u8; 64],
+    used: &mut u64,
     pos: usize,
     n: usize,
     sentinel: u8,
@@ -172,21 +172,21 @@ fn canon_bt(
 /// Sorting free vertices by ascending WL-2 label (lighter/sparser first) causes B&B to
 /// find the canonical (lex-min) assignment earlier, dramatically improving pruning.
 /// free_visit[0..f] contains offsets 0..f-1 sorted by ascending WL-2 color.
-fn wl_free_visit_order(adj: &[u32; 20], s: usize, f: usize) -> [u8; 20] {
-    let mut order = [0u8; 20];
+fn wl_free_visit_order(adj: &[u64; 64], s: usize, f: usize) -> [u8; 64] {
+    let mut order = [0u8; 64];
     for i in 0..f { order[i] = i as u8; }
     if f <= 1 { return order; }
 
     let n = s + f;
-    let mut labels = [0u64; 20];
+    let mut labels = [0u64; 64];
     for i in 0..n {
         let vtype = if i < s { 0u64 } else { 1u64 };
         labels[i] = (vtype << 6) | adj[i].count_ones() as u64;
     }
     for _ in 0..2 {
-        let mut new_labels = [0u64; 20];
+        let mut new_labels = [0u64; 64];
         for i in 0..n {
-            let mut nbrs = [0u64; 20];
+            let mut nbrs = [0u64; 64];
             let mut nn = 0usize;
             let mut bits = adj[i];
             while bits != 0 {
@@ -220,17 +220,17 @@ fn wl_free_visit_order(adj: &[u32; 20], s: usize, f: usize) -> [u8; 20] {
 /// `free_visit[0..f]` gives the order in which old free-vertex offsets are tried
 /// (WL-2 sorted = lighter first → canonical solution found early → better pruning).
 fn stab_canon_bt(
-    adj: &[u32; 20],
+    adj: &[u64; 64],
     s: usize,
     f: usize,
-    inv: &mut [u8; 20],   // inv[old] = new label; (s+f) = unassigned
-    used_fixed: &mut u32, // bitmask over OLD fixed vertices 0..s-1
-    used_free: &mut u32,  // bitmask over OLD free vertex OFFSETS 0..f-1 (vertex s+j ↔ bit j)
+    inv: &mut [u8; 64],   // inv[old] = new label; (s+f) = unassigned
+    used_fixed: &mut u64, // bitmask over OLD fixed vertices 0..s-1
+    used_free: &mut u64,  // bitmask over OLD free vertex OFFSETS 0..f-1 (vertex s+j ↔ bit j)
     pos: usize,
     partial: &mut Vec<(u8, u8)>,
     best: &mut Vec<(u8, u8)>,
     aut: &mut u64,
-    free_visit: &[u8; 20],
+    free_visit: &[u8; 64],
 ) {
     let n = s + f;
     if pos == n {
@@ -313,19 +313,20 @@ fn stab_canon_bb(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
     let remap = |x: u8| -> u8 {
         if x < s { x } else { s + free_labels.partition_point(|&v| v < x) as u8 }
     };
-    let mut adj = [0u32; 20];
+    // Max vertices: s + 2*max_free_edges. For d=19, s=5, max_free=14 edges × 2 = 28 → 33 verts.
+    let mut adj = [0u64; 64];
     for &(u, v) in edges {
         let (ru, rv) = (remap(u) as usize, remap(v) as usize);
-        adj[ru] |= 1 << rv;
-        adj[rv] |= 1 << ru;
+        adj[ru] |= 1u64 << rv;
+        adj[rv] |= 1u64 << ru;
     }
     let ne = edges.len();
     let sentinel = n as u8;
     let mut best: Vec<(u8, u8)> = vec![(sentinel, sentinel); ne];
     let mut aut = 0u64;
-    let mut inv = [sentinel; 20];
-    let mut used_fixed = 0u32;
-    let mut used_free = 0u32;
+    let mut inv = [sentinel; 64];
+    let mut used_fixed = 0u64;
+    let mut used_free = 0u64;
     let mut partial: Vec<(u8, u8)> = Vec::with_capacity(ne);
     let free_visit = wl_free_visit_order(&adj, s as usize, f);
     stab_canon_bt(&adj, s as usize, f, &mut inv, &mut used_fixed, &mut used_free,
@@ -742,14 +743,15 @@ fn extension_key(pat: &[(u8, u8)], s: u8) -> u64 {
         if v as usize + 1 > n_total { n_total = v as usize + 1; }
     }
 
-    let mut adj = [0u32; 20];
+    // Max vertices: s + 2*max_free_edges. For d=19, s=5, max_free=14*2=28 → 33 verts. Use 64.
+    let mut adj = [0u64; 64];
     for &(u, v) in pat {
-        adj[u as usize] |= 1 << v;
-        adj[v as usize] |= 1 << u;
+        adj[u as usize] |= 1u64 << v;
+        adj[v as usize] |= 1u64 << u;
     }
 
     // Initial labels: (vertex_type << 6) | degree.
-    let mut labels = [0u64; 20];
+    let mut labels = [0u64; 64];
     for i in 0..n_total {
         let vtype = if (i as u8) < s { 0u64 } else { 1u64 };
         labels[i] = (vtype << 6) | (adj[i].count_ones() as u64);
@@ -757,9 +759,9 @@ fn extension_key(pat: &[(u8, u8)], s: u8) -> u64 {
 
     // 2 WL iterations (all stack-allocated).
     for _ in 0..2 {
-        let mut new_labels = [0u64; 20];
+        let mut new_labels = [0u64; 64];
         for i in 0..n_total {
-            let mut nbr_buf = [0u64; 20];
+            let mut nbr_buf = [0u64; 64];
             let mut nn = 0usize;
             let mut bits = adj[i];
             while bits != 0 {
@@ -780,8 +782,8 @@ fn extension_key(pat: &[(u8, u8)], s: u8) -> u64 {
     }
 
     // Collect labels by type, sort each group, then fold into final hash.
-    let mut fixed_buf = [0u64; 20];
-    let mut free_buf  = [0u64; 20];
+    let mut fixed_buf = [0u64; 64];
+    let mut free_buf  = [0u64; 64];
     let mut n_fixed = 0usize;
     let mut n_free  = 0usize;
     for i in 0..n_total {
@@ -901,8 +903,8 @@ pub(crate) fn enumerate_stab_pair_reps_inc(
                 .max()
                 .map(|m| m - s + 1)
                 .unwrap_or(0);
-            // Stack-allocated presence lookup (up to 20×20).
-            let mut present = [[false; 20]; 20];
+            // Stack-allocated presence lookup (up to 64×64).
+            let mut present = [[false; 64]; 64];
             for &(u, v) in pattern { present[u as usize][v as usize] = true; }
             let n_exist = s + cur_f;
 
@@ -1034,7 +1036,7 @@ pub(crate) fn cheap_graph_hash(product: MonoBits, n_verts: u32) -> u64 {
     if edges.is_empty() { return 0; }
     let (comp_edges, k) = compress(&edges);
 
-    let mut degrees = [0u8; 20];
+    let mut degrees = [0u8; 64];
     for &(u, v) in &comp_edges {
         degrees[u as usize] += 1;
         degrees[v as usize] += 1;
@@ -1042,9 +1044,9 @@ pub(crate) fn cheap_graph_hash(product: MonoBits, n_verts: u32) -> u64 {
     degrees[..k as usize].sort_unstable();
 
     // Union-find for component signatures (stack-only, no heap).
-    let mut parent = [0u8; 20];
+    let mut parent = [0u8; 64];
     for i in 0..k as usize { parent[i] = i as u8; }
-    fn uf_find_local(p: &mut [u8; 20], x: u8) -> u8 {
+    fn uf_find_local(p: &mut [u8; 64], x: u8) -> u8 {
         if p[x as usize] != x { p[x as usize] = uf_find_local(p, p[x as usize]); }
         p[x as usize]
     }
@@ -1053,11 +1055,11 @@ pub(crate) fn cheap_graph_hash(product: MonoBits, n_verts: u32) -> u64 {
         let pv = uf_find_local(&mut parent, v);
         if pu != pv { parent[pu as usize] = pv; }
     }
-    let mut comp_v = [0u8; 20];
-    let mut comp_e = [0u8; 20];
+    let mut comp_v = [0u8; 64];
+    let mut comp_e = [0u8; 64];
     for i in 0..k as usize { comp_v[uf_find_local(&mut parent, i as u8) as usize] += 1; }
     for &(u, _v) in &comp_edges { comp_e[uf_find_local(&mut parent, u) as usize] += 1; }
-    let mut comp_sigs = [(0u8, 0u8); 20];
+    let mut comp_sigs = [(0u8, 0u8); 64];
     let mut nc = 0usize;
     for i in 0..k as usize {
         if parent[i] == i as u8 {
