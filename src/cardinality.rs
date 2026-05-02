@@ -331,14 +331,14 @@ pub fn ramsey_lookup(a: u32, b: u32) -> u32 {
         return match b {
             4 => 18,
             5 => 25,
-            6 => 41,
+            6 => 36, // R(4,6) = 36, proven
             _ => 0,
         };
     }
     if a == 5 {
         return match b {
-            5 => 43,
-            6 => 87,
+            // R(5,5) is open (43 ≤ R(5,5) ≤ 48); return 0 so chains are not added
+            // R(5,6) is open; return 0
             _ => 0,
         };
     }
@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(ramsey_lookup(3, 3), 6);
         assert_eq!(ramsey_lookup(4, 4), 18);
         assert_eq!(ramsey_lookup(4, 5), 25);
-        assert_eq!(ramsey_lookup(5, 5), 43);
+        assert_eq!(ramsey_lookup(5, 5), 0);  // open problem
         assert_eq!(ramsey_lookup(99, 99), 0);  // unknown
     }
 
