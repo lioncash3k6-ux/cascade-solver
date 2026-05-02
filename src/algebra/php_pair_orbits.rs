@@ -738,7 +738,7 @@ pub fn build_orbit_matrix(
     prime: u8,
     mono_orbits: &[PhpMatrix],
     pair_orbits: &[PairOrbit],
-    mu_sizes: &[u64],
+    _mu_sizes: &[u64],
 ) -> Vec<Vec<u8>> {
     let orbit_index = OrbitIndex::new(mono_orbits);
     let n_rows = mono_orbits.len();
@@ -746,67 +746,20 @@ pub fn build_orbit_matrix(
 
     let mut matrix: Vec<Vec<u8>> = vec![vec![0u8; n_cols + 1]; n_rows];
 
-    // Cache: inv(|orbit κ| mod p) per κ.
-    let inv_mu: Vec<u8> = mu_sizes
-        .iter()
-        .map(|&s| {
-            let s_mod = (s % prime as u64) as u8;
-            assert!(s_mod != 0, "prime {} divides |orbit| ({})", prime, s);
-            mod_inv(s_mod, prime)
-        })
-        .collect();
-
     for (col, po) in pair_orbits.iter().enumerate() {
-        let pair_size_mod = (po.size % prime as u64) as u8;
-
         // A'(κ) aggregator, indexed by mono-orbit id κ.
         let mut a_of_kappa: BTreeMap<usize, u16> = BTreeMap::new();
 
-        if po.axiom_orbit == 0 {
-            // Pigeon axiom: terms are x_{0, j} for j=0..H-1 (coef 1 each) +
-            // constant (coef prime-1). Stab(pair)-orbit size of term
-            // x_{0, j} = |hole_orbits_under_pigeon_stab(m*)[j]|'s class size.
-            // Constant term: Stab(pair)-orbit size 1 always.
-            let hole_orbits = hole_orbits_under_pigeon_stab(po.mono_rep_bits, p, h);
-            // Compute class size per hole.
-            let mut class_size: Vec<u32> = vec![0; h as usize];
-            for &c in &hole_orbits {
-                class_size[c as usize] += 1;
-            }
-            // Group contributions: for each Stab(pair)-orbit of holes,
-            // contribute orbit_size × 1 to the κ of (x_{0, rep} ∪ m*).
-            // Skip duplicates within an orbit (pick one rep hole per orbit).
-            let mut orbit_seen: Vec<bool> = vec![false; h as usize];
-            for j in 0..h {
-                let c = hole_orbits[j as usize] as usize;
-                if orbit_seen[c] {
-                    continue;
-                }
-                orbit_seen[c] = true;
-                let orbit_sz = class_size[c];
-                let term_bit: u128 = 1u128 << (0 * h + j); // x_{0, j} bit
-                let product = term_bit | po.mono_rep_bits;
-                if (product.count_ones() as u32) > d {
-                    continue;
-                }
-                let pm = PhpMatrix::from_bits(product, p, h);
-                let kappa = orbit_index.of(pm);
-                let slot = a_of_kappa.entry(kappa).or_insert(0u16);
-                *slot = (*slot + (orbit_sz as u16 * 1u16) % prime as u16) % prime as u16;
-            }
-            // Constant term.
-            let kappa_const = orbit_index.of(PhpMatrix::from_bits(po.mono_rep_bits, p, h));
-            let slot = a_of_kappa.entry(kappa_const).or_insert(0u16);
-            *slot = (*slot + (prime - 1) as u16) % prime as u16;
-        } else {
-            // Hole AMO axiom: term fixed, but pair-orbit members visit
-            // different (axiom_label, m) pairs. The closed-form per-orbit
-            // approach is the same as pigeon's: enumerate Stab(pair)-orbits
-            // of the SINGLE term relative to the specific (a_0, m*) rep.
-            // Simpler path: BFS-walk this pair orbit's members. Cost is
-            // bounded by |pair| which is typically small. Correct always.
+        // BFS over the pair orbit: for each (axiom_label, mono) in the orbit,
+        // accumulate term contributions that land exactly on the mono orbit rep.
+        // This is correct for both pigeon and hole-AMO axioms.
+        {
             use std::collections::HashSet;
-            let seed_label = AxiomLabel::Hole(0, 0, 1);
+            let seed_label = if po.axiom_orbit == 0 {
+                AxiomLabel::Pigeon(0)
+            } else {
+                AxiomLabel::Hole(0, 0, 1)
+            };
             let mut visited: HashSet<(AxiomLabel, u128)> = HashSet::new();
             let mut queue: Vec<(AxiomLabel, u128)> = Vec::new();
             visited.insert((seed_label, po.mono_rep_bits));
@@ -836,21 +789,10 @@ pub fn build_orbit_matrix(
                     }
                 }
             }
-            // This BFS already samples at rep_κ (the `== product` check),
-            // so the result IS M[κ][col] directly — no need to scale by
-            // |pair|/|orbit κ|. Bypass the `a_of_kappa → v` step below
-            // by directly writing to matrix.
-            for (kappa, a_val) in a_of_kappa.iter() {
-                matrix[*kappa][col] = *a_val as u8;
-            }
-            continue;
         }
-
-        // matrix[κ][col] = pair_size · A'(κ) · inv(|orbit κ|) mod p.
+        // BFS result is M[κ][col] directly (no pair_size/orbit scaling needed).
         for (kappa, a_val) in a_of_kappa {
-            let v = (pair_size_mod as u16 * a_val) % prime as u16;
-            let v = (v * inv_mu[kappa] as u16) % prime as u16;
-            matrix[kappa][col] = v as u8;
+            matrix[kappa][col] = a_val as u8;
         }
     }
 
