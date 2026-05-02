@@ -672,6 +672,91 @@ fn stab_canonicalize(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
     (best.unwrap(), f, aut_count)
 }
 
+// ---------------------------------------------------------------------------
+// LEOI: Local Extension Orbit Index
+// ---------------------------------------------------------------------------
+
+/// Orbit-invariant key for a candidate pattern under S_s × S_f.
+///
+/// Runs 2 iterations of labeled 1-WL (vertex types: 0=fixed, 1=free) on the
+/// adjacency graph of `pat`, then hashes the sorted per-type label sequences.
+/// For the sparse patterns arising in stab pair enumeration (≤20 verts, ≤20 edges)
+/// this is a complete invariant: same key ↔ same S_s × S_f orbit.
+/// Stack-only, no heap allocation.
+fn extension_key(pat: &[(u8, u8)], s: u8) -> u64 {
+    if pat.is_empty() { return 0; }
+
+    let mut n_total = 0usize;
+    for &(u, v) in pat {
+        if u as usize + 1 > n_total { n_total = u as usize + 1; }
+        if v as usize + 1 > n_total { n_total = v as usize + 1; }
+    }
+
+    let mut adj = [0u32; 20];
+    for &(u, v) in pat {
+        adj[u as usize] |= 1 << v;
+        adj[v as usize] |= 1 << u;
+    }
+
+    // Initial labels: (vertex_type << 6) | degree.
+    let mut labels = [0u64; 20];
+    for i in 0..n_total {
+        let vtype = if (i as u8) < s { 0u64 } else { 1u64 };
+        labels[i] = (vtype << 6) | (adj[i].count_ones() as u64);
+    }
+
+    // 2 WL iterations (all stack-allocated).
+    for _ in 0..2 {
+        let mut new_labels = [0u64; 20];
+        for i in 0..n_total {
+            let mut nbr_buf = [0u64; 20];
+            let mut nn = 0usize;
+            let mut bits = adj[i];
+            while bits != 0 {
+                let j = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                nbr_buf[nn] = labels[j];
+                nn += 1;
+            }
+            nbr_buf[..nn].sort_unstable();
+            let mut h = labels[i].wrapping_mul(0x9e3779b97f4a7c15u64);
+            for k in 0..nn {
+                h = h.wrapping_mul(0x6c62272e07bb0142u64)
+                     .wrapping_add(nbr_buf[k].wrapping_add(1));
+            }
+            new_labels[i] = h;
+        }
+        labels = new_labels;
+    }
+
+    // Collect labels by type, sort each group, then fold into final hash.
+    let mut fixed_buf = [0u64; 20];
+    let mut free_buf  = [0u64; 20];
+    let mut n_fixed = 0usize;
+    let mut n_free  = 0usize;
+    for i in 0..n_total {
+        if (i as u8) < s { fixed_buf[n_fixed] = labels[i]; n_fixed += 1; }
+        else             { free_buf[n_free]  = labels[i]; n_free  += 1; }
+    }
+    fixed_buf[..n_fixed].sort_unstable();
+    free_buf[..n_free].sort_unstable();
+
+    // Fold in partition edge counts for extra discrimination.
+    let n_ff: u8 = pat.iter().filter(|&&(u, v)| u < s && v < s).count() as u8;
+    let n_fx: u8 = pat.iter().filter(|&&(u, v)| (u < s) != (v < s)).count() as u8;
+
+    let mut h = 0xcbf29ce484222325u64;
+    for i in 0..n_fixed {
+        h = h.wrapping_mul(0x100000001b3u64).wrapping_add(fixed_buf[i].wrapping_add(1));
+    }
+    h ^= 0xdeadbeefcafe0000u64; // fixed/free separator
+    for i in 0..n_free {
+        h = h.wrapping_mul(0x100000001b3u64).wrapping_add(free_buf[i].wrapping_add(1));
+    }
+    h ^= ((n_ff as u64) << 56) | ((n_fx as u64) << 48) | ((pat.len() as u64) << 40);
+    h
+}
+
 /// Enumerate canonical pair-orbit representatives for Stab(K_s on {0..s-1}) = S_s × S_{n-s}
 /// acting on monomials of degree ≤ budget.
 ///
@@ -699,6 +784,7 @@ impl CandidatePat {
 
 pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize) -> Vec<StabOrbitRep> {
     use rayon::prelude::*;
+    use rustc_hash::FxHashMap;
     use std::collections::HashSet;
     let s = s as u8;
     let max_f = (max_free.min(2 * budget)) as u8;
@@ -757,17 +843,38 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize)
             }
         }
 
-        // Parallel: canonicalize all candidates. Each call is independent and allocation-free
-        // at the call site (stab_canon_bb allocates internally but only on the local stack/heap).
-        let canon_results: Vec<Vec<(u8, u8)>> = candidates.par_iter()
-            .map(|p| { let (canon, _, _) = stab_canon_bb(p.as_slice(), s); canon })
+        // LEOI: bucket candidates by orbit key, call stab_canon_bb once per bucket.
+        // extension_key is a WL-2 labeled invariant under S_s × S_f; same key → same orbit.
+        let t_bucket = std::time::Instant::now();
+        let mut key_to_first: FxHashMap<u64, usize> = FxHashMap::default();
+        for (i, p) in candidates.iter().enumerate() {
+            let ekey = extension_key(p.as_slice(), s);
+            key_to_first.entry(ekey).or_insert(i);
+        }
+
+        // Parallel: canonicalize one representative per bucket.
+        let mut rep_indices: Vec<usize> = key_to_first.into_values().collect();
+        rep_indices.sort_unstable(); // deterministic ordering
+        let n_reps = rep_indices.len();
+        let n_cands = candidates.len();
+
+        let canon_results: Vec<Vec<(u8, u8)>> = rep_indices.par_iter()
+            .map(|&i| { let (canon, _, _) = stab_canon_bb(candidates[i].as_slice(), s); canon })
             .collect();
 
         // Sequential dedup into global seen.
+        let n_prev = by_deg[k].len();
         for canon in canon_results {
             if seen.insert(canon.clone()) {
                 by_deg[k].push(canon);
             }
+        }
+        if s >= 4 || budget >= 8 {
+            eprintln!("  stab_enum s={} k={}: {} cands → {} reps ({:.1}×) → {} new  [{:.3}s]",
+                      s, k, n_cands, n_reps,
+                      n_cands as f64 / n_reps.max(1) as f64,
+                      by_deg[k].len() - n_prev,
+                      t_bucket.elapsed().as_secs_f64());
         }
     }
 
@@ -1047,5 +1154,14 @@ mod tests {
             let (g2, _) = canon_monobits(*bits, n);
             assert_eq!(*g, g2, "canon roundtrip failed for {:?}", g);
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn stab_pair_reps_r44_timing() {
+        // R(4,4): s=4, budget=10. Measures LEOI skip rates at each degree.
+        let t0 = std::time::Instant::now();
+        let reps = enumerate_stab_pair_reps(4, 10, 20);
+        eprintln!("R(4,4) s=4 b=10 max_f=20: {} reps in {:.2}s", reps.len(), t0.elapsed().as_secs_f64());
     }
 }
