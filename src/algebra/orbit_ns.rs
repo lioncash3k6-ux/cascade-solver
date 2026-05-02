@@ -2052,6 +2052,10 @@ pub(crate) struct WarmStartState {
     /// cheap_graph_hash → (orbit_id, orbit_size): skip nauty for known orbit types.
     /// Grows by ~n_new_orbits per degree step; at d=15 holds ~32K entries (~640KB).
     pub(crate) hash_to_orbit: FxHashMap<u64, (u32, u64)>,
+    /// Incremental stab-enum caches for red and blue symmetry groups.
+    /// Avoids rebuilding k=1..d-1 for each warm-start degree step.
+    pub(crate) stab_cache_red:  super::graph_canon::StabEnumCache,
+    pub(crate) stab_cache_blue: super::graph_canon::StabEnumCache,
     // Sizes at last clone call — used to compute per-degree growth deltas in verbose mode.
     logged_c2o_len: usize,
     logged_b2o_len: usize,
@@ -2063,6 +2067,8 @@ impl WarmStartState {
             lazy_c2o: std::collections::HashMap::new(),
             bits_to_orbit: B2OMap::new(),
             hash_to_orbit: FxHashMap::default(),
+            stab_cache_red:  super::graph_canon::StabEnumCache::new(),
+            stab_cache_blue: super::graph_canon::StabEnumCache::new(),
             logged_c2o_len: 0,
             logged_b2o_len: 0,
         }
@@ -2269,18 +2275,26 @@ fn find_orbit_cert_fp_inner(
         // Lazy c2o: enumerate only the canonical product graphs that arise from
         // stab seeds, not all C(n_edges, d) orbit classes.
         use super::graph_canon::{
-            canonicalize, cheap_graph_hash, enumerate_stab_pair_reps, monobits_to_edges,
-            orbit_size, CanonGraph,
+            canonicalize, cheap_graph_hash, enumerate_stab_pair_reps_inc,
+            monobits_to_edges, orbit_size, CanonGraph,
         };
         use std::collections::HashMap;
         let n_verts = schema.bases[0].size;
 
         let t_reps = std::time::Instant::now();
-        let red_reps = enumerate_stab_pair_reps(pre_s, pre_br, n_verts as usize - pre_s);
-        let blue_reps = if pre_t == pre_s && pre_bt == pre_br {
+        let red_reps = enumerate_stab_pair_reps_inc(
+            pre_s, pre_br, n_verts as usize - pre_s,
+            if let Some(ref mut ws) = warm { Some(&mut ws.stab_cache_red) } else { None },
+        );
+        let blue_reps = if pre_t == pre_s && pre_bt == pre_br
+            && n_verts as usize - pre_t == n_verts as usize - pre_s
+        {
             red_reps.clone()
         } else {
-            enumerate_stab_pair_reps(pre_t, pre_bt, n_verts as usize - pre_t)
+            enumerate_stab_pair_reps_inc(
+                pre_t, pre_bt, n_verts as usize - pre_t,
+                if let Some(ref mut ws) = warm { Some(&mut ws.stab_cache_blue) } else { None },
+            )
         };
         if verbose { eprintln!("c [alg-timing] enumerate_stab_pair_reps: {:.3}s ({} red, {} blue)", t_reps.elapsed().as_secs_f64(), red_reps.len(), blue_reps.len()); }
 

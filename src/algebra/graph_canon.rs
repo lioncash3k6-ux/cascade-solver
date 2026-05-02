@@ -168,10 +168,57 @@ fn canon_bt(
     }
 }
 
+/// Compute a WL-guided visit order for free vertices in stab_canon_bt.
+/// Sorting free vertices by ascending WL-2 label (lighter/sparser first) causes B&B to
+/// find the canonical (lex-min) assignment earlier, dramatically improving pruning.
+/// free_visit[0..f] contains offsets 0..f-1 sorted by ascending WL-2 color.
+fn wl_free_visit_order(adj: &[u32; 20], s: usize, f: usize) -> [u8; 20] {
+    let mut order = [0u8; 20];
+    for i in 0..f { order[i] = i as u8; }
+    if f <= 1 { return order; }
+
+    let n = s + f;
+    let mut labels = [0u64; 20];
+    for i in 0..n {
+        let vtype = if i < s { 0u64 } else { 1u64 };
+        labels[i] = (vtype << 6) | adj[i].count_ones() as u64;
+    }
+    for _ in 0..2 {
+        let mut new_labels = [0u64; 20];
+        for i in 0..n {
+            let mut nbrs = [0u64; 20];
+            let mut nn = 0usize;
+            let mut bits = adj[i];
+            while bits != 0 {
+                let j = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                nbrs[nn] = labels[j];
+                nn += 1;
+            }
+            nbrs[..nn].sort_unstable();
+            let mut h = labels[i].wrapping_mul(0x9e3779b97f4a7c15u64);
+            for k in 0..nn { h = h.wrapping_mul(0x6c62272e07bb0142u64).wrapping_add(nbrs[k] + 1); }
+            new_labels[i] = h;
+        }
+        labels = new_labels;
+    }
+    // Insertion sort of free vertex offsets by ascending WL-2 label.
+    for i in 1..f {
+        let mut j = i;
+        while j > 0 && labels[s + order[j-1] as usize] > labels[s + order[j] as usize] {
+            order.swap(j-1, j);
+            j -= 1;
+        }
+    }
+    order
+}
+
 /// Branch-and-bound canonical form under S_s × S_f.
 /// Fixed vertices 0..s-1 map only to labels 0..s-1; free vertices s..s+f-1
 /// map only to labels s..s+f-1. Prunes branches whose partial edge list
 /// already exceeds the current best (same logic as canon_bt).
+/// `free_visit[0..f]` gives the order in which old free-vertex offsets are tried
+/// (WL-2 sorted = lighter first → canonical solution found early → better pruning).
 fn stab_canon_bt(
     adj: &[u32; 20],
     s: usize,
@@ -183,6 +230,7 @@ fn stab_canon_bt(
     partial: &mut Vec<(u8, u8)>,
     best: &mut Vec<(u8, u8)>,
     aut: &mut u64,
+    free_visit: &[u8; 20],
 ) {
     let n = s + f;
     if pos == n {
@@ -212,15 +260,16 @@ fn stab_canon_bt(
             if partial.as_slice().cmp(&best[..partial.len()]) != std::cmp::Ordering::Greater {
                 inv[old] = pos as u8;
                 *used_fixed |= 1 << old;
-                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut);
+                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut, free_visit);
                 inv[old] = n as u8;
                 *used_fixed &= !(1 << old);
             }
             partial.truncate(save_len);
         }
     } else {
-        // Assign a free label: try each unassigned old free vertex.
-        for old_j in 0..f {
+        // Assign a free label: visit in WL-guided order (lighter/sparser first).
+        for vi in 0..f {
+            let old_j = free_visit[vi] as usize;
             if *used_free >> old_j & 1 != 0 { continue; }
             let old = s + old_j;
             let save_len = partial.len();
@@ -235,7 +284,7 @@ fn stab_canon_bt(
             if partial.as_slice().cmp(&best[..partial.len()]) != std::cmp::Ordering::Greater {
                 inv[old] = pos as u8;
                 *used_free |= 1 << old_j;
-                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut);
+                stab_canon_bt(adj, s, f, inv, used_fixed, used_free, pos + 1, partial, best, aut, free_visit);
                 inv[old] = n as u8;
                 *used_free &= !(1 << old_j);
             }
@@ -278,8 +327,9 @@ fn stab_canon_bb(edges: &[(u8, u8)], s: u8) -> (Vec<(u8, u8)>, u8, u64) {
     let mut used_fixed = 0u32;
     let mut used_free = 0u32;
     let mut partial: Vec<(u8, u8)> = Vec::with_capacity(ne);
+    let free_visit = wl_free_visit_order(&adj, s as usize, f);
     stab_canon_bt(&adj, s as usize, f, &mut inv, &mut used_fixed, &mut used_free,
-                  0, &mut partial, &mut best, &mut aut);
+                  0, &mut partial, &mut best, &mut aut, &free_visit);
     (best, f as u8, aut)
 }
 
@@ -782,21 +832,62 @@ impl CandidatePat {
     fn push(&mut self, e: (u8, u8)) { self.edges[self.len as usize] = e; self.len += 1; }
 }
 
+/// Persistent enumeration state for incremental calls to `enumerate_stab_pair_reps`.
+/// Pass a `&mut StabEnumCache` across successive calls with increasing `budget` to
+/// avoid rebuilding the lower-degree levels from scratch each time.
+pub(crate) struct StabEnumCache {
+    by_deg: Vec<Vec<Vec<(u8, u8)>>>,
+    seen:   std::collections::HashSet<Vec<(u8, u8)>>,
+    pub budget: usize,
+    pub s:      u8,
+    pub max_f:  u8,
+}
+
+impl StabEnumCache {
+    pub(crate) fn new() -> Self {
+        Self { by_deg: Vec::new(), seen: std::collections::HashSet::new(),
+               budget: 0, s: 255, max_f: 0 }
+    }
+    pub(crate) fn compatible(&self, s: u8, max_f: u8) -> bool {
+        self.s == s && self.max_f == max_f
+    }
+}
+
 pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize) -> Vec<StabOrbitRep> {
+    enumerate_stab_pair_reps_inc(s, budget, max_free, None)
+}
+
+pub(crate) fn enumerate_stab_pair_reps_inc(
+    s: usize, budget: usize, max_free: usize,
+    cache: Option<&mut StabEnumCache>,
+) -> Vec<StabOrbitRep> {
     use rayon::prelude::*;
     use rustc_hash::FxHashMap;
     use std::collections::HashSet;
     let s = s as u8;
     let max_f = (max_free.min(2 * budget)) as u8;
 
-    let mut seen: HashSet<Vec<(u8, u8)>> = HashSet::new();
-    let mut by_deg: Vec<Vec<Vec<(u8, u8)>>> = vec![Vec::new(); budget + 1];
+    // Incremental warm-start: if cache covers the same (s, max_f) and a lower budget,
+    // borrow its by_deg/seen and only compute the new degree levels.
+    let (mut seen, mut by_deg, start_k) = match cache.as_ref()
+        .filter(|c| c.compatible(s, max_f) && c.budget < budget && !c.by_deg.is_empty())
+    {
+        Some(c) => {
+            let mut by_deg = c.by_deg.clone();
+            by_deg.resize(budget + 1, Vec::new());
+            (c.seen.clone(), by_deg, c.budget + 1)
+        }
+        None => {
+            let mut seen: HashSet<Vec<(u8, u8)>> = HashSet::new();
+            let mut by_deg: Vec<Vec<Vec<(u8, u8)>>> = vec![Vec::new(); budget + 1];
+            let empty: Vec<(u8, u8)> = vec![];
+            seen.insert(empty.clone());
+            by_deg[0].push(empty);
+            (seen, by_deg, 1)
+        }
+    };
 
-    let empty: Vec<(u8, u8)> = vec![];
-    seen.insert(empty.clone());
-    by_deg[0].push(empty);
-
-    for k in 1..=budget {
+    for k in start_k..=budget {
         let prev = &by_deg[k - 1];
 
         // Collect all candidate patterns into a flat Vec of fixed-size structs.
@@ -876,6 +967,15 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize)
                       by_deg[k].len() - n_prev,
                       t_bucket.elapsed().as_secs_f64());
         }
+    }
+
+    // Write back to cache if provided (always; the caller can reuse for a higher budget).
+    if let Some(c) = cache {
+        c.by_deg = by_deg.clone();
+        c.seen   = seen.clone();
+        c.budget = budget;
+        c.s      = s;
+        c.max_f  = max_f;
     }
 
     // Parallel result assembly: recompute (f, aut_count) for each canonical pattern.
