@@ -48,6 +48,7 @@ pub mod php_cert_explicit;
 pub(crate) mod graph_canon;
 pub mod clifford_ns;
 pub mod alg_experiments;
+pub mod quotient_wiedemann;
 
 pub use poly::{Monomial, Poly, F2};
 pub use ns::{find_ns_certificate, NsResult, NsCertificate};
