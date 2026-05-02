@@ -224,6 +224,34 @@ impl B2OMap {
         }
     }
 
+    /// Append entries from `src` whose data-index >= `new_start` into self.
+    /// Delta write-back: `src` started as a clone of `self` and only grew;
+    /// `new_start` is the length of `self` at clone time.
+    pub(crate) fn append_new_from(&mut self, src: &B2OMap, new_start: usize) {
+        if new_start >= src.data.len() { return; }
+        macro_rules! do_variant {
+            ($dst:expr, $sm:expr) => {{
+                let new_kv: Vec<_> = $sm.iter()
+                    .filter(|(_, &i)| (i as usize) >= new_start)
+                    .map(|(&k, &i)| (k, src.data[i as usize]))
+                    .collect();
+                for (k, v) in new_kv {
+                    let idx = self.data.len() as u32;
+                    self.data.push(v);
+                    $dst.insert(k, idx);
+                }
+            }};
+        }
+        match (&mut self.inner, &src.inner) {
+            (Some(B2OInner::W1(d)),  Some(B2OInner::W1(s)))  => do_variant!(d, s),
+            (Some(B2OInner::W2(d)),  Some(B2OInner::W2(s)))  => do_variant!(d, s),
+            (Some(B2OInner::W3(d)),  Some(B2OInner::W3(s)))  => do_variant!(d, s),
+            (Some(B2OInner::W8(d)),  Some(B2OInner::W8(s)))  => do_variant!(d, s),
+            (Some(B2OInner::W15(d)), Some(B2OInner::W15(s))) => do_variant!(d, s),
+            _ => {}
+        }
+    }
+
     /// Approximate heap bytes used (key slots + data Vec, rough lower bound).
     pub(crate) fn approx_bytes(&self) -> usize {
         let key_bytes = match &self.inner {
@@ -2224,6 +2252,8 @@ fn find_orbit_cert_fp_inner(
     // Build orbit info. For the stab path: build a lazy c2o from actual products
     // (avoids expensive enumerate_orbit_reps at high degree). For other formula paths:
     // use enumerate_orbit_reps. For BFS paths: on-the-fly monomial orbit BFS.
+    // b2o_len_at_clone: size of ws.bits_to_orbit at clone time; used for delta write-back.
+    let mut b2o_len_at_clone: usize = 0;
     let t0 = std::time::Instant::now();
     let (n_mono_orbits, mono_orbit_id, mono_orbit_rep, formula_data) = if let Some(
         (pre_s, pre_t, pre_n_red, _pre_n_blue, pre_br, pre_bt),
@@ -2289,6 +2319,7 @@ fn find_orbit_cert_fp_inner(
             bits_to_orbit = B2OMap::new();
             bits_to_orbit.ensure_init(n_edges_b2o);
         };
+        b2o_len_at_clone = bits_to_orbit.len();
         // Always ensure the empty-graph orbit is at row 0.
         lazy_c2o.entry(CanonGraph::empty()).or_insert((0, 1u64));
 
@@ -2401,14 +2432,11 @@ fn find_orbit_cert_fp_inner(
     };
 
     // Write back updated orbit tables to warm state (stab path only).
-    // The tables in formula_data grew by adding products with exactly d edges that
-    // were new at this degree; future calls skip those via bits_to_orbit lookup.
-    // The local bits_to_orbit started as a clone of ws.bits_to_orbit and only grew
-    // (new products appended).  Replacing the warm state with the full local copy is
-    // equivalent to merging — and avoids iterating over millions of already-present entries.
+    // Delta write-back: only entries with data-index >= b2o_len_at_clone are new;
+    // append them into ws.bits_to_orbit without reallocating the full map.
     if let (Some(ref mut ws), Some((_, ref c2o, ref b2o, _, _))) = (&mut warm, &formula_data) {
         for (k, v) in c2o { ws.lazy_c2o.entry(k.clone()).or_insert(*v); }
-        ws.bits_to_orbit = b2o.clone();
+        ws.bits_to_orbit.append_new_from(b2o, b2o_len_at_clone);
     }
 
     // Axiom action under group.
