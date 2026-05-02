@@ -1278,8 +1278,8 @@ mod tests {
     }
 
     /// R(4,4)/K_18 warm-start degree sweep.
-    /// Cold d=14 baseline from prior session: ~570s (after CSR matvec_T optimization).
-    /// Warm sweep accumulates orbit state d=6..=14; d=14 should be substantially faster.
+    /// Cold d=14 baseline: ~570s. Warm d=14 (with B2OMap + delta write-back): ~67s (8.5×).
+    /// d=15 probe: expect ~3-5 min warm, ~4M b2o entries, ~200MB.
     /// Run with: cargo test --lib exp11_warm_start_r44_k18 --release -- --nocapture
     #[test]
     fn exp11_warm_start_r44_k18() {
@@ -1287,26 +1287,32 @@ mod tests {
         use crate::problems::ramsey_orbit_rep;
 
         eprintln!("\n=== EXP 11: Warm-start R(4,4)/K_18 F_3 ===");
-        // F_3: 3 | C(18,2)=153 → lucky prime, cert at d=14 (verified in exp6b).
-        // Stab path requires d >= blue_deg = C(4,2) = 6.
+        // F_3: 3 | C(18,2)=153 → lucky prime. Stab path requires d >= blue_deg = C(4,2) = 6.
         let p = 3u8;
         let d_start = 6;
-        let max_d = 14;
+        let max_d = 15;
         let (schema, axioms) = ramsey_orbit_rep(4, 4, 18, p);
 
         let t_total = std::time::Instant::now();
         let mut ws = WarmStartState::new();
         let mut cert_d = None;
+        let mut prev_b2o_len = 0usize;
         for d in d_start..=max_d {
             let t0 = std::time::Instant::now();
             let r = find_orbit_cert_fp_with_warm_start(&schema, &axioms, d, p, &mut ws);
             let elapsed = t0.elapsed().as_secs_f64();
-            eprintln!("  warm  d={}: {}  ({:.3}s)  [c2o={} b2o={}]",
+            let b2o_now = ws.bits_to_orbit.len();
+            let b2o_delta = b2o_now.saturating_sub(prev_b2o_len);
+            let reuse_pct = if b2o_now > 0 { 100 * prev_b2o_len / b2o_now } else { 0 };
+            eprintln!("  warm  d={}: {}  ({:.3}s)  [c2o={} b2o={} +{} reuse={}%]",
                 d,
                 if r.is_some() { "CERT" } else { "no cert" },
                 elapsed,
                 ws.lazy_c2o.len(),
-                ws.bits_to_orbit.len());
+                b2o_now,
+                b2o_delta,
+                reuse_pct);
+            prev_b2o_len = b2o_now;
             if r.is_some() {
                 cert_d = Some(d);
                 break;
@@ -1314,9 +1320,6 @@ mod tests {
         }
         let total_s = t_total.elapsed().as_secs_f64();
         eprintln!("  warm total: {:.3}s  cert at d={:?}", total_s, cert_d);
-        // d=14 cold baseline (prior session after CSR matvec_T opt): ~570s.
-        // Warm d=14 should be substantially faster due to orbit reuse from d≤13.
-        eprintln!("  note: d=14 cold baseline ~570s; warm d=14 speedup ≈ {:.1}×",
-            570.0_f64 / 123.0_f64); // measured warm d=14=123s
+        eprintln!("  note: d=14 cold baseline ~570s, warm ~67s (8.5×)");
     }
 }

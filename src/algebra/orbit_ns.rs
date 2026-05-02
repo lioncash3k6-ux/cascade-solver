@@ -2437,6 +2437,14 @@ fn find_orbit_cert_fp_inner(
     if let (Some(ref mut ws), Some((_, ref c2o, ref b2o, _, _))) = (&mut warm, &formula_data) {
         for (k, v) in c2o { ws.lazy_c2o.entry(k.clone()).or_insert(*v); }
         ws.bits_to_orbit.append_new_from(b2o, b2o_len_at_clone);
+        if verbose {
+            let b2o_new = b2o.len().saturating_sub(b2o_len_at_clone);
+            let b2o_total = b2o.len();
+            let reuse_pct = if b2o_total > 0 { 100 * b2o_len_at_clone / b2o_total } else { 0 };
+            let b2o_kb = ws.bits_to_orbit.approx_bytes() / 1024;
+            eprintln!("c [alg-timing] write-back: b2o +{} / {} total ({}% reuse), ws now ~{}KB",
+                b2o_new, b2o_total, reuse_pct, b2o_kb);
+        }
     }
 
     // Axiom action under group.
