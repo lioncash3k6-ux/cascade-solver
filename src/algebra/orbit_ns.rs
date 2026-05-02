@@ -1674,12 +1674,93 @@ fn sparse_block_wiedemann_fp(
 
 /// Sparse Gaussian elimination over 𝔽_p with optional fill-in abort.
 /// Returns Ok(Some(sol)) on cert, Ok(None) when inconsistent, Err(()) when fill > fill_limit.
+/// Per-orbit row classification after forward GE elimination.
+/// Filled by `sparse_ge_fp_bounded` when `out_row_classes` is `Some`.
+///
+/// Values: 1 = pivot row, 2 = zero row (dependent), 0 = other nonzero (non-pivot but non-zero).
+/// Only the first `n_real_rows` entries are meaningful; augmented rows are ignored.
+pub(crate) const ROW_CLASS_OTHER: u8 = 0;
+pub(crate) const ROW_CLASS_PIVOT: u8 = 1;
+pub(crate) const ROW_CLASS_ZERO: u8 = 2;
+
 fn sparse_ge_fp_bounded(
     mut rows: Vec<Vec<(u32, u8)>>,
     n_cols: usize,
     p: u8,
     verbose: bool,
     fill_limit: usize,
+) -> Result<Option<Vec<u8>>, ()> {
+    sparse_ge_fp_bounded_inner(rows, n_cols, p, verbose, fill_limit, 0, None, None, None, None)
+}
+
+/// Like `sparse_ge_fp_bounded` but also classifies the first `n_real_rows` rows
+/// (the actual orbit rows, before any augmented enforcement rows) as pivot/zero/other.
+fn sparse_ge_fp_bounded_classified(
+    rows: Vec<Vec<(u32, u8)>>,
+    n_cols: usize,
+    p: u8,
+    verbose: bool,
+    fill_limit: usize,
+    n_real_rows: usize,
+    out_row_classes: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>, ()> {
+    sparse_ge_fp_bounded_inner(rows, n_cols, p, verbose, fill_limit, n_real_rows, Some(out_row_classes), None, None, None)
+}
+
+/// Like `sparse_ge_fp_bounded_classified` but also returns the residual norm of `e_∅` and
+/// the logical (orbit-ID) row indices of the blocking rows (zero-LHS, nonzero-RHS after GE).
+/// `||r_d|| = 0` iff cert found; blocking orbit IDs reveal dual-ray stability across degrees.
+fn sparse_ge_fp_bounded_classified_with_residual(
+    rows: Vec<Vec<(u32, u8)>>,
+    n_cols: usize,
+    p: u8,
+    verbose: bool,
+    fill_limit: usize,
+    n_real_rows: usize,
+    out_row_classes: &mut Vec<u8>,
+    out_residual_norm: &mut usize,
+) -> Result<Option<Vec<u8>>, ()> {
+    sparse_ge_fp_bounded_inner(rows, n_cols, p, verbose, fill_limit, n_real_rows, Some(out_row_classes), Some(out_residual_norm), None, None)
+}
+
+/// Full diagnostic variant: classifies rows, returns residual norm, blocking orbit IDs,
+/// AND the full RHS column pattern (rhs_val at each logical orbit ID after GE).
+/// The RHS pattern encodes φ_d in orbit-ID coordinates for dual-ray stability analysis.
+fn sparse_ge_fp_bounded_full_diagnostic(
+    rows: Vec<Vec<(u32, u8)>>,
+    n_cols: usize,
+    p: u8,
+    verbose: bool,
+    fill_limit: usize,
+    n_real_rows: usize,
+    out_row_classes: &mut Vec<u8>,
+    out_residual_norm: &mut usize,
+    out_blocking_orbit_ids: &mut Vec<u32>,
+    out_rhs_pattern: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>, ()> {
+    sparse_ge_fp_bounded_inner(
+        rows, n_cols, p, verbose, fill_limit,
+        n_real_rows, Some(out_row_classes), Some(out_residual_norm),
+        Some(out_blocking_orbit_ids), Some(out_rhs_pattern),
+    )
+}
+
+fn sparse_ge_fp_bounded_inner(
+    mut rows: Vec<Vec<(u32, u8)>>,
+    n_cols: usize,
+    p: u8,
+    verbose: bool,
+    fill_limit: usize,
+    n_real_rows: usize,
+    out_row_classes: Option<&mut Vec<u8>>,
+    out_residual_norm: Option<&mut usize>,
+    // When Some, receives the LOGICAL (orbit-ID) row indices of the blocking rows
+    // (zero-LHS rows with nonzero RHS after elimination). For dual-ray stability analysis.
+    out_blocking_orbit_ids: Option<&mut Vec<u32>>,
+    // When Some, receives the full RHS column pattern indexed by logical orbit ID.
+    // rhs_pattern[log_r] = coefficient of e_∅ at orbit log_r after forward elimination.
+    // Encodes φ_d in a fixed (orbit-ID) ambient basis; compare across degrees for dual-ray stability.
+    out_rhs_pattern: Option<&mut Vec<u8>>,
 ) -> Result<Option<Vec<u8>>, ()> {
     use std::collections::BinaryHeap;
     use std::cmp::Reverse;
@@ -1874,14 +1955,67 @@ fn sparse_ge_fp_bounded(
         );
     }
 
-    // Consistency: any row with all-zero LHS but nonzero RHS → inconsistent.
+    // Per-row classification (only when requested, only for actual orbit rows).
+    // pivot_row_of_col stores PHYSICAL row indices (post-swap). Map back to the
+    // original LOGICAL ordering (= orbit ID) via phys_to_log so the barcode can
+    // index stably by orbit ID across degree steps.
+    if let Some(rc) = out_row_classes {
+        let n_classify = n_real_rows.min(n_rows);
+        rc.resize(n_classify, ROW_CLASS_ZERO);
+        for pr in pivot_row_of_col.iter().filter_map(|x| *x) {
+            let log_r = phys_to_log[pr];
+            if log_r < n_classify { rc[log_r] = ROW_CLASS_PIVOT; }
+        }
+        for log_r in 0..n_classify {
+            if rc[log_r] == ROW_CLASS_ZERO {
+                let phys_r = log_to_phys[log_r];
+                let has_lhs = rows[phys_r].iter().any(|&(c, _)| (c as usize) < n_cols);
+                if has_lhs { rc[log_r] = ROW_CLASS_OTHER; }
+            }
+        }
+    }
+
+    // Consistency: count all rows with zero LHS but nonzero RHS.
+    // Each such row is an independent "uncovered direction" of e_∅ in the complement of Im(E_d).
+    // ||r_d|| = 0 iff e_∅ ∈ Im(E_d) (certificate found); ||r_d|| > 0 → no cert at this degree.
+    // We also record their LOGICAL (orbit-ID) indices for dual-ray stability analysis.
+    let mut residual_count = 0usize;
+    let mut inconsistent = false;
+    let track_ids = out_blocking_orbit_ids.is_some();
+    let mut blocking_ids: Vec<u32> = Vec::new();
     for r in 0..n_rows {
         let has_lhs = rows[r].iter().any(|&(c, _)| (c as usize) < n_cols);
         let rhs_val = rows[r].iter().find(|&&(c, _)| c == rhs_col).map(|&(_, v)| v).unwrap_or(0);
         if !has_lhs && rhs_val != 0 {
-            return Ok(None);
+            residual_count += 1;
+            inconsistent = true;
+            if track_ids {
+                blocking_ids.push(phys_to_log[r] as u32);
+            }
         }
     }
+    if let Some(rn) = out_residual_norm { *rn = residual_count; }
+    if let Some(ids) = out_blocking_orbit_ids { *ids = blocking_ids; }
+
+    // Extract full RHS column pattern indexed by logical orbit ID.
+    // rhs_pattern[log_r] = e_∅ coefficient at orbit log_r after forward elimination.
+    // Only orbit rows (log_r < n_real_rows) are stored; augmented/extra rows are skipped.
+    if let Some(rp) = out_rhs_pattern {
+        let sz = if n_real_rows > 0 { n_real_rows } else { n_rows };
+        rp.resize(sz, 0u8);
+        for r in 0..n_rows {
+            let log_r = phys_to_log[r];
+            if log_r < sz {
+                let rhs_val = rows[r].iter()
+                    .find(|&&(c, _)| c == rhs_col)
+                    .map(|&(_, v)| v)
+                    .unwrap_or(0);
+                rp[log_r] = rhs_val;
+            }
+        }
+    }
+
+    if inconsistent { return Ok(None); }
 
     // Back-substitution in reverse pivot order (free variables = 0).
     let mut solution = vec![0u8; n_cols];
@@ -2046,6 +2180,211 @@ fn reenumerate_orbit_members(
 /// monotonically: entries from degree `d` are valid at degree `d+1`, so the
 /// next call only needs to canonicalize products with exactly `d+1` edges.
 /// For R(5,5)/K_43 this reduces ~10M canon calls per step to ~100K.
+/// Persistence barcode for orbit row lifetimes across degree steps.
+///
+/// For each orbit_id, records:
+/// - `birth_d`:  first degree where orbit appears as a matrix row
+/// - `pivot_d`:  first degree where orbit is a pivot row (usize::MAX if never)
+/// - `zero_d`:   first degree where orbit reduces to zero / is dependent (usize::MAX if never)
+///
+/// Interpretation:
+/// - `pivot_d - birth_d` = "waiting time" to become independent (0 = born as pivot)
+/// - `zero_d - birth_d`  = "annihilation depth" (MAX = still live at d_cert)
+/// - Orbit is "live" in [birth_d, zero_d)
+#[derive(Default, Clone)]
+pub(crate) struct RowBarcodeCollector {
+    pub birth_d:  Vec<usize>,
+    pub pivot_d:  Vec<usize>,
+    pub zero_d:   Vec<usize>,
+    /// Per-degree residual norm: ||r_d|| = count of zero-LHS rows with nonzero RHS after GE.
+    /// This is the number of independent "uncovered directions" of e_∅ in the complement of Im(E_d).
+    /// Sequence is (degree, ||r_d||); value 0 means cert found at that degree.
+    pub residual_norms: Vec<(usize, usize)>,
+    /// Per-degree blocking orbit IDs: the logical (orbit-ID) row indices of the blocking rows.
+    /// Each entry is (degree, Vec<orbit_id>). Stable orbit_id across degrees → persistent dual ray.
+    pub blocking_orbit_ids: Vec<(usize, Vec<u32>)>,
+    /// Per-degree full RHS column pattern in fixed orbit-ID basis.
+    /// rhs_patterns[i] = (degree, Vec<u8>) where vec[orbit_id] = e_∅ coefficient after GE.
+    /// Tracks whether φ_d (the dual obstruction) rotates or stays proportional across degrees.
+    pub rhs_patterns: Vec<(usize, Vec<u8>)>,
+    /// The prime p used in the GE (set on first record() call).
+    pub p: u8,
+}
+
+impl RowBarcodeCollector {
+    pub fn new() -> Self { Self::default() }
+
+    /// Update barcode with GE row classifications at degree `d`.
+    /// `n_rows_now` = current total orbit count (c2o length).
+    /// `classes` = ROW_CLASS_{PIVOT,ZERO,OTHER} for rows 0..n_rows_now.
+    /// `residual_norm` = ||r_d|| from the GE consistency check.
+    /// `rhs_pattern` = full RHS column values indexed by orbit ID (ambient-basis φ_d encoding).
+    pub fn record(&mut self, d: usize, n_rows_now: usize, classes: &[u8], residual_norm: usize, blocking_ids: Vec<u32>, rhs_pattern: Vec<u8>, p: u8) {
+        if self.p == 0 { self.p = p; }
+        // Extend to cover any new orbits born at this degree.
+        let prev = self.birth_d.len();
+        self.birth_d.resize(n_rows_now, d);
+        self.pivot_d.resize(n_rows_now, usize::MAX);
+        self.zero_d.resize(n_rows_now, usize::MAX);
+        let _ = prev; // silence unused-variable warning
+
+        for orbit_id in 0..classes.len().min(n_rows_now) {
+            match classes[orbit_id] {
+                ROW_CLASS_PIVOT => {
+                    if self.pivot_d[orbit_id] == usize::MAX {
+                        self.pivot_d[orbit_id] = d;
+                    }
+                }
+                ROW_CLASS_ZERO => {
+                    if self.zero_d[orbit_id] == usize::MAX {
+                        self.zero_d[orbit_id] = d;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.residual_norms.push((d, residual_norm));
+        self.blocking_orbit_ids.push((d, blocking_ids));
+        self.rhs_patterns.push((d, rhs_pattern));
+    }
+
+    pub fn last_residual_norm(&self) -> Option<usize> {
+        self.residual_norms.last().map(|&(_, rn)| rn)
+    }
+
+    /// Print a histogram of (zero_d - birth_d) persistence values,
+    /// broken out by birth degree to show which cohort contributes each depth.
+    pub fn print_histogram(&self) {
+        use std::collections::BTreeMap;
+        let n = self.birth_d.len();
+        eprintln!("  [barcode] {} orbit rows total", n);
+
+        // Per-birth-degree tallies: birth_d → (n_annihilated, n_live, n_never_pivot)
+        let mut by_birth: BTreeMap<usize, [usize; 3]> = BTreeMap::new();
+        // Annihilation depth histogram (depth → count)
+        let mut hist: BTreeMap<usize, usize> = BTreeMap::new();
+        // Pivot-then-zero: rows that were pivot at some degree and later also zero
+        let mut n_pivot_then_zero = 0usize;
+
+        for id in 0..n {
+            let b = self.birth_d[id];
+            let z = self.zero_d[id];
+            let pv = self.pivot_d[id];
+            let slot = by_birth.entry(b).or_insert([0; 3]);
+            if z == usize::MAX {
+                slot[1] += 1; // live (never annihilated)
+            } else {
+                slot[0] += 1; // annihilated
+                *hist.entry(z.saturating_sub(b)).or_insert(0) += 1;
+                // "Resurrected": was ZERO first (annihilated), then PIVOT later.
+                if pv != usize::MAX && pv > z { n_pivot_then_zero += 1; }
+            }
+            if pv == usize::MAX { slot[2] += 1; } // never pivot (regardless of live/annihilated)
+        }
+
+        let n_live: usize = by_birth.values().map(|s| s[1]).sum();
+        // n_never_pivot: rows that never appear as a GE pivot across all d steps.
+        // Computed globally, not from by_birth (by_birth[2] only counts live+never-pivot).
+        let n_never_pivot: usize = self.pivot_d.iter().filter(|&&p| p == usize::MAX).count();
+
+        // Per-birth-degree table
+        eprintln!("  [barcode] per-birth-degree breakdown:");
+        eprintln!("    birth_d  new_rows  annihilated  live  never_pivot");
+        for (b, [ann, live, np]) in &by_birth {
+            let total = ann + live;
+            eprintln!("      d={:2}    {:5}      {:5}      {:4}    {:4}",
+                b, total, ann, live, np);
+        }
+
+        eprintln!("  [barcode] annihilation depth histogram (depth → count):");
+        for (depth, count) in &hist {
+            eprintln!("    depth {:2}: {:4} orbits", depth, count);
+        }
+        let max_depth = hist.keys().max().copied().unwrap_or(0);
+        let n_annihilated = n - n_live;
+        let mean_depth = if n_annihilated > 0 {
+            hist.iter().map(|(&d, &c)| d * c).sum::<usize>() as f64 / n_annihilated as f64
+        } else { 0.0 };
+        eprintln!("  [barcode] live (never annihilated): {} / {}", n_live, n);
+        eprintln!("  [barcode] never pivot (null complement): {}", n_never_pivot);
+        eprintln!("  [barcode] pivot-before-zero (resurrected): {}", n_pivot_then_zero);
+        eprintln!("  [barcode] d_cancel = max(zero_d - birth_d) = {}, mean = {:.2}", max_depth, mean_depth);
+
+        if !self.residual_norms.is_empty() {
+            eprintln!("  [barcode] residual ||r_d|| + blocking orbit IDs (dual-ray stability):");
+            let mut prev_ids: Option<&[u32]> = None;
+            for (i, &(deg, rn)) in self.residual_norms.iter().enumerate() {
+                let ids = self.blocking_orbit_ids.get(i).map(|(_, v)| v.as_slice()).unwrap_or(&[]);
+                let stable = prev_ids.map_or(true, |p| p == ids);
+                let stable_tag = if stable && prev_ids.is_some() { " [SAME]" } else if prev_ids.is_some() { " [CHANGED]" } else { "" };
+                if rn == 0 {
+                    eprintln!("    d={:2}: ||r_d|| = 0  <- cert  blocking={:?}", deg, ids);
+                } else {
+                    eprintln!("    d={:2}: ||r_d|| = {}  blocking={:?}{}", deg, rn, ids, stable_tag);
+                }
+                prev_ids = Some(ids);
+            }
+        }
+
+        // Dual-ray stability: compare full RHS column pattern (φ_d in fixed orbit-ID basis) across degrees.
+        // Tests whether the obstruction to cert is a stable direction or a rotating one.
+        if self.rhs_patterns.len() >= 2 {
+            let p = self.p;
+            eprintln!("  [barcode] phi_d stability (RHS pattern in ambient orbit-ID basis, p={}):", p);
+
+            // Modular inverse for small prime p (brute-force, p <= 251).
+            let mod_inv = |a: u8| -> u8 {
+                if p <= 1 || a == 0 { return 0; }
+                for x in 1..p { if ((x as u16 * a as u16) % p as u16) == 1 { return x; } }
+                0
+            };
+
+            for i in 1..self.rhs_patterns.len() {
+                let (d_prev, pat_prev) = &self.rhs_patterns[i - 1];
+                let (d_cur,  pat_cur)  = &self.rhs_patterns[i];
+                let common = pat_prev.len().min(pat_cur.len());
+
+                // Support of each pattern on the common orbit range.
+                let supp_prev: usize = pat_prev[..common].iter().filter(|&&v| v != 0).count();
+                let supp_cur:  usize = pat_cur[..common].iter().filter(|&&v| v != 0).count();
+                let supp_intersect: usize = pat_prev[..common].iter().zip(pat_cur[..common].iter())
+                    .filter(|(&a, &b)| a != 0 && b != 0).count();
+                let supp_union = supp_prev + supp_cur - supp_intersect;
+                let jaccard = if supp_union == 0 { 1.0f64 } else { supp_intersect as f64 / supp_union as f64 };
+
+                // Proportionality check in F_p: find scale c such that pat_cur[i] = c * pat_prev[i] mod p.
+                let prop_result: Result<u8, usize> = (|| {
+                    let mut c_opt: Option<u8> = None;
+                    for k in 0..common {
+                        let a = pat_prev[k];
+                        let b = pat_cur[k];
+                        match (a, b) {
+                            (0, 0) => {}
+                            (0, _) | (_, 0) => return Err(k), // support mismatch
+                            _ => {
+                                let ratio = ((b as u16 * mod_inv(a) as u16) % p as u16) as u8;
+                                match c_opt {
+                                    None => c_opt = Some(ratio),
+                                    Some(c) if c == ratio => {}
+                                    Some(_) => return Err(k), // inconsistent ratio
+                                }
+                            }
+                        }
+                    }
+                    Ok(c_opt.unwrap_or(1))
+                })();
+
+                let prop_str = match prop_result {
+                    Ok(c) => format!("[PROPORTIONAL c={}]", c),
+                    Err(k) => format!("[ROTATED first_diff_orbit={}]", k),
+                };
+                eprintln!("    d={} -> d={}: common={} supp_prev={} supp_cur={} jaccard={:.3} {}",
+                    d_prev, d_cur, common, supp_prev, supp_cur, jaccard, prop_str);
+            }
+        }
+    }
+}
+
 pub(crate) struct WarmStartState {
     pub(crate) lazy_c2o: std::collections::HashMap<super::graph_canon::CanonGraph, (u32, u64)>,
     pub(crate) bits_to_orbit: B2OMap,
@@ -2059,6 +2398,12 @@ pub(crate) struct WarmStartState {
     // Sizes at last clone call — used to compute per-degree growth deltas in verbose mode.
     logged_c2o_len: usize,
     logged_b2o_len: usize,
+    /// Kernel algebra state: pivot table built from solutions at lower degrees.
+    /// Enables G_d measurement and quotient-space Wiedemann at each degree step.
+    pub(crate) kernel_algebra: Option<super::quotient_wiedemann::KernelAlgebraState>,
+    /// Cancellation barcode: per-orbit-row lifetime tracking across degree steps.
+    /// None = barcode collection disabled (default); Some = collecting.
+    pub(crate) barcode: Option<RowBarcodeCollector>,
 }
 
 impl WarmStartState {
@@ -2071,6 +2416,8 @@ impl WarmStartState {
             stab_cache_blue: super::graph_canon::StabEnumCache::new(),
             logged_c2o_len: 0,
             logged_b2o_len: 0,
+            kernel_algebra: None,
+            barcode: None,
         }
     }
 }
@@ -2124,6 +2471,22 @@ pub(crate) fn find_orbit_cert_fp_with_warm_start(
     p: u8,
     warm: &mut WarmStartState,
 ) -> Option<BTreeMap<usize, PolyP>> {
+    let gens = schema.generators();
+    find_orbit_cert_fp_inner(schema, axioms, &gens, d, p, Some(warm))
+}
+
+/// Like [`find_orbit_cert_fp_with_warm_start`] but enables the cancellation
+/// barcode: per-orbit-row lifetime tracking (birth / pivot / annihilation) across
+/// degree steps. Call repeatedly for d = d_min..=d_cert; after the final call
+/// the barcode is in `warm.barcode` (always `Some` after this function returns).
+pub(crate) fn find_orbit_cert_fp_with_barcode(
+    schema: &TupleVarSchema,
+    axioms: &[PolyP],
+    d: usize,
+    p: u8,
+    warm: &mut WarmStartState,
+) -> Option<BTreeMap<usize, PolyP>> {
+    warm.barcode.get_or_insert_with(RowBarcodeCollector::new);
     let gens = schema.generators();
     find_orbit_cert_fp_inner(schema, axioms, &gens, d, p, Some(warm))
 }
@@ -2987,14 +3350,61 @@ fn find_orbit_cert_fp_inner(
                 t0.elapsed().as_secs_f64()
             );
         }
+        // G_d measurement: augment sparse_rows with pivot rows from lower-degree solutions.
+        // Prepending pivot-enforcement rows (drop_pivot_cols=false) forces the GE/Wiedemann
+        // solution into the quotient A_d / I_{<d} without remapping columns.
+        // Also logs N_eff, pivot_coverage, and S-pair rate for the current degree.
+        if let Some(ref mut ws) = warm {
+            let ka = ws.kernel_algebra.get_or_insert_with(|| {
+                super::quotient_wiedemann::KernelAlgebraState::new(p)
+            });
+            let stats = ka.measure(d, n_cols_pruned);
+            if ka.pivot_count() > 0 {
+                let (aug, _) = ka.augmented_rows(&sparse_rows, n_cols_pruned, false);
+                sparse_rows = aug;
+                if verbose {
+                    eprintln!("c [qw] augmented: {} rows → {} rows (predicted {:.1}× speedup)",
+                        n_rows, sparse_rows.len(), stats.predicted_speedup());
+                }
+            }
+        }
+
         // Dispatch: try GE first (fast for small fill).  If fill explodes, fall back to
         // Wiedemann over a large prime P_work coprime to |G| (P_work >> rank ensures
         // BM succeeds with probability ≥ 1 - rank/P_work ≈ 99%).  The cert found over
         // F_{P_work} is valid for the Ramsey problem because {0,1}^n ⊆ F_{P_work}^n
         // and the NS identity holds over any field.
         const GE_FILL_LIMIT: usize = 8_000_000;
-        match sparse_ge_fp_bounded(sparse_rows, n_cols_pruned, p, verbose, GE_FILL_LIMIT) {
+        // If barcode collection is active, run the classified variant so we get
+        // per-orbit-row ROW_CLASS_{PIVOT,ZERO,OTHER} labels back for free.
+        let do_barcode = warm.as_ref().map_or(false, |ws| ws.barcode.is_some());
+        let ge_result = if do_barcode {
+            let mut row_classes = Vec::new();
+            let mut residual_norm = 0usize;
+            let mut blocking_ids = Vec::new();
+            let mut rhs_pattern = Vec::new();
+            let r = sparse_ge_fp_bounded_full_diagnostic(
+                sparse_rows, n_cols_pruned, p, verbose, GE_FILL_LIMIT,
+                n_rows, &mut row_classes, &mut residual_norm, &mut blocking_ids, &mut rhs_pattern,
+            );
+            if let Some(ref mut ws) = warm {
+                if let Some(ref mut bc) = ws.barcode {
+                    bc.record(d, n_rows, &row_classes, residual_norm, blocking_ids, rhs_pattern, p);
+                }
+            }
+            r
+        } else {
+            sparse_ge_fp_bounded(sparse_rows, n_cols_pruned, p, verbose, GE_FILL_LIMIT)
+        };
+        match ge_result {
             Ok(Some(solution)) => {
+                // Record solution into kernel algebra state for the next degree step.
+                if let Some(ref mut ws) = warm {
+                    let ka = ws.kernel_algebra.get_or_insert_with(|| {
+                        super::quotient_wiedemann::KernelAlgebraState::new(p)
+                    });
+                    ka.record_solution(d, &solution, n_cols_pruned);
+                }
                 let mut mults: BTreeMap<usize, PolyP> = BTreeMap::new();
                 for (col, &coef) in solution.iter().enumerate() {
                     if coef == 0 { continue; }

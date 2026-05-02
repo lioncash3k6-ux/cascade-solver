@@ -1286,9 +1286,11 @@ mod tests {
         use crate::algebra::orbit_ns::{find_orbit_cert_fp_with_warm_start, WarmStartState};
         use crate::problems::ramsey_orbit_rep;
 
-        eprintln!("\n=== EXP 11: Warm-start R(4,4)/K_18 F_3 ===");
-        // F_3: 3 | C(18,2)=153 → lucky prime. Stab path requires d >= blue_deg = C(4,2) = 6.
-        let p = 3u8;
+        eprintln!("\n=== EXP 11: Warm-start R(4,4)/K_18 F_19 ===");
+        // p=19 > n=18: guarantees 19 ∤ orbit_c_size for all multiplier orbits in K_18.
+        // orbit_c_size = P(18,k)/aut_count; since all factors ≤ 18 < 19, never divisible by 19.
+        // p=3 was wrong here: 3 | C(18,4)=3060 → orbit_c_mod=0 → matrix identically zero.
+        let p = 19u8;
         let d_start = 6;
         let max_d = 15;
         let (schema, axioms) = ramsey_orbit_rep(4, 4, 18, p);
@@ -1321,5 +1323,243 @@ mod tests {
         let total_s = t_total.elapsed().as_secs_f64();
         eprintln!("  warm total: {:.3}s  cert at d={:?}", total_s, cert_d);
         eprintln!("  note: d=14 cold baseline ~570s, warm ~67s (8.5×)");
+    }
+
+    /// G_d quotient measurement: R(3,4)/K_9 F_11, continue PAST first cert.
+    ///
+    /// R(3,4)=9 (boundary), K_9 is UNSAT.  p=11 > n=9 → 11 ∤ P(9,k) for any k≤9 → all
+    /// orbit_c_sizes nonzero mod 11.
+    ///
+    /// Protocol:
+    ///   1. Run d=6..max_d without breaking on cert.
+    ///   2. After each cert, record_solution populates the pivot table.
+    ///   3. At d>d_cert the [qw] lines should show pivots>0, N_eff<|A_d|, q_d<1.
+    ///   4. This directly measures G_d = dim(K_d / I_{<d}).
+    ///
+    /// Run with: cargo test --release exp12_quotient_r34_k9 -- --nocapture
+    #[test]
+    fn exp12_quotient_r34_k9() {
+        use crate::algebra::orbit_ns::{find_orbit_cert_fp_with_warm_start, WarmStartState};
+        use crate::problems::ramsey_orbit_rep;
+
+        eprintln!("\n=== EXP 12: G_d quotient measurement R(3,4)/K_9 F_11 ===");
+        // p=11 > n=9: guaranteed 11 ∤ orbit_c_size for all multiplier orbits in K_9.
+        let p = 11u8;
+        let d_start = 6; // min degree = C(4,2) = 6 for blue K_4 axiom
+        let max_d = 20;  // run well past cert to observe quotient compression
+        let (schema, axioms) = ramsey_orbit_rep(3, 4, 9, p);
+
+        let t_total = std::time::Instant::now();
+        let mut ws = WarmStartState::new();
+        let mut cert_d: Option<usize> = None;
+        let mut prev_b2o_len = 0usize;
+        let mut n_certs = 0usize;
+        for d in d_start..=max_d {
+            let t0 = std::time::Instant::now();
+            let r = find_orbit_cert_fp_with_warm_start(&schema, &axioms, d, p, &mut ws);
+            let elapsed = t0.elapsed().as_secs_f64();
+            let b2o_now = ws.bits_to_orbit.len();
+            let b2o_delta = b2o_now.saturating_sub(prev_b2o_len);
+            let reuse_pct = if b2o_now > 0 { 100 * prev_b2o_len / b2o_now } else { 0 };
+            let tag = if r.is_some() { "CERT" } else { "no cert" };
+            eprintln!("  d={}: {}  ({:.3}s)  [c2o={} b2o={} +{} reuse={}%]",
+                d, tag, elapsed,
+                ws.lazy_c2o.len(), b2o_now, b2o_delta, reuse_pct);
+            prev_b2o_len = b2o_now;
+            if r.is_some() {
+                n_certs += 1;
+                if cert_d.is_none() { cert_d = Some(d); }
+                // Do NOT break — continue to observe q_d after first cert.
+                // Pivot table is populated by record_solution; d+1 will show q_d < 1.
+                if n_certs >= 1 && d >= cert_d.unwrap() + 3 {
+                    eprintln!("  (3 post-cert degrees measured, stopping)");
+                    break;
+                }
+            }
+        }
+        let total_s = t_total.elapsed().as_secs_f64();
+        eprintln!("  total: {:.3}s  first cert at d={:?}  total certs={}", total_s, cert_d, n_certs);
+        eprintln!("  --- regime: check [qw] lines above for q_d = N_eff/|A_d| post cert ---");
+    }
+
+    /// EXP 13: Does symmetry breaking increase rank(A_d)/|A_d|?
+    ///
+    /// Protocol: R(3,4)/K_9 F_11 with k=0,1,3 edges fixed to red via SBP unit clauses.
+    ///
+    ///   k=0: ramsey_orbit_rep (stab path, S_9, 2 canonical axioms)
+    ///   k=1: ramsey_sbp_fix_k_edges(k=1) + sbp_stabilizer_gens(n=9,k=1)
+    ///        → group: (S_2)^1 × S_7 (~36× smaller than S_9)
+    ///   k=3: ramsey_sbp_fix_k_edges(k=3) + sbp_stabilizer_gens(n=9,k=3)
+    ///        → group: (S_2)^3 × S_3 (~17280× smaller than S_9)
+    ///
+    /// Key metric: rank(A_d)/|A_d| from [alg-timing] sparse GE lines.
+    /// Theory predicts ratio invariant (both rows+cols scale by |G|/|G'|).
+    /// If empirics show rank density increase → "constraint-misaligned system".
+    ///
+    /// Run with: cargo test --release exp13_rank_vs_symmetry_breaking -- --nocapture
+    #[test]
+    fn exp13_rank_vs_symmetry_breaking() {
+        use crate::algebra::orbit_ns::{find_orbit_cert_fp, find_orbit_cert_fp_with_gens};
+        use crate::problems::{ramsey_orbit_rep, ramsey_sbp_fix_k_edges, ramsey_sbp_stabilizer_gens};
+
+        let p = 11u8;
+        let max_d = 14usize;
+
+        for k in [0u32, 1, 3] {
+            let (schema, axioms, gens_override): (_, _, Option<Vec<_>>) = if k == 0 {
+                let (s, a) = ramsey_orbit_rep(3, 4, 9, p);
+                (s, a, None)
+            } else {
+                let (s, a) = ramsey_sbp_fix_k_edges(3, 4, 9, k, p);
+                let g = ramsey_sbp_stabilizer_gens(9, k);
+                (s, a, Some(g))
+            };
+            eprintln!("\n=== EXP 13: R(3,4)/K_9 F_11, k={} fixed ({} axioms) ===",
+                k, axioms.len());
+            let t0_total = std::time::Instant::now();
+            for d in 6..=max_d {
+                let t0 = std::time::Instant::now();
+                let r = if let Some(ref g) = gens_override {
+                    find_orbit_cert_fp_with_gens(&schema, &axioms, g, d, p)
+                } else {
+                    find_orbit_cert_fp(&schema, &axioms, d, p)
+                };
+                eprintln!("  k={} d={}: {}  ({:.3}s)",
+                    k, d,
+                    if r.is_some() { "CERT" } else { "no cert" },
+                    t0.elapsed().as_secs_f64());
+                if r.is_some() { break; }
+            }
+            eprintln!("  k={} total: {:.3}s", k, t0_total.elapsed().as_secs_f64());
+        }
+    }
+
+    /// EXP 14: Cancellation persistence barcode of the NS ideal.
+    ///
+    /// Homological Layer 4 diagnostic for R(3,4)/K_9 F_11.
+    ///
+    /// Tracks the "live rows" metric at each degree:
+    ///   live(d) = n_rows(d) − rank(d)   ["unresolved boundary terms"]
+    ///
+    /// The barcode shows three phases:
+    ///   Phase 1 (d=6..9):  Δrank < Δrows → backlog accumulates (H_1 growth)
+    ///   Phase flip (d=10): Δrank > Δrows → pivots outpace new rows
+    ///   Phase 2 (d=11):    backlog drains to 30, cert appears (H_0 closes)
+    ///
+    /// The phase flip degree separates "support accumulation" from
+    /// "cancellation closure" and precedes d_cert by exactly 1 degree.
+    ///
+    /// Key formula: d_cert = C(t,2) + (n − t) for R(s,t)/K_n
+    ///   where C(t,2) = blue axiom degree, (n−t) = external vertices = cancellation depth
+    ///   For R(3,4)/K_9: d_cert = C(4,2) + (9−4) = 6 + 5 = 11 ✓
+    ///
+    /// Per-orbit-row cancellation persistence barcode for R(3,4)/K_9 over 𝔽_11.
+    ///
+    /// For each orbit row S, tracks three degree timestamps:
+    ///   birth(S)  = first d at which S appears in the orbit basis
+    ///   pivot(S)  = first d at which S becomes a GE pivot (independent)
+    ///   zero(S)   = first d at which S is annihilated (reduced to zero by R_d)
+    ///
+    /// Outputs the full histogram of annihilation depths (zero(S) - birth(S))
+    /// to distinguish Case 1 (bounded ~5 steps), Case 2 (bimodal), Case 3 (flat).
+    ///
+    /// Run with: CASCADE_ALG_TIMING=1 cargo test --release exp14_cancellation_barcode -- --nocapture
+    #[test]
+    fn exp14_cancellation_barcode() {
+        use crate::problems::ramsey_orbit_rep;
+        use crate::algebra::orbit_ns::{WarmStartState, find_orbit_cert_fp_with_barcode};
+
+        let p = 11u8;
+        let (schema, axioms) = ramsey_orbit_rep(3, 4, 9, p);
+
+        eprintln!("\n=== EXP 14: Per-Row Cancellation Barcode R(3,4)/K_9 F_11 ===");
+
+        let mut warm = WarmStartState::new();
+        let t_start = std::time::Instant::now();
+
+        for d in 6..=11usize {
+            let t0 = std::time::Instant::now();
+            let cert = find_orbit_cert_fp_with_barcode(&schema, &axioms, d, p, &mut warm);
+            let elapsed = t0.elapsed().as_secs_f64();
+            let n_rows = warm.barcode.as_ref().map_or(0, |bc| bc.birth_d.len());
+            let rn = warm.barcode.as_ref().and_then(|bc| bc.last_residual_norm());
+            let rn_str = match rn {
+                Some(0) => "  ← CERT (||r_d||=0)".to_string(),
+                Some(n) => format!("  ||r_d||={}", n),
+                None    => String::new(),
+            };
+            eprintln!("  d={}: {} orbit rows, {:.3}s{}", d, n_rows, elapsed, rn_str);
+            if cert.is_some() { break; }
+        }
+
+        eprintln!();
+        if let Some(ref bc) = warm.barcode {
+            bc.print_histogram();
+        }
+        eprintln!("  Total: {:.3}s", t_start.elapsed().as_secs_f64());
+    }
+
+    /// R(5,5)/K_43 NS orbit profile: growth curves at d=10..D_MAX.
+    ///
+    /// Metrics come from CASCADE_ALG_TIMING=1 verbose output:
+    ///   n_rows  = "monomial_orbits (lazy stab): N product orbits"
+    ///   n_cols  = "matrix build (R rows × C cols …)"
+    ///   rank    = "sparse GE: … (rank R / C …)"
+    ///
+    /// Wall-time budget: D_MAX is conservative; each step multiplies n_cols
+    /// by ~C(903, 1) / C(903, 0) ≈ 903 at d=11, but orbit reduction collapses
+    /// that dramatically. Real growth depends on the stab rep count.
+    ///
+    /// Run with:
+    ///   CASCADE_ALG_TIMING=1 cargo test --release exp15_r55_k43_profile -- --nocapture
+    #[test]
+    fn exp15_r55_k43_profile() {
+        use crate::problems::ramsey_orbit_rep;
+        use crate::algebra::orbit_ns::{WarmStartState, find_orbit_cert_fp_with_barcode};
+
+        let p = 11u8;
+        let (schema, axioms) = ramsey_orbit_rep(5, 5, 43, p);
+
+        const D_MAX: usize = 19;
+        const TIME_BUDGET_S: f64 = 600.0;  // stop if any degree step exceeds this
+
+        eprintln!("\n=== EXP 15: R(5,5)/K_43 NS Orbit Profile over 𝔽_{} ===", p);
+        eprintln!("  (key metrics in CASCADE_ALG_TIMING lines above each row)");
+        eprintln!("  d    n_rows  elapsed");
+        eprintln!("  -----------------------------------------------");
+
+        let mut warm = WarmStartState::new();
+        let t_total = std::time::Instant::now();
+
+        for d in 10..=D_MAX {
+            let t0 = std::time::Instant::now();
+            let cert = find_orbit_cert_fp_with_barcode(&schema, &axioms, d, p, &mut warm);
+            let elapsed = t0.elapsed().as_secs_f64();
+            let n_rows = warm.barcode.as_ref().map_or(0, |bc| bc.birth_d.len());
+            let rn = warm.barcode.as_ref().and_then(|bc| bc.last_residual_norm());
+            let blocking = warm.barcode.as_ref()
+                .and_then(|bc| bc.blocking_orbit_ids.last())
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default();
+            let rn_str = match rn {
+                Some(0) => "  ← CERT (||r_d||=0)".to_string(),
+                Some(n) => format!("  ||r_d||={}  blocking={:?}", n, blocking),
+                None    => String::new(),
+            };
+
+            eprintln!("  d={:2}  {:7}   {:.3}s{}", d, n_rows, elapsed, rn_str);
+
+            if cert.is_some() { break; }
+            if elapsed > TIME_BUDGET_S {
+                eprintln!("  Time budget {:.0}s exceeded at d={}, stopping.", TIME_BUDGET_S, d);
+                break;
+            }
+        }
+
+        eprintln!();
+        if let Some(ref bc) = warm.barcode {
+            bc.print_histogram();
+        }
+        eprintln!("  Total elapsed: {:.3}s", t_total.elapsed().as_secs_f64());
     }
 }
