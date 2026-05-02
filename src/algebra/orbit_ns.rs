@@ -2049,6 +2049,9 @@ fn reenumerate_orbit_members(
 pub(crate) struct WarmStartState {
     pub(crate) lazy_c2o: std::collections::HashMap<super::graph_canon::CanonGraph, (u32, u64)>,
     pub(crate) bits_to_orbit: B2OMap,
+    /// cheap_graph_hash → (orbit_id, orbit_size): skip nauty for known orbit types.
+    /// Grows by ~n_new_orbits per degree step; at d=15 holds ~32K entries (~640KB).
+    pub(crate) hash_to_orbit: FxHashMap<u64, (u32, u64)>,
     // Sizes at last clone call — used to compute per-degree growth deltas in verbose mode.
     logged_c2o_len: usize,
     logged_b2o_len: usize,
@@ -2059,6 +2062,7 @@ impl WarmStartState {
         Self {
             lazy_c2o: std::collections::HashMap::new(),
             bits_to_orbit: B2OMap::new(),
+            hash_to_orbit: FxHashMap::default(),
             logged_c2o_len: 0,
             logged_b2o_len: 0,
         }
@@ -2254,6 +2258,9 @@ fn find_orbit_cert_fp_inner(
     // use enumerate_orbit_reps. For BFS paths: on-the-fly monomial orbit BFS.
     // b2o_len_at_clone: size of ws.bits_to_orbit at clone time; used for delta write-back.
     let mut b2o_len_at_clone: usize = 0;
+    // hash_to_orbit: cheap_graph_hash → (orbit_id, orbit_size) cache, populated by stab path.
+    let mut hash_to_orbit: FxHashMap<u64, (u32, u64)> = FxHashMap::default();
+    let stab_path_applicable = pre_stab_path.is_some();
     let t0 = std::time::Instant::now();
     let (n_mono_orbits, mono_orbit_id, mono_orbit_rep, formula_data) = if let Some(
         (pre_s, pre_t, pre_n_red, _pre_n_blue, pre_br, pre_bt),
@@ -2314,10 +2321,13 @@ fn find_orbit_cert_fp_inner(
             ws.logged_b2o_len = ws.bits_to_orbit.len();
             lazy_c2o = ws.lazy_c2o.clone();
             bits_to_orbit = ws.bits_to_orbit.clone();
+            // hash_to_orbit (outer scope) is populated from ws here; stays after branch ends.
+            hash_to_orbit = ws.hash_to_orbit.clone();
         } else {
             lazy_c2o = HashMap::new();
             bits_to_orbit = B2OMap::new();
             bits_to_orbit.ensure_init(n_edges_b2o);
+            // hash_to_orbit already initialized to default in outer scope.
         };
         b2o_len_at_clone = bits_to_orbit.len();
         // Always ensure the empty-graph orbit is at row 0.
@@ -2363,9 +2373,28 @@ fn find_orbit_cert_fp_inner(
                 t_hash.elapsed().as_secs_f64(), rep_indices.len(), products_to_canon.len());
         }
 
-        // Canonicalize only representative products in parallel.
+        // Pre-filter reps: if the rep's cheap_graph_hash maps to a known orbit,
+        // skip nauty entirely and use the cached (orbit_id, orbit_size) directly.
+        // Correctness: cheap_graph_hash is an isomorphism invariant (same orbit ↔ same hash),
+        // and the existing dedup code already assumes it's injective on orbits.
+        let mut cached_rep_orbit: std::collections::HashMap<usize, (u32, u64)> =
+            std::collections::HashMap::new();
+        let reps_to_nauty: Vec<usize> = rep_indices.iter()
+            .filter(|&&i| {
+                if let Some(&v) = hash_to_orbit.get(&inv_hashes[i]) {
+                    cached_rep_orbit.insert(i, v);
+                    false
+                } else {
+                    true
+                }
+            })
+            .copied()
+            .collect();
+        let n_hash_skipped = cached_rep_orbit.len();
+
+        // Canonicalize only reps not found in the hash_to_orbit cache.
         let t_canon = std::time::Instant::now();
-        let rep_canon: Vec<(usize, CanonGraph, u64)> = rep_indices.par_iter()
+        let rep_canon: Vec<(usize, CanonGraph, u64)> = reps_to_nauty.par_iter()
             .map(|&i| {
                 let product = products_to_canon[i];
                 let prod_edges = monobits_to_edges(product, n_verts);
@@ -2373,9 +2402,12 @@ fn find_orbit_cert_fp_inner(
                 (i, canon_g, aut)
             })
             .collect();
-        if verbose { eprintln!("c [alg-timing] product canon (par): {:.3}s ({} reps)", t_canon.elapsed().as_secs_f64(), rep_canon.len()); }
+        if verbose {
+            eprintln!("c [alg-timing] product canon (par): {:.3}s ({} reps, {} skipped via orbit cache)",
+                t_canon.elapsed().as_secs_f64(), rep_canon.len(), n_hash_skipped);
+        }
 
-        // Build per-representative-index → canonical form.
+        // Build per-representative-index → canonical form (only for non-cached reps).
         let mut idx_canon: Vec<(CanonGraph, u64)> = vec![(CanonGraph::empty(), 1u64); products_to_canon.len()];
         for (i, canon_g, aut) in &rep_canon {
             idx_canon[*i] = (canon_g.clone(), *aut);
@@ -2384,13 +2416,21 @@ fn find_orbit_cert_fp_inner(
         let t_insert = std::time::Instant::now();
         for (i, &product) in products_to_canon.iter().enumerate() {
             let rep_i = product_rep_idx[i];
-            let (ref canon_g, aut) = idx_canon[rep_i];
-            let next = lazy_c2o.len() as u32;
-            let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
-                let sz = orbit_size(canon_g, aut, n_verts);
-                (next, sz)
-            });
+            let (orbit_r, orbit_r_size) = if let Some(&v) = cached_rep_orbit.get(&rep_i) {
+                v  // rep found in hash_to_orbit: skip lazy_c2o lookup
+            } else {
+                let (ref canon_g, aut) = idx_canon[rep_i];
+                let next = lazy_c2o.len() as u32;
+                *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
+                    let sz = orbit_size(canon_g, aut, n_verts);
+                    (next, sz)
+                })
+            };
             bits_to_orbit.insert_new(product, orbit_r, orbit_r_size);
+            // Populate hash_to_orbit for every rep so future degree steps can skip nauty.
+            if product_rep_idx[i] == i {
+                hash_to_orbit.entry(inv_hashes[i]).or_insert((orbit_r, orbit_r_size));
+            }
         }
         if verbose { eprintln!("c [alg-timing] orbit insert: {:.3}s", t_insert.elapsed().as_secs_f64()); }
 
@@ -2444,6 +2484,12 @@ fn find_orbit_cert_fp_inner(
             let b2o_kb = ws.bits_to_orbit.approx_bytes() / 1024;
             eprintln!("c [alg-timing] write-back: b2o +{} / {} total ({}% reuse), ws now ~{}KB",
                 b2o_new, b2o_total, reuse_pct, b2o_kb);
+        }
+    }
+    // hash_to_orbit write-back: stab path only (other paths leave it as the default empty map).
+    if stab_path_applicable {
+        if let Some(ref mut ws) = warm {
+            ws.hash_to_orbit = std::mem::take(&mut hash_to_orbit);
         }
     }
 
