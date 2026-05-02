@@ -10,7 +10,7 @@
 //!
 //! This replaces ~2M ban clauses with ~2n groups, each with O(n) edges.
 
-use crate::biclique::{BiclDecomp, BiclGroup};
+use crate::biclique::BiclDecomp;
 use crate::cadical::ExternalPropagator;
 
 /// State of an edge variable in the propagator.

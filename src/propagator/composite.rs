@@ -180,7 +180,7 @@ mod tests {
     // Mock sub-propagator that emits a scripted sequence of propagations and
     // records callbacks for assertion.
     struct MockSub {
-        name: &'static str,
+        _name: &'static str,
         scripted: Vec<i32>, // pops from the front on each propagate() call
         assignments_seen: Vec<i32>,
         decision_levels: u32,
@@ -193,7 +193,7 @@ mod tests {
     impl MockSub {
         fn new(name: &'static str, scripted: Vec<i32>) -> Self {
             Self {
-                name,
+                _name: name,
                 scripted,
                 assignments_seen: Vec::new(),
                 decision_levels: 0,

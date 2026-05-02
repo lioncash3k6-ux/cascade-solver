@@ -23,7 +23,6 @@
 
 use crate::cardinality;
 use crate::dimacs::Cnf;
-use crate::types::Lit;
 
 /// A single biclique group: at-most-k constraint on a set of edge variables.
 #[derive(Debug, Clone)]

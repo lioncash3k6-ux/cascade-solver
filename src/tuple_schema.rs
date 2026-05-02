@@ -307,6 +307,7 @@ impl TupleVarSchema {
 }
 
 // Token BTreeMap re-export so downstream modules can use it consistently.
+#[allow(dead_code)]
 pub(crate) type OrbitMap<K, V> = BTreeMap<K, V>;
 
 /// Binomial coefficient C(n, k), saturating to 0 when k > n. Returns u32;

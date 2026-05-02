@@ -88,6 +88,7 @@ pub struct Stats {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct PendingClause {
     lit: i32,
     clause: Vec<i32>,

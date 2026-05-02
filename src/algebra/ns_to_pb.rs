@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! VeriPB (pseudo-Boolean proof) lowering for NS certificates with
 //! linear axioms.
 //!
@@ -32,8 +33,7 @@
 
 use super::ns_cert::CertDoc;
 use super::ns_fp::PolyP;
-use super::poly::Monomial;
-use std::io::{self, Write};
+use std::io::Write;
 
 /// A linear term in integer coefficients: `coef * x_var`. `var == 0` encodes
 /// the constant term.
@@ -340,6 +340,7 @@ fn emit_pol_sum(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::poly::Monomial;
     use crate::problems::count_q_partition;
 
     #[test]

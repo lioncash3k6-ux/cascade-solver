@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_mut, unused_parens)]
 //! Stage A — direct enumeration of PHP monomial orbit representatives.
 //!
 //! For PHP_{P,H} under G = S_P × S_H, a squarefree degree-d monomial is a

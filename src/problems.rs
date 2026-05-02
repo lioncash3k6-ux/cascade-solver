@@ -169,6 +169,48 @@ pub fn ramsey_disjunctive(
     (schema, axioms)
 }
 
+/// Ramsey R(s, t) on K_n: orbit-rep-only mode unconditionally.
+/// Returns exactly 2 axioms: canonical red K_s rep + canonical blue K_t rep.
+/// Used by IPS degree-2 tests that need n_axioms==2 regardless of problem size.
+pub fn ramsey_orbit_rep(s: u32, t: u32, n: u32, prime: u8) -> (TupleVarSchema, Vec<PolyP>) {
+    let schema = TupleVarSchema {
+        bases: vec![BaseSet::new("V", n)],
+        tuple_kind: TupleKind::UnorderedPair,
+        group: GroupSpec::Diagonal,
+    };
+    let mut axioms: Vec<PolyP> = Vec::new();
+
+    // Red axiom: K_s on vertices {1,...,s}
+    let mut red_vars: Vec<u32> = Vec::new();
+    for i in 1..=s {
+        for j in (i + 1)..=s {
+            red_vars.push(schema.var_of_tuple(&[i, j]));
+        }
+    }
+    let mut red_terms = BTreeMap::new();
+    red_terms.insert(Monomial::from_vars(red_vars), 1u8);
+    axioms.push(PolyP { p: prime, terms: red_terms });
+
+    // Blue axiom: ∏(1-x_e) for K_t on vertices {1,...,t}
+    let mut blue_factors: Vec<PolyP> = Vec::new();
+    for i in 1..=t {
+        for j in (i + 1)..=t {
+            let v = schema.var_of_tuple(&[i, j]);
+            let mut f = BTreeMap::new();
+            f.insert(Monomial::one(), 1u8);
+            f.insert(Monomial::single(v), prime - 1);
+            blue_factors.push(PolyP { p: prime, terms: f });
+        }
+    }
+    let mut blue_acc = PolyP::one(prime);
+    for f in &blue_factors {
+        blue_acc = blue_acc.mul(f);
+    }
+    axioms.push(blue_acc);
+
+    (schema, axioms)
+}
+
 /// Ramsey R(s, t) on K_n with **symmetry-breaking linear axioms** added.
 ///
 /// Research probe: does fixing `k` disjoint edges to red (linear axioms

@@ -311,7 +311,7 @@ impl SymmetryPropagator {
             // pending clause, we use source_gen_idx as a placeholder
             // (the actual witness is computed separately for proof
             // emission).
-            let witness = h.compose(&g_i).compose(&h.inverse());
+            let _witness = h.compose(&g_i).compose(&h.inverse());
 
             let mut reason = vec![propagated];
             for &l in &image {

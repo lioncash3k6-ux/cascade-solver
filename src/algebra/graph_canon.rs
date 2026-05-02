@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Canonical labeling and orbit enumeration for edge-sets of K_n under S_n.
 //!
 //! Used by the orbit-NS engine to replace the O(C(n²,d)) monomial BFS with
@@ -780,6 +781,98 @@ pub(crate) fn enumerate_stab_pair_reps(s: usize, budget: usize, max_free: usize)
         })
         .collect();
     result
+}
+
+// ---------------------------------------------------------------------------
+// IPS pair-orbit enumeration (stub — not yet needed for stab-path NS)
+// ---------------------------------------------------------------------------
+
+/// Enumerate canonical multiplier-orbit representatives for IPS pair columns
+/// under S_a × S_b × S_c × S_free, where:
+///   - vertices 0..a-1: shared (S1∩S2)
+///   - vertices a..a+b-1: S1-exclusive
+///   - vertices a+b..a+b+c-1: S2-exclusive
+///   - vertices a+b+c..: free
+///
+/// Current stub: delegates to `enumerate_stab_pair_reps` with s=a+b+c
+/// (treats all fixed vertices as one group — correct orbit structure only
+/// when a=b=c=0 or when all fixed vertices are equivalent). Full 3-group
+/// implementation is deferred until the IPS path is benchmarked.
+pub(crate) fn enumerate_ips_pair_reps(
+    a: usize,
+    b: usize,
+    c: usize,
+    budget: usize,
+    max_free: usize,
+) -> Vec<StabOrbitRep> {
+    enumerate_stab_pair_reps(a + b + c, budget, max_free)
+}
+
+// ---------------------------------------------------------------------------
+// Cheap isomorphism-invariant hash for product MonoBits
+// ---------------------------------------------------------------------------
+
+/// Fast isomorphism-invariant hash for a product MonoBits in K_{n_verts}.
+///
+/// Combines: compressed vertex count (k), edge count, sorted degree sequence,
+/// and sorted component (size, edge_count) pairs. For the sparse product
+/// graphs arising in stab-path NS (K_s ∪ small hat, ≤20 verts total), this
+/// nearly perfectly discriminates orbit classes, enabling ~250× speedup in
+/// product canonicalization by skipping redundant calls to `canonicalize`.
+///
+/// Soundness: false positives (same hash, different orbit) only cause missed
+/// certificates, never wrong ones. Uses only stack-allocated arrays.
+pub(crate) fn cheap_graph_hash(product: MonoBits, n_verts: u32) -> u64 {
+    let edges = monobits_to_edges(product, n_verts);
+    if edges.is_empty() { return 0; }
+    let (comp_edges, k) = compress(&edges);
+
+    let mut degrees = [0u8; 20];
+    for &(u, v) in &comp_edges {
+        degrees[u as usize] += 1;
+        degrees[v as usize] += 1;
+    }
+    degrees[..k as usize].sort_unstable();
+
+    // Union-find for component signatures (stack-only, no heap).
+    let mut parent = [0u8; 20];
+    for i in 0..k as usize { parent[i] = i as u8; }
+    fn uf_find_local(p: &mut [u8; 20], x: u8) -> u8 {
+        if p[x as usize] != x { p[x as usize] = uf_find_local(p, p[x as usize]); }
+        p[x as usize]
+    }
+    for &(u, v) in &comp_edges {
+        let pu = uf_find_local(&mut parent, u);
+        let pv = uf_find_local(&mut parent, v);
+        if pu != pv { parent[pu as usize] = pv; }
+    }
+    let mut comp_v = [0u8; 20];
+    let mut comp_e = [0u8; 20];
+    for i in 0..k as usize { comp_v[uf_find_local(&mut parent, i as u8) as usize] += 1; }
+    for &(u, _v) in &comp_edges { comp_e[uf_find_local(&mut parent, u) as usize] += 1; }
+    let mut comp_sigs = [(0u8, 0u8); 20];
+    let mut nc = 0usize;
+    for i in 0..k as usize {
+        if parent[i] == i as u8 {
+            comp_sigs[nc] = (comp_v[i], comp_e[i]);
+            nc += 1;
+        }
+    }
+    comp_sigs[..nc].sort_unstable();
+
+    let ne = comp_edges.len() as u64;
+    let mut h: u64 = (k as u64).wrapping_mul(0x9e3779b97f4a7c15_u64);
+    h ^= ne.wrapping_mul(0x517cc1b727220a95_u64);
+    for i in 0..k as usize {
+        h = h.wrapping_mul(0x6c62272e07bb0142_u64)
+             .wrapping_add(degrees[i] as u64 + 1);
+    }
+    for i in 0..nc {
+        let (cv, ce) = comp_sigs[i];
+        h = h.wrapping_mul(0xf3a5c87d12b96e4f_u64)
+             .wrapping_add(((cv as u64) << 16) | ((ce as u64) + 1));
+    }
+    h
 }
 
 // ---------------------------------------------------------------------------

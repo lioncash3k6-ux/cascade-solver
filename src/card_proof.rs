@@ -31,7 +31,7 @@ pub fn emit_card_veripb_proof(
     t: u32,
 ) -> (String, usize) {
     let mut proof = String::new();
-    let n_edges = n * (n - 1) / 2;
+    let _n_edges = n * (n - 1) / 2;
     let n_clauses = cnf.clauses.len();
 
     writeln!(proof, "pseudo-Boolean proof version 3.0").unwrap();
@@ -236,6 +236,7 @@ mod tests {
     use crate::dimacs;
     use std::io::{BufReader, Cursor};
 
+    #[allow(dead_code)]
     fn parse(s: &str) -> Cnf {
         dimacs::parse_reader(BufReader::new(Cursor::new(s.as_bytes()))).unwrap()
     }

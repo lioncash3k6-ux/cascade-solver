@@ -153,6 +153,7 @@ pub fn clausal_fixing_units(n: u32, count: u32) -> Vec<Vec<Lit>> {
 }
 
 /// Compute the vertex pair (a, b) with a < b for a given edge variable index.
+#[allow(dead_code)]
 fn edge_verts(e: u32, n: u32) -> (u32, u32) {
     for a in 1..=n {
         for b in (a + 1)..=n {

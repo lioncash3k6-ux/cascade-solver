@@ -98,7 +98,7 @@ fn orbit_and_tree(
 fn sift(
     perm: &Permutation,
     levels: &[StabLevel],
-    n_vars: u32,
+    _n_vars: u32,
 ) -> Permutation {
     let mut h = perm.clone();
     for level in levels {
@@ -279,6 +279,7 @@ impl SchreierSims {
             // Generate Schreier generators and sift. A Schreier generator
             // for level i is: u_{g(β)}^{-1} ∘ g ∘ u_β for each orbit
             // element β and generator g at level i.
+            #[allow(unused_assignments)]
             let mut new_gens_found = false;
             // Collect Schreier generators into a buffer (avoids borrow
             // conflict with sgs).

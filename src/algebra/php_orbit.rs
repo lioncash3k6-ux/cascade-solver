@@ -358,7 +358,7 @@ pub fn find_php_orbit_cert(instance: &Php, d: usize) -> NsResult {
     let mut matrix: Vec<Vec<u64>> = vec![vec![0u64; words_per_row]; n_rows];
 
     // Pre-pick a monomial rep per orbit row for fast membership test.
-    let mono_orbit_rep_mono: Vec<Monomial> = mono_orbit_rep
+    let _mono_orbit_rep_mono: Vec<Monomial> = mono_orbit_rep
         .iter()
         .map(|&idx| monomials[idx].clone())
         .collect();
@@ -938,7 +938,6 @@ mod tests {
     fn php_4_3_orbit_probe() {
         let php = Php::new(4, 3);
         let t = std::time::Instant::now();
-        let mut found = None;
         for d in 3..=7 {
             let t_d = std::time::Instant::now();
             match find_php_orbit_cert(&php, d) {
@@ -953,7 +952,6 @@ mod tests {
                         valid
                     );
                     if valid {
-                        found = Some(d);
                         break;
                     }
                 }

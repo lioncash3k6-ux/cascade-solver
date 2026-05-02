@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Stage B — pair-orbit enumeration + matrix scatter for PHP in orbit basis.
 //!
 //! Takes Stage A's mono-orbit reps and computes the matrix column structure
@@ -103,7 +104,7 @@ pub fn php_axiom_orbits(p: u32, h: u32) -> Vec<AxiomOrbit> {
 
 /// Apply an adjacent-transposition generator (by index) to a `PhpMatrix`.
 /// Generators 0..P-1 are pigeon swaps, indices P-1..P+H-2 are hole swaps.
-pub fn apply_gen(m: &PhpMatrix, gen_idx: usize, p: u32, h: u32) -> PhpMatrix {
+pub fn apply_gen(m: &PhpMatrix, gen_idx: usize, p: u32, _h: u32) -> PhpMatrix {
     let n_pigeon_gens = p.saturating_sub(1) as usize;
     if gen_idx < n_pigeon_gens {
         // Pigeon swap i ↔ i+1.
@@ -363,7 +364,7 @@ pub fn axiom_terms(
     axiom_orbit_idx: u32,
     pigeon_label: u32,
     hole_label: (u32, u32, u32),
-    p: u32,
+    _p: u32,
     h: u32,
     prime: u8,
 ) -> Vec<(u128, u8)> {
@@ -904,7 +905,7 @@ fn bits_to_mono(bits: u128) -> Monomial {
 ///   `P + (hole * C(P, 2)) + (triangular pair index of (p_lo, p_hi))`
 /// matching the `php_functional` construction order:
 ///   hole outer loop, then p1 loop, then p2 > p1 loop.
-fn raw_axiom_idx(label: AxiomLabel, p: u32, h: u32) -> usize {
+fn raw_axiom_idx(label: AxiomLabel, p: u32, _h: u32) -> usize {
     match label {
         AxiomLabel::Pigeon(pig) => pig as usize,
         AxiomLabel::Hole(hole, lo, hi) => {
@@ -925,7 +926,6 @@ fn raw_axiom_idx(label: AxiomLabel, p: u32, h: u32) -> usize {
             base + pair_idx
         }
     }
-    // Reference `h` to avoid unused-var warning (it's needed by callers).
 }
 
 /// Reconstruct the NS certificate from the Gaussian solution.

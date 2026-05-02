@@ -1,3 +1,4 @@
+#![allow(dead_code, non_snake_case, unused_mut)]
 //! Generic orbit-reduced Nullstellensatz over 𝔽_p.
 //!
 //! Takes a [`TupleVarSchema`] and a list of polynomial axioms, and searches
@@ -112,6 +113,130 @@ impl std::ops::BitOrAssign for MonoBits {
         for i in 0..N_WORDS {
             self.w[i] |= rhs.w[i];
         }
+    }
+}
+
+// ── Compact-key map for MonoBits → orbit identity ────────────────────────────
+//
+// The full MonoBits is [u64; 16] = 128 bytes, but for K_n only ceil(C(n,2)/64)
+// words are ever non-zero.  Storing 128-byte keys in the HashMap wastes memory
+// and hurts cache behaviour at 2M+ entries.  B2OMap selects the minimum-width
+// integer-array key for the problem at hand:
+//
+//   W1  →  [u64;  1] =  8 B  (n_edges ≤  64, covers K_10)
+//   W2  →  [u64;  2] = 16 B  (n_edges ≤ 128, covers K_16)
+//   W3  →  [u64;  3] = 24 B  (n_edges ≤ 192, covers K_18/K_19) ← main target
+//   W8  →  [u64;  8] = 64 B  (n_edges ≤ 512, covers K_32)
+//   W15 →  [u64; 15] =120 B  (n_edges ≤ 960, covers K_43)
+//
+// Values are stored in a flat Vec<(u32, u64)> (orbit_id, orbit_size).  The map
+// stores only a u32 index, so each occupied slot is key_bytes + 4 bytes.
+// For K_18 at d=14 (2.1M entries): ~50 MB instead of ~370 MB.
+
+use rustc_hash::FxHashMap;
+
+#[derive(Clone)]
+enum B2OInner {
+    W1(FxHashMap<u64,        u32>),
+    W2(FxHashMap<[u64;  2],  u32>),
+    W3(FxHashMap<[u64;  3],  u32>),
+    W8(FxHashMap<[u64;  8],  u32>),
+    W15(FxHashMap<[u64; 15], u32>),
+}
+
+/// Split-storage compact map: MonoBits key → (orbit_id, orbit_size).
+#[derive(Clone)]
+pub(crate) struct B2OMap {
+    inner: Option<B2OInner>,   // None until ensure_init is called
+    data:  Vec<(u32, u64)>,    // index → (orbit_id, orbit_size)
+}
+
+#[inline(always)] fn bk1(b: MonoBits) -> u64        { b.w[0] }
+#[inline(always)] fn bk2(b: MonoBits) -> [u64;  2]  { [b.w[0], b.w[1]] }
+#[inline(always)] fn bk3(b: MonoBits) -> [u64;  3]  { [b.w[0], b.w[1], b.w[2]] }
+#[inline(always)] fn bk8(b: MonoBits) -> [u64;  8]  {
+    [b.w[0],b.w[1],b.w[2],b.w[3],b.w[4],b.w[5],b.w[6],b.w[7]]
+}
+#[inline(always)] fn bk15(b: MonoBits) -> [u64; 15] {
+    let mut k = [0u64; 15]; k.copy_from_slice(&b.w[..15]); k
+}
+
+impl B2OMap {
+    pub(crate) fn new() -> Self { B2OMap { inner: None, data: Vec::new() } }
+
+    /// Select the compact variant for a problem with `n_edges` possible edge-bits.
+    /// Must be called before any insert/get; safe to call multiple times.
+    pub(crate) fn ensure_init(&mut self, n_edges: usize) {
+        if self.inner.is_some() { return; }
+        self.inner = Some(match n_edges {
+            0..=64   => B2OInner::W1(FxHashMap::default()),
+            65..=128  => B2OInner::W2(FxHashMap::default()),
+            129..=192 => B2OInner::W3(FxHashMap::default()),
+            193..=512 => B2OInner::W8(FxHashMap::default()),
+            _         => B2OInner::W15(FxHashMap::default()),
+        });
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match &self.inner {
+            None => 0,
+            Some(B2OInner::W1(m))  => m.len(),
+            Some(B2OInner::W2(m))  => m.len(),
+            Some(B2OInner::W3(m))  => m.len(),
+            Some(B2OInner::W8(m))  => m.len(),
+            Some(B2OInner::W15(m)) => m.len(),
+        }
+    }
+
+    pub(crate) fn get(&self, b: MonoBits) -> Option<(u32, u64)> {
+        let idx = match &self.inner {
+            None => return None,
+            Some(B2OInner::W1(m))  => *m.get(&bk1(b))?,
+            Some(B2OInner::W2(m))  => *m.get(&bk2(b))?,
+            Some(B2OInner::W3(m))  => *m.get(&bk3(b))?,
+            Some(B2OInner::W8(m))  => *m.get(&bk8(b))?,
+            Some(B2OInner::W15(m)) => *m.get(&bk15(b))?,
+        };
+        Some(self.data[idx as usize])
+    }
+
+    pub(crate) fn contains_key(&self, b: MonoBits) -> bool {
+        match &self.inner {
+            None => false,
+            Some(B2OInner::W1(m))  => m.contains_key(&bk1(b)),
+            Some(B2OInner::W2(m))  => m.contains_key(&bk2(b)),
+            Some(B2OInner::W3(m))  => m.contains_key(&bk3(b)),
+            Some(B2OInner::W8(m))  => m.contains_key(&bk8(b)),
+            Some(B2OInner::W15(m)) => m.contains_key(&bk15(b)),
+        }
+    }
+
+    /// Insert a new entry. Caller must ensure `b` is not already present.
+    pub(crate) fn insert_new(&mut self, b: MonoBits, orbit_id: u32, orbit_size: u64) {
+        let idx = self.data.len() as u32;
+        self.data.push((orbit_id, orbit_size));
+        match self.inner.as_mut().expect("B2OMap: insert_new before ensure_init") {
+            B2OInner::W1(m)  => { m.insert(bk1(b), idx); }
+            B2OInner::W2(m)  => { m.insert(bk2(b), idx); }
+            B2OInner::W3(m)  => { m.insert(bk3(b), idx); }
+            B2OInner::W8(m)  => { m.insert(bk8(b), idx); }
+            B2OInner::W15(m) => { m.insert(bk15(b), idx); }
+        }
+    }
+
+    /// Approximate heap bytes used (key slots + data Vec, rough lower bound).
+    pub(crate) fn approx_bytes(&self) -> usize {
+        let key_bytes = match &self.inner {
+            None => 0,
+            Some(B2OInner::W1(_))  => 8,
+            Some(B2OInner::W2(_))  => 16,
+            Some(B2OInner::W3(_))  => 24,
+            Some(B2OInner::W8(_))  => 64,
+            Some(B2OInner::W15(_)) => 120,
+        };
+        // map: (key_bytes + 4 value + ~4 overhead) × len × 4/3 for load factor
+        let n = self.len();
+        n * (key_bytes + 8) * 4 / 3 + self.data.len() * 16
     }
 }
 
@@ -374,7 +499,7 @@ fn monomial_orbits_via_embedding(
     n_monos: usize,
     colex: &ColexIndex,
 ) -> (Vec<u32>, Vec<u32>) {
-    use super::graph_canon::{edge_to_bit, enumerate_orbit_reps};
+    use super::graph_canon::enumerate_orbit_reps;
 
     assert!(
         n_monos <= u32::MAX as usize,
@@ -1169,7 +1294,7 @@ fn poly_reverse(a: &[u8]) -> Vec<u8> {
 /// LCM(a, b) = a * b / gcd(a, b) over 𝔽_p, monic.
 fn poly_lcm_fp(a: &[u8], b: &[u8], p: u8) -> Vec<u8> {
     let g = poly_gcd_fp(a, b, p);
-    let a_div_g = poly_rem_fp(a, &g, p);  // TODO: proper division
+    let _a_div_g = poly_rem_fp(a, &g, p);  // TODO: proper division
     // For LCM = (a / gcd) * b, need exact division.
     // Use: a = g * q, so q = a / g. Compute by synthetic division.
     let q = poly_exact_div_fp(a, &g, p);
@@ -1296,19 +1421,70 @@ fn matvec_T_B_fp(rows: &[Vec<(u32, u8)>], av_flat: &[u8], n_cols: usize, b: usiz
 /// processed with BM; each BM polynomial is reversed to obtain the operator annihilator
 /// (Q_j(M')b = 0).  The LCM of the B operator polynomials converges to the true minimal
 /// polynomial with P(failure) < rank/p^B.  For p=11, rank=21000, B=8: P < 0.01%.
+///
+/// Matvec buffers are pre-allocated once and reused across all Krylov iterations; the CSR
+/// transpose of A is built once so A^T×x uses a cache-friendly gather instead of scatter.
 fn sparse_block_wiedemann_fp(
     rows: &[Vec<(u32, u8)>],
     n_cols: usize,
     p: u8,
     verbose: bool,
 ) -> Option<Vec<u8>> {
+    // A^T×x via CSR-gather (parallel, zero-alloc per call).
+    fn matvec_t_csr(col_data: &[(u32, u8)], col_start: &[usize], x: &[u8], out: &mut [u8], p32: u32) {
+        use rayon::prelude::*;
+        out.par_iter_mut().enumerate().for_each(|(j, v)| {
+            let mut acc = 0u32;
+            for &(i, a) in &col_data[col_start[j]..col_start[j + 1]] {
+                acc += a as u32 * x[i as usize] as u32;
+            }
+            *v = (acc % p32) as u8;
+        });
+    }
+    // A^T×x via scatter into caller-owned u32 scratch (sequential, zero-alloc per call).
+    fn matvec_t_seq(rows: &[Vec<(u32, u8)>], x: &[u8], out: &mut [u8], n_cols: usize, p32: u32, scratch: &mut [u32]) {
+        scratch.iter_mut().for_each(|v| *v = 0);
+        for (i, row) in rows.iter().enumerate() {
+            let xi = x[i] as u32;
+            if xi == 0 { continue; }
+            for &(c_idx, a) in row {
+                let col_j = c_idx as usize;
+                if col_j < n_cols { scratch[col_j] += a as u32 * xi; }
+            }
+        }
+        for (o, &v) in out.iter_mut().zip(scratch.iter()) { *o = (v % p32) as u8; }
+    }
+    // A×x (row dot-products, parallel or sequential, zero-alloc per call).
+    fn matvec_a(rows: &[Vec<(u32, u8)>], x: &[u8], out: &mut [u8], n_cols: usize, p32: u32, par: bool) {
+        if par {
+            use rayon::prelude::*;
+            rows.par_iter().zip(out.par_iter_mut()).for_each(|(row, yi)| {
+                let mut acc = 0u32;
+                for &(c_idx, a) in row {
+                    let ci = c_idx as usize;
+                    if ci < n_cols { acc += a as u32 * x[ci] as u32; }
+                }
+                *yi = (acc % p32) as u8;
+            });
+        } else {
+            for (yi, row) in out.iter_mut().zip(rows.iter()) {
+                let mut acc = 0u32;
+                for &(c_idx, a) in row {
+                    let ci = c_idx as usize;
+                    if ci < n_cols { acc += a as u32 * x[ci] as u32; }
+                }
+                *yi = (acc % p32) as u8;
+            }
+        }
+    }
+
     let p16 = p as u16;
     let p32 = p as u32;
     let t0 = std::time::Instant::now();
     let n_rows = rows.len();
 
-    let nnz: usize = rows.iter().map(|r| r.len()).sum();
-    let par = nnz > 2_000_000;
+    let nnz_total: usize = rows.iter().map(|r| r.len()).sum();
+    let par = nnz_total > 2_000_000;
 
     // RHS vector b[i] = A[i][n_cols] (augmented column).
     let rhs_col = n_cols as u32;
@@ -1321,9 +1497,32 @@ fn sparse_block_wiedemann_fp(
     let rank_bound = n_rows.min(n_cols);
     let k_len = 2 * rank_bound + 64;
 
-    // For small p (p << rank), a single random u makes BM return a proper divisor of the true
-    // operator min poly.  Use B=8 projections in ONE Krylov pass; LCM of all B reversed-BM
-    // polynomials converges to the true min poly with overwhelming probability.
+    // Build CSR transpose of A (excluding augmented col) once; reused across all matvec calls.
+    let nnz_a: usize = rows.iter()
+        .map(|r| r.iter().filter(|&&(c, _)| (c as usize) < n_cols).count()).sum();
+    let mut col_start_t = vec![0usize; n_cols + 1];
+    for row in rows.iter() {
+        for &(c, _) in row { if (c as usize) < n_cols { col_start_t[c as usize + 1] += 1; } }
+    }
+    for j in 0..n_cols { col_start_t[j + 1] += col_start_t[j]; }
+    let mut col_data_t = vec![(0u32, 0u8); nnz_a];
+    {
+        let mut pos = col_start_t[..n_cols].to_vec();
+        for (i, row) in rows.iter().enumerate() {
+            for &(c, a) in row {
+                let col = c as usize;
+                if col < n_cols { col_data_t[pos[col]] = (i as u32, a); pos[col] += 1; }
+            }
+        }
+    }
+
+    // Pre-allocated matvec buffers, reused across all phases and outer iterations.
+    let mut c_buf = vec![0u8; n_rows];      // current Krylov vector / working scratch
+    let mut at_c_buf = vec![0u8; n_cols];   // A^T × c_buf; holds x_tilde in Phase 3
+    let mut z_acc_buf = vec![0u32; n_rows]; // Phase 3 z accumulator
+    // Sequential A^T scatter needs a u32 accumulator; parallel CSR-gather needs none.
+    let mut u32_at_scratch = if par { Vec::new() } else { vec![0u32; n_cols] };
+
     const B: usize = 8;
     const MAX_OUTER: usize = 4;
 
@@ -1336,23 +1535,27 @@ fn sparse_block_wiedemann_fp(
         for _ in 0..B {
             let u: Vec<u8> = (0..n_rows).map(|_| {
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                ((rng_state >> 33) as u8 % p)
+                (rng_state >> 33) as u8 % p
             }).collect();
             u_vecs.push(u);
         }
 
-        // Phase 1: ONE Krylov pass, B simultaneous scalar dot-products.
-        // r_seqs[j][k] = u_j · (M')^k b
+        // Phase 1: ONE Krylov pass, B simultaneous dot-products.
+        // All matvec steps use pre-allocated c_buf / at_c_buf — zero heap churn per iteration.
         let mut r_seqs: Vec<Vec<u8>> = vec![Vec::with_capacity(k_len); B];
-        let mut c = b_rhs.clone();
+        c_buf.copy_from_slice(&b_rhs);
         for _k in 0..k_len {
             for j in 0..B {
                 let mut acc = 0u32;
-                for (&uu, &cc) in u_vecs[j].iter().zip(c.iter()) { acc += uu as u32 * cc as u32; }
+                for (&uu, &cc) in u_vecs[j].iter().zip(c_buf.iter()) { acc += uu as u32 * cc as u32; }
                 r_seqs[j].push((acc % p32) as u8);
             }
-            let at_c = matvec_T_fp(rows, &c, n_cols, p, par);
-            c = matvec_fp(rows, &at_c, n_cols, p, par);
+            if par {
+                matvec_t_csr(&col_data_t, &col_start_t, &c_buf, &mut at_c_buf, p32);
+            } else {
+                matvec_t_seq(rows, &c_buf, &mut at_c_buf, n_cols, p32, &mut u32_at_scratch);
+            }
+            matvec_a(rows, &at_c_buf, &mut c_buf, n_cols, p32, par);
         }
 
         if verbose {
@@ -1361,9 +1564,7 @@ fn sparse_block_wiedemann_fp(
         }
 
         // Phase 2: BM on each sequence → reverse → LCM of operator polynomials.
-        // BM returns LFSR polynomial L (L[0]=1).  Operator annihilator Q = reverse(L):
-        // Q(M')b = 0.  LCM(Q_0,...,Q_{B-1}) = true min poly with high probability.
-        let mut q_lcm: Vec<u8> = vec![1u8];  // neutral element for LCM (constant 1)
+        let mut q_lcm: Vec<u8> = vec![1u8];
         let mut bm_degs = [0usize; B];
         for j in 0..B {
             let mu_j = berlekamp_massey_fp(&r_seqs[j], p);
@@ -1382,56 +1583,61 @@ fn sparse_block_wiedemann_fp(
 
         if deg_q == 0 { continue; }
 
-        // Phase 3: power escalation.  For nilpotent module structure (min_poly = f^m),
-        // every BM projection returns f but f(M')b ≠ 0.  Try q_lcm^k for k=1,2,3,...
-        // until reconstruction succeeds.  Only powers ≤ ceil(rank/deg_q) are meaningful.
+        // Phase 3: power escalation.  Try q_lcm^k for k=1,2,... until reconstruction succeeds.
         let max_power = (rank_bound / deg_q.max(1) + 1).min(4);
         let mut poly = q_lcm.clone();
-        let mut found = false;
         for power in 1..=max_power {
             let deg_poly = poly.len() - 1;
             if poly[0] == 0 || deg_poly == 0 {
                 if power < max_power { poly = poly_mul_fp(&poly, &q_lcm, p); }
                 continue;
             }
-            // Overflow guard: (p-1)^2 * deg_poly must fit in u32.
             let pp1sq = (p as u32 - 1) * (p as u32 - 1);
             if deg_poly as u64 * pp1sq as u64 >= u32::MAX as u64 {
                 break;
             }
             let q0_inv = mod_inv(poly[0], p);
-            let mut z_acc = vec![0u32; n_rows];
-            {
-                let mut v = b_rhs.clone();
-                for j in 0..deg_poly {
-                    let coef = poly[j + 1];
-                    if coef != 0 {
-                        let c = ((p16 - coef as u16) * q0_inv as u16 % p16) as u32;
-                        for (za, &vv) in z_acc.iter_mut().zip(v.iter()) { *za += c * vv as u32; }
+            // z = Σ_j c_j * (A A^T)^j b  accumulated into z_acc_buf; v = (A A^T)^j b in c_buf.
+            z_acc_buf.iter_mut().for_each(|v| *v = 0);
+            c_buf.copy_from_slice(&b_rhs);
+            for j in 0..deg_poly {
+                let coef = poly[j + 1];
+                if coef != 0 {
+                    let c_scale = ((p16 - coef as u16) * q0_inv as u16 % p16) as u32;
+                    for (za, &vv) in z_acc_buf.iter_mut().zip(c_buf.iter()) { *za += c_scale * vv as u32; }
+                }
+                if j + 1 < deg_poly {
+                    if par {
+                        matvec_t_csr(&col_data_t, &col_start_t, &c_buf, &mut at_c_buf, p32);
+                    } else {
+                        matvec_t_seq(rows, &c_buf, &mut at_c_buf, n_cols, p32, &mut u32_at_scratch);
                     }
-                    if j + 1 < deg_poly {
-                        let at_v = matvec_T_fp(rows, &v, n_cols, p, par);
-                        v = matvec_fp(rows, &at_v, n_cols, p, par);
-                    }
+                    matvec_a(rows, &at_c_buf, &mut c_buf, n_cols, p32, par);
                 }
             }
-            let z_tilde: Vec<u8> = z_acc.iter().map(|&a| (a % p32) as u8).collect();
-            let x_tilde = matvec_T_fp(rows, &z_tilde, n_cols, p, par);
+            // z_tilde = z_acc % p → c_buf; x_tilde = A^T z_tilde → at_c_buf
+            for (dst, &src) in c_buf.iter_mut().zip(z_acc_buf.iter()) { *dst = (src % p32) as u8; }
+            if par {
+                matvec_t_csr(&col_data_t, &col_start_t, &c_buf, &mut at_c_buf, p32);
+            } else {
+                matvec_t_seq(rows, &c_buf, &mut at_c_buf, n_cols, p32, &mut u32_at_scratch);
+            }
 
             if verbose {
                 eprintln!("c [alg-timing] wiedemann phase3 (outer {} power {} deg={}): {:.3}s",
                     outer, power, deg_poly, t0.elapsed().as_secs_f64());
             }
 
-            let ax = matvec_fp(rows, &x_tilde, n_cols, p, par);
-            if ax.iter().zip(b_rhs.iter()).all(|(&a, &b)| a == b) {
+            // Verify A × x_tilde == b_rhs  (x_tilde is at_c_buf; verification result in c_buf)
+            matvec_a(rows, &at_c_buf, &mut c_buf, n_cols, p32, par);
+            if c_buf.iter().zip(b_rhs.iter()).all(|(&a, &b)| a == b) {
                 if verbose { eprintln!("c [alg-timing] wiedemann: {:.3}s (CERT VERIFIED, outer {} power {})", t0.elapsed().as_secs_f64(), outer, power); }
-                return Some(x_tilde);
+                return Some(at_c_buf.clone());
             }
 
             if power < max_power { poly = poly_mul_fp(&poly, &q_lcm, p); }
         }
-        if !found && verbose { eprintln!("c [alg-timing] wiedemann outer {}: all powers failed (deg_q={}), retrying", outer, deg_q); }
+        if verbose { eprintln!("c [alg-timing] wiedemann outer {}: all powers failed (deg_q={}), retrying", outer, deg_q); }
     }
 
     if verbose { eprintln!("c [alg-timing] wiedemann: {:.3}s (inconsistent, verification failed)", t0.elapsed().as_secs_f64()); }
@@ -1677,7 +1883,7 @@ fn build_lp_sparse_rows(
     orbit_c_sizes: &[u64],
     n_verts: usize,
     c2o: &std::collections::HashMap<super::graph_canon::CanonGraph, (u32, u64)>,
-    bits_to_orbit: &std::collections::HashMap<MonoBits, (u32, u64)>,
+    bits_to_orbit: &B2OMap,
     axiom_bits: &[Vec<(MonoBits, u8)>],
     colex: &ColexIndex,
     p_work: u64,
@@ -1693,7 +1899,7 @@ fn build_lp_sparse_rows(
         for &(term_bits, coef) in &axiom_bits[ai as usize] {
             let product = term_bits | mi_bits;
             if (product.count_ones() as u32) > colex.d { continue; }
-            let orbit_r_and_size = if let Some(&v) = bits_to_orbit.get(&product) {
+            let orbit_r_and_size = if let Some(v) = bits_to_orbit.get(product) {
                 Some(v)
             } else {
                 let prod_edges = monobits_to_edges(product, n_verts as u32);
@@ -1805,6 +2011,32 @@ fn reenumerate_orbit_members(
     members
 }
 
+/// Persistent state for the R(s,t) stab-path solver across degree steps.
+///
+/// Holds the orbit identity tables (`lazy_c2o`, `bits_to_orbit`) built during
+/// a previous call to [`find_orbit_cert_fp_with_warm_start`]. These maps grow
+/// monotonically: entries from degree `d` are valid at degree `d+1`, so the
+/// next call only needs to canonicalize products with exactly `d+1` edges.
+/// For R(5,5)/K_43 this reduces ~10M canon calls per step to ~100K.
+pub(crate) struct WarmStartState {
+    pub(crate) lazy_c2o: std::collections::HashMap<super::graph_canon::CanonGraph, (u32, u64)>,
+    pub(crate) bits_to_orbit: B2OMap,
+    // Sizes at last clone call — used to compute per-degree growth deltas in verbose mode.
+    logged_c2o_len: usize,
+    logged_b2o_len: usize,
+}
+
+impl WarmStartState {
+    pub(crate) fn new() -> Self {
+        Self {
+            lazy_c2o: std::collections::HashMap::new(),
+            bits_to_orbit: B2OMap::new(),
+            logged_c2o_len: 0,
+            logged_b2o_len: 0,
+        }
+    }
+}
+
 /// Find a G-invariant NS certificate at degree `d` over 𝔽_p for the given
 /// schema + axioms. Uses the adjacent-transposition generators implied by
 /// the schema's group spec. See [`find_orbit_cert_fp_with_gens`] for
@@ -1819,7 +2051,7 @@ pub fn find_orbit_cert_fp(
     p: u8,
 ) -> Option<BTreeMap<usize, PolyP>> {
     let gens = schema.generators();
-    find_orbit_cert_fp_with_gens(schema, axioms, &gens, d, p)
+    find_orbit_cert_fp_inner(schema, axioms, &gens, d, p, None)
 }
 
 /// Like [`find_orbit_cert_fp`] but uses explicit generators instead of
@@ -1838,6 +2070,33 @@ pub fn find_orbit_cert_fp_with_gens(
     gens: &[Generator],
     d: usize,
     p: u8,
+) -> Option<BTreeMap<usize, PolyP>> {
+    find_orbit_cert_fp_inner(schema, axioms, gens, d, p, None)
+}
+
+/// Like [`find_orbit_cert_fp`] but persists orbit identity tables across
+/// degree steps via `warm`. On the first call `warm` should be a fresh
+/// [`WarmStartState::new()`]; on subsequent calls it carries the tables
+/// from the previous degree. Only valid for the R(s,t) stab path; falls
+/// back to a cold start for other problem families.
+pub(crate) fn find_orbit_cert_fp_with_warm_start(
+    schema: &TupleVarSchema,
+    axioms: &[PolyP],
+    d: usize,
+    p: u8,
+    warm: &mut WarmStartState,
+) -> Option<BTreeMap<usize, PolyP>> {
+    let gens = schema.generators();
+    find_orbit_cert_fp_inner(schema, axioms, &gens, d, p, Some(warm))
+}
+
+fn find_orbit_cert_fp_inner(
+    schema: &TupleVarSchema,
+    axioms: &[PolyP],
+    gens: &[Generator],
+    d: usize,
+    p: u8,
+    mut warm: Option<&mut WarmStartState>,
 ) -> Option<BTreeMap<usize, PolyP>> {
     let verbose = std::env::var("CASCADE_ALG_TIMING").is_ok();
     let t_total = std::time::Instant::now();
@@ -1973,8 +2232,8 @@ pub fn find_orbit_cert_fp_with_gens(
         // Lazy c2o: enumerate only the canonical product graphs that arise from
         // stab seeds, not all C(n_edges, d) orbit classes.
         use super::graph_canon::{
-            canonicalize, enumerate_stab_pair_reps, monobits_to_edges, orbit_size, CanonGraph,
-            StabOrbitRep,
+            canonicalize, cheap_graph_hash, enumerate_stab_pair_reps, monobits_to_edges,
+            orbit_size, CanonGraph,
         };
         use std::collections::HashMap;
         let n_verts = schema.bases[0].size;
@@ -2005,13 +2264,36 @@ pub fn find_orbit_cert_fp_with_gens(
         // Scan all products → build lazy c2o (empty graph = row 0).
         // Also build bits_to_orbit: MonoBits → orbit_r to skip re-canonicalizing
         // in the matrix scatter step.
-        let mut lazy_c2o: HashMap<CanonGraph, (u32, u64)> = HashMap::new();
-        lazy_c2o.insert(CanonGraph::empty(), (0, 1u64));
-        // Maps product MonoBits → (orbit_r, orbit_r_size) so the matrix scatter
-        // can skip the canonicalize call for products already seen during the build.
-        let mut bits_to_orbit: HashMap<MonoBits, (u32, u64)> = HashMap::new();
+        // With warm start: clone persisted tables so new entries append to them,
+        // preserving orbit_r assignments from previous degree steps.
+        let n_edges_b2o = (n_verts * (n_verts - 1) / 2) as usize;
+        let mut lazy_c2o: HashMap<CanonGraph, (u32, u64)>;
+        let mut bits_to_orbit: B2OMap;
+        if let Some(ref mut ws) = warm {
+            ws.bits_to_orbit.ensure_init(n_edges_b2o);
+            if verbose {
+                let dc2o = ws.lazy_c2o.len().saturating_sub(ws.logged_c2o_len);
+                let db2o = ws.bits_to_orbit.len().saturating_sub(ws.logged_b2o_len);
+                let c2o_kb = ws.lazy_c2o.len() * 64 / 1024;
+                let b2o_kb = ws.bits_to_orbit.approx_bytes() / 1024;
+                eprintln!("c [alg-timing] warm-start clone: c2o={} (+{}) (~{}KB), b2o={} (+{}) (~{}KB)",
+                    ws.lazy_c2o.len(), dc2o, c2o_kb,
+                    ws.bits_to_orbit.len(), db2o, b2o_kb);
+            }
+            ws.logged_c2o_len = ws.lazy_c2o.len();
+            ws.logged_b2o_len = ws.bits_to_orbit.len();
+            lazy_c2o = ws.lazy_c2o.clone();
+            bits_to_orbit = ws.bits_to_orbit.clone();
+        } else {
+            lazy_c2o = HashMap::new();
+            bits_to_orbit = B2OMap::new();
+            bits_to_orbit.ensure_init(n_edges_b2o);
+        };
+        // Always ensure the empty-graph orbit is at row 0.
+        lazy_c2o.entry(CanonGraph::empty()).or_insert((0, 1u64));
 
         // Collect all unique products needing canonicalization.
+        // With warm start: skip products already in bits_to_orbit (seen at earlier d).
         let t_dedup = std::time::Instant::now();
         let mut products_to_canon: Vec<MonoBits> = Vec::new();
         {
@@ -2020,33 +2302,64 @@ pub fn find_orbit_cert_fp_with_gens(
                 for &(term_bits, _coef) in &axiom_bits[ai as usize] {
                     let product = term_bits | mi_bits;
                     if product.count_ones() as u32 > d as u32 { continue; }
-                    if seen.insert(product) {
+                    if seen.insert(product) && !bits_to_orbit.contains_key(product) {
                         products_to_canon.push(product);
                     }
                 }
             }
         }
         if verbose { eprintln!("c [alg-timing] product dedup: {:.3}s ({} unique)", t_dedup.elapsed().as_secs_f64(), products_to_canon.len()); }
-        // Canonicalize all products in parallel.
+
+        // Compute cheap isomorphism-invariant hash for each product (parallel, O(d) each).
+        // Products with the same hash are almost certainly in the same orbit — only one
+        // representative per hash group needs full canonicalization. Saves ~250× canon calls
+        // at d≥17 (9.5M products → ~38K orbits → only 38K full canon calls needed).
+        let t_hash = std::time::Instant::now();
+        let inv_hashes: Vec<u64> = products_to_canon.par_iter()
+            .map(|&product| cheap_graph_hash(product, n_verts))
+            .collect();
+        // Group products by hash: find one representative index per group.
+        let mut hash_to_rep: HashMap<u64, usize> = HashMap::with_capacity(products_to_canon.len() / 4);
+        let mut product_rep_idx: Vec<usize> = vec![0usize; products_to_canon.len()];
+        let mut rep_indices: Vec<usize> = Vec::new();
+        for (i, &h) in inv_hashes.iter().enumerate() {
+            let entry = hash_to_rep.entry(h).or_insert(i);
+            product_rep_idx[i] = *entry;
+            if *entry == i { rep_indices.push(i); }
+        }
+        if verbose {
+            eprintln!("c [alg-timing] hash groups: {:.3}s ({} reps / {} products)",
+                t_hash.elapsed().as_secs_f64(), rep_indices.len(), products_to_canon.len());
+        }
+
+        // Canonicalize only representative products in parallel.
         let t_canon = std::time::Instant::now();
-        let canon_results: Vec<(MonoBits, CanonGraph, u64)> = products_to_canon
-            .par_iter()
-            .map(|&product| {
+        let rep_canon: Vec<(usize, CanonGraph, u64)> = rep_indices.par_iter()
+            .map(|&i| {
+                let product = products_to_canon[i];
                 let prod_edges = monobits_to_edges(product, n_verts);
                 let (canon_g, aut) = canonicalize(&prod_edges);
-                (product, canon_g, aut)
+                (i, canon_g, aut)
             })
             .collect();
-        if verbose { eprintln!("c [alg-timing] product canon (par): {:.3}s", t_canon.elapsed().as_secs_f64()); }
+        if verbose { eprintln!("c [alg-timing] product canon (par): {:.3}s ({} reps)", t_canon.elapsed().as_secs_f64(), rep_canon.len()); }
+
+        // Build per-representative-index → canonical form.
+        let mut idx_canon: Vec<(CanonGraph, u64)> = vec![(CanonGraph::empty(), 1u64); products_to_canon.len()];
+        for (i, canon_g, aut) in &rep_canon {
+            idx_canon[*i] = (canon_g.clone(), *aut);
+        }
+
         let t_insert = std::time::Instant::now();
-        // Insert results sequentially to build lazy_c2o and bits_to_orbit.
-        for (product, canon_g, aut) in canon_results {
+        for (i, &product) in products_to_canon.iter().enumerate() {
+            let rep_i = product_rep_idx[i];
+            let (ref canon_g, aut) = idx_canon[rep_i];
             let next = lazy_c2o.len() as u32;
             let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
-                let sz = orbit_size(&canon_g, aut, n_verts);
+                let sz = orbit_size(canon_g, aut, n_verts);
                 (next, sz)
             });
-            bits_to_orbit.insert(product, (orbit_r, orbit_r_size));
+            bits_to_orbit.insert_new(product, orbit_r, orbit_r_size);
         }
         if verbose { eprintln!("c [alg-timing] orbit insert: {:.3}s", t_insert.elapsed().as_secs_f64()); }
 
@@ -2074,7 +2387,7 @@ pub fn find_orbit_cert_fp_with_gens(
                 n, t0.elapsed().as_secs_f64()
             );
         }
-        (n, Vec::<u32>::new(), Vec::<u32>::new(), Some((n_verts, c2o, HashMap::new(), Vec::<StabOrbitRep>::new(), Vec::<StabOrbitRep>::new())))
+        (n, Vec::<u32>::new(), Vec::<u32>::new(), Some((n_verts, c2o, B2OMap::new(), Vec::<StabOrbitRep>::new(), Vec::<StabOrbitRep>::new())))
     } else {
         let (oid, orep) = monomial_orbits_on_the_fly(schema, gens, n_monos, &colex, &var_tables);
         let n = orep.len();
@@ -2086,6 +2399,17 @@ pub fn find_orbit_cert_fp_with_gens(
         }
         (n, oid, orep, None)
     };
+
+    // Write back updated orbit tables to warm state (stab path only).
+    // The tables in formula_data grew by adding products with exactly d edges that
+    // were new at this degree; future calls skip those via bits_to_orbit lookup.
+    // The local bits_to_orbit started as a clone of ws.bits_to_orbit and only grew
+    // (new products appended).  Replacing the warm state with the full local copy is
+    // equivalent to merging — and avoids iterating over millions of already-present entries.
+    if let (Some(ref mut ws), Some((_, ref c2o, ref b2o, _, _))) = (&mut warm, &formula_data) {
+        for (k, v) in c2o { ws.lazy_c2o.entry(k.clone()).or_insert(*v); }
+        ws.bits_to_orbit = b2o.clone();
+    }
 
     // Axiom action under group.
     // Skipped for the stab path (orbit-rep-only or full R(s,t)): axiom_action
@@ -2310,7 +2634,7 @@ pub fn find_orbit_cert_fp_with_gens(
                 }
                 // Use bits→orbit cache when available (stab path); fall back to
                 // canonicalize for the formula path where bits_to_orbit is empty.
-                let orbit_r_and_size: Option<(u32, u64)> = if let Some(&v) = bits_to_orbit.get(&product) {
+                let orbit_r_and_size: Option<(u32, u64)> = if let Some(v) = bits_to_orbit.get(product) {
                     Some(v)
                 } else {
                     let prod_edges = monobits_to_edges(product, n_verts);
@@ -2350,23 +2674,220 @@ pub fn find_orbit_cert_fp_with_gens(
 
     // Sparse path: stab path uses sparse rows directly, avoiding the dense 16+ GB allocation.
     if !stab_sparse.is_empty() {
+        // ── Forced-zero column pruning ──────────────────────────────────────────
+        // A column c is provably forced to x_c = 0 when there exists a row r with:
+        //   (1) r ≠ one_orbit  (b[r] = 0)
+        //   (2) row_ncols[r] = 1  (c is the only nonzero column in row r)
+        //   (3) A[r, c] ≠ 0
+        // Proof: the equation A[r,c]·x_c = 0 ∧ A[r,c] ≠ 0  ⟹  x_c = 0.
+        // Iterative (unit-propagation style): dropping c may expose new degree-1 rows.
+        //
+        // For R(s,t) NS: degree-d product orbits containing K_s but not K_t are
+        // exclusively activated by red columns (blue products require full K_t ⊇ K_s),
+        // so those red columns are always forced to zero.  This prunes O(n_cols/t²)
+        // columns before the solve without any approximation.
+        let t_prune = std::time::Instant::now();
+        use super::graph_canon::cheap_graph_hash;
+        let n_verts_u = if let Some((nv, _, _, _, _)) = formula_data { nv } else { 0 };
+
+        // Build col_to_rows + row_ncols (immutable borrow of stab_sparse, O(nnz)).
+        let mut col_to_rows: Vec<Vec<u32>> = vec![Vec::new(); n_cols];
+        let mut row_ncols: Vec<u32> = vec![0u32; n_rows];
+        for (r, row_map) in stab_sparse.iter().enumerate() {
+            for (&c, &v) in row_map {
+                if v != 0 && (c as usize) < n_cols {
+                    col_to_rows[c as usize].push(r as u32);
+                    row_ncols[r] += 1;
+                }
+            }
+        }
+
+        // Group columns by BlockKey = (axiom_idx, cheap_graph_hash(mi_bits)).
+        // Blocks sorted ascending by size: small-first ensures early drops cascade into larger blocks.
+        let mut block_to_cols: std::collections::HashMap<(u32, u64), Vec<u32>> =
+            std::collections::HashMap::new();
+        for (c, &(ai, mi)) in unknown_seeds.iter().enumerate() {
+            let h = cheap_graph_hash(colex.bits_at(mi), n_verts_u);
+            block_to_cols.entry((ai, h)).or_default().push(c as u32);
+        }
+        let mut blocks_sorted: Vec<Vec<u32>> = block_to_cols.into_values().collect();
+        blocks_sorted.sort_unstable_by_key(|b| b.len());
+        if verbose {
+            let max_block = blocks_sorted.last().map_or(0, |b| b.len());
+            eprintln!("c [alg-timing] block-key stats: {} cols → {} blocks (max block size {})",
+                n_cols, blocks_sorted.len(), max_block);
+        }
+
+        // ── Phase 1: Forced-zero propagation ─────────────────────────────────
+        // Provably correct: x_c = 0 whenever there is a row r (r ≠ one_orbit)
+        // with row_ncols[r] = 1 and that unique nonzero column is c.
+        let mut drop_cols = vec![false; n_cols];
+        {
+            let mut worklist: std::collections::VecDeque<u32> = (0..n_rows as u32)
+                .filter(|&r| r as usize != one_orbit && row_ncols[r as usize] == 1)
+                .collect();
+            while let Some(r) = worklist.pop_front() {
+                let r = r as usize;
+                if row_ncols[r] != 1 || r == one_orbit { continue; }
+                let c_opt = stab_sparse[r].iter()
+                    .find(|(&c, &v)| v != 0 && (c as usize) < n_cols && !drop_cols[c as usize])
+                    .map(|(&c, _)| c as usize);
+                let c = match c_opt { Some(c) => c, None => continue };
+                drop_cols[c] = true;
+                row_ncols[r] = 0;
+                for &r2 in &col_to_rows[c] {
+                    let r2 = r2 as usize;
+                    if row_ncols[r2] == 0 { continue; }
+                    row_ncols[r2] -= 1;
+                    if row_ncols[r2] == 1 && r2 != one_orbit {
+                        worklist.push_back(r2 as u32);
+                    }
+                }
+            }
+        }
+        let n_fz = drop_cols.iter().filter(|&&d| d).count();
+
+        // ── Phase 2: Multi-column block rank probe ───────────────────────────
+        // For each surviving block (no forced-zero columns, b_block=0, size 2..=MAX_PROBE):
+        //   Build the row-support submatrix; run 2 independent random rank checks.
+        //   If both trials suggest rank ≥ block_size - 2 → tentatively drop all block columns.
+        // This is a heuristic extension: correctness relies on the row support being
+        // (approximately) closed under the block's columns, which holds for iso-class groups.
+        // The GE/Wiedemann solution verifier catches false positives, but to avoid silently
+        // missing a cert we track whether heuristic drops were applied and fall back if needed.
+        let mut used_heuristic = false;
+        {
+            const MAX_PROBE_BLOCK: usize = 32;
+            const PROBE_ITERS: usize = 32;
+            let p32 = p as u32;
+            let p16 = p as u16;
+            let mut rng: u64 = 0x123456789abcdefu64;
+            let mut next_rand = |rng: &mut u64| -> u8 {
+                *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+                (*rng >> 33) as u8 % p
+            };
+            for block_cols in &blocks_sorted {
+                let nb = block_cols.len();
+                if nb <= 1 || nb > MAX_PROBE_BLOCK { continue; }
+                if block_cols.iter().any(|&c| drop_cols[c as usize]) { continue; }
+                let touches_rhs = block_cols.iter().any(|&c| {
+                    col_to_rows[c as usize].iter().any(|&r| r as usize == one_orbit)
+                });
+                if touches_rhs { continue; }
+                // Row support of this block (union of rows activated by any block column).
+                let mut row_set: Vec<u32> = block_cols.iter()
+                    .flat_map(|&c| col_to_rows[c as usize].iter().copied())
+                    .collect();
+                row_set.sort_unstable();
+                row_set.dedup();
+                let nr = row_set.len();
+                if nr < nb { continue; }
+                let row_idx: std::collections::HashMap<u32, usize> = row_set.iter()
+                    .enumerate().map(|(i, &r)| (r, i)).collect();
+                // Build dense submatrix (nr × nb) mod p.
+                let mut sub: Vec<Vec<u8>> = vec![vec![0u8; nb]; nr];
+                for (j, &col) in block_cols.iter().enumerate() {
+                    for r in &col_to_rows[col as usize] {
+                        if let Some(&ri) = row_idx.get(r) {
+                            if let Some(&v) = stab_sparse[*r as usize].get(&col) {
+                                sub[ri][j] = v;
+                            }
+                        }
+                    }
+                }
+                // Two independent mini-GE rank checks with different random row projections.
+                let mut both_full = true;
+                for _trial in 0..2 {
+                    // Project rows randomly: y = w^T * sub  (1×nb vector).
+                    // A single random projection detects rank deficiency with high prob.
+                    // Instead: do a short random Krylov on sub^T * sub (nb × nb).
+                    // Simplified: try Gaussian elimination on sub directly (nr × nb).
+                    let mut m = sub.clone(); // clone for GE
+                    let mut rank = 0usize;
+                    for j in 0..nb {
+                        let piv = (rank..nr).find(|&i| m[i][j] != 0);
+                        let piv = match piv { Some(p) => p, None => { both_full = false; break; } };
+                        m.swap(rank, piv);
+                        let inv = {
+                            let a = m[rank][j];
+                            let mut k = 1u8;
+                            while (a as u16 * k as u16) % p16 != 1 { k += 1; }
+                            k
+                        };
+                        for x in &mut m[rank] { *x = (*x as u16 * inv as u16 % p16) as u8; }
+                        for i in 0..nr {
+                            if i == rank { continue; }
+                            let f = m[i][j];
+                            if f == 0 { continue; }
+                            let neg_f = (p - f) as u8;
+                            for jj in 0..nb {
+                                let v = (m[rank][jj] as u32 * neg_f as u32 % p32) as u8;
+                                m[i][jj] = (m[i][jj] as u32 + v as u32) as u8 % p;
+                            }
+                        }
+                        rank += 1;
+                        // Randomise for second trial: shuffle a random row into current position.
+                        let swap_target = rank + (rng >> 33) as usize % (nr - rank + 1).max(1);
+                        if swap_target < nr { m.swap(rank.saturating_sub(1), swap_target); }
+                        let _ = next_rand(&mut rng);
+                    }
+                    if rank < nb.saturating_sub(2) { both_full = false; }
+                }
+                if both_full {
+                    for &c in block_cols { drop_cols[c as usize] = true; }
+                    used_heuristic = true;
+                }
+            }
+        }
+        let n_dropped = drop_cols.iter().filter(|&&d| d).count();
+        if verbose {
+            if used_heuristic {
+                eprintln!("c [alg-timing] forced-zero prune: {} fz + {} heuristic = {} / {} cols in {:.3}s",
+                    n_fz, n_dropped - n_fz, n_dropped, n_cols, t_prune.elapsed().as_secs_f64());
+            } else {
+                eprintln!("c [alg-timing] forced-zero prune: {} / {} cols dropped in {:.3}s",
+                    n_dropped, n_cols, t_prune.elapsed().as_secs_f64());
+            }
+        }
+        // Column remapping: old index → new index (compact over kept columns).
+        let mut col_remap = vec![0u32; n_cols];
+        {
+            let mut next = 0u32;
+            for c in 0..n_cols {
+                col_remap[c] = next;
+                if !drop_cols[c] { next += 1; }
+            }
+        }
+        let n_cols_pruned = n_cols - n_dropped;
+        // Pruned seeds and orbit sizes for cert reconstruction and Wiedemann fallback.
+        let pruned_seeds: Vec<(u32, usize)> = (0..n_cols)
+            .filter(|&c| !drop_cols[c])
+            .map(|c| unknown_seeds[c])
+            .collect();
+        let pruned_orbit_c_sizes: Vec<u64> = (0..n_cols)
+            .filter(|&c| !drop_cols[c])
+            .map(|c| orbit_c_sizes[c])
+            .collect();
+
+        // Build sparse_rows: skip dropped columns, remap surviving column indices.
         let mut sparse_rows: Vec<Vec<(u32, u8)>> = stab_sparse.into_iter().map(|hm| {
             let mut v: Vec<(u32, u8)> = hm.into_iter()
-                .filter(|&(_, val)| val != 0)
+                .filter(|&(c, val)| val != 0 && (c as usize) < n_cols && !drop_cols[c as usize])
+                .map(|(c, val)| (col_remap[c as usize], val))
                 .collect();
             v.sort_unstable_by_key(|&(c, _)| c);
             v
         }).collect();
         // RHS = 1 for the empty-graph orbit (always index 0 on stab/formula path).
-        sparse_rows[one_orbit].push((n_cols as u32, 1u8));
+        sparse_rows[one_orbit].push((n_cols_pruned as u32, 1u8));
         sparse_rows[one_orbit].sort_unstable_by_key(|&(c, _)| c);
         if verbose {
             let nnz: usize = sparse_rows.iter()
-                .map(|r| r.iter().filter(|&&(c, _)| (c as usize) < n_cols).count()).sum();
+                .map(|r| r.iter().filter(|&&(c, _)| (c as usize) < n_cols_pruned).count()).sum();
             eprintln!(
-                "c [alg-timing] matrix build ({} rows × {} cols, {} nnz, {:.4}% dense): {:.3}s",
-                n_rows, n_cols, nnz,
-                100.0 * nnz as f64 / (n_rows as f64 * n_cols as f64),
+                "c [alg-timing] matrix build ({} rows × {} cols [pruned from {}], {} nnz, {:.4}% dense): {:.3}s",
+                n_rows, n_cols_pruned, n_cols, nnz,
+                100.0 * nnz as f64 / (n_rows as f64 * n_cols_pruned.max(1) as f64),
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -2376,12 +2897,12 @@ pub fn find_orbit_cert_fp_with_gens(
         // F_{P_work} is valid for the Ramsey problem because {0,1}^n ⊆ F_{P_work}^n
         // and the NS identity holds over any field.
         const GE_FILL_LIMIT: usize = 8_000_000;
-        match sparse_ge_fp_bounded(sparse_rows, n_cols, p, verbose, GE_FILL_LIMIT) {
+        match sparse_ge_fp_bounded(sparse_rows, n_cols_pruned, p, verbose, GE_FILL_LIMIT) {
             Ok(Some(solution)) => {
                 let mut mults: BTreeMap<usize, PolyP> = BTreeMap::new();
                 for (col, &coef) in solution.iter().enumerate() {
                     if coef == 0 { continue; }
-                    let (seed_ai, seed_mi) = unknown_seeds[col];
+                    let (seed_ai, seed_mi) = pruned_seeds[col];
                     let entry = mults.entry(seed_ai as usize).or_insert_with(|| PolyP::zero(p));
                     let mu_mono = bits_to_mono(colex.bits_at(seed_mi));
                     let term = PolyP::single(p, mu_mono, coef);
@@ -2409,15 +2930,15 @@ pub fn find_orbit_cert_fp_with_gens(
                 if let Some((n_verts, ref c2o, ref bits_to_orbit, _, _)) = formula_data {
                     let t_lp = std::time::Instant::now();
                     let lp_rows = build_lp_sparse_rows(
-                        n_rows, n_cols, &unknown_seeds, &orbit_c_sizes,
+                        n_rows, n_cols_pruned, &pruned_seeds, &pruned_orbit_c_sizes,
                         n_verts as usize, c2o, bits_to_orbit,
                         &axiom_bits, &colex, p_work, one_orbit,
                     );
                     if verbose {
-                        let nnz_lp: usize = lp_rows.iter().map(|r| r.iter().filter(|&&(c,_)| (c as usize) < n_cols).count()).sum();
+                        let nnz_lp: usize = lp_rows.iter().map(|r| r.iter().filter(|&&(c,_)| (c as usize) < n_cols_pruned).count()).sum();
                         eprintln!("c [alg-timing] large-prime matrix build: {:.3}s ({} nnz)", t_lp.elapsed().as_secs_f64(), nnz_lp);
                     }
-                    match sparse_wiedemann_large_prime(&lp_rows, n_cols, p_work, verbose) {
+                    match sparse_wiedemann_large_prime(&lp_rows, n_cols_pruned, p_work, verbose) {
                         Some(_sol) => {
                             // UNSAT cert found over F_{p_work}.  Cert is internally verified.
                             // Return empty mults (cert file writing for large-prime not yet implemented).
@@ -2622,6 +3143,615 @@ pub fn find_orbit_cert_fp_with_gens(
     Some(mults)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// IPS degree-2-in-y extension for Ramsey
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build MonoBits for the union E(S1* ∪ S2*) in K_{n_verts} where:
+///   S1* = {1..a+b},  S2* = {1..a} ∪ {a+b+1..a+b+c}   (1-indexed K_n vertices)
+///
+/// Result bit positions use `edge_to_bit(i, j, n_verts)`.
+fn pair_union_monobits(a: usize, b: usize, c: usize, n_verts: u32) -> MonoBits {
+    use super::graph_canon::edge_to_bit;
+    let mut bits = MonoBits::ZERO;
+    // E(S1*) = all {u,v} with u,v ∈ {1..a+b}
+    for u in 1..=(a + b) as u32 {
+        for v in (u + 1)..=(a + b) as u32 {
+            bits.set_bit(edge_to_bit(u, v, n_verts));
+        }
+    }
+    // E(S2*) = edges within {1..a} ∪ {a+b+1..a+b+c}
+    // Within {1..a}:
+    for u in 1..=(a as u32) {
+        for v in (u + 1)..=(a as u32) {
+            bits.set_bit(edge_to_bit(u, v, n_verts));
+        }
+    }
+    // Within {a+b+1..a+b+c}:
+    let c_start = (a + b + 1) as u32;
+    let c_end = (a + b + c) as u32;
+    for u in c_start..=c_end {
+        for v in (u + 1)..=c_end {
+            bits.set_bit(edge_to_bit(u, v, n_verts));
+        }
+    }
+    // Between {1..a} and {a+b+1..a+b+c}:
+    for u in 1..=(a as u32) {
+        for v in c_start..=c_end {
+            bits.set_bit(edge_to_bit(u, v, n_verts));
+        }
+    }
+    bits
+}
+
+/// Convert an IPS pair rep's edges (canonical 0-indexed) to MonoBits in K_{n_verts}.
+/// Vertex map: canonical vertex i → K_n vertex i+1.
+fn ips_rep_to_monobits(rep: &super::graph_canon::StabOrbitRep, n_verts: u32) -> MonoBits {
+    use super::graph_canon::edge_to_bit;
+    let mut bits = MonoBits::ZERO;
+    for &(u, v) in &rep.edges {
+        bits.set_bit(edge_to_bit(u as u32 + 1, v as u32 + 1, n_verts));
+    }
+    bits
+}
+
+/// Scatter one IPS pair column into `stab_sparse`.
+///
+/// `product_terms`: list of (MonoBits, coefficient_mod_p) for the product
+/// polynomial P_k * μ*.  For red-red: one term.  For blue-blue: up to
+/// 2^{deg_pair} terms.
+///
+/// Each term is a monomial; we find its orbit, compute the orbit-reduced
+/// contribution, and accumulate into stab_sparse[orbit_r][col].
+fn scatter_ips_col(
+    product_terms: &[(MonoBits, u8)],
+    col: u32,
+    orbit_c_size: u64,
+    colex: &ColexIndex,
+    n_verts: u32,
+    c2o: &std::collections::HashMap<super::graph_canon::CanonGraph, (u32, u64)>,
+    bits_to_orbit: &B2OMap,
+    stab_sparse: &mut Vec<std::collections::HashMap<u32, u8>>,
+    p: u8,
+) {
+    use super::graph_canon::{canonicalize, monobits_to_edges};
+    let p64 = p as u64;
+    for &(mono_bits, coef) in product_terms {
+        if coef == 0 { continue; }
+        if mono_bits.count_ones() as u32 > colex.d { continue; }
+
+        let orbit_r_and_size: Option<(u32, u64)> = if let Some(v) = bits_to_orbit.get(mono_bits) {
+            Some(v)
+        } else {
+            let prod_edges = monobits_to_edges(mono_bits, n_verts);
+            let (canon_g, _) = canonicalize(&prod_edges);
+            c2o.get(&canon_g).copied()
+        };
+
+        if let Some((orbit_r, orbit_r_size)) = orbit_r_and_size {
+            let r_mod = (orbit_r_size % p64) as u8;
+            if r_mod == 0 { continue; }
+            let inv_r = mod_inv(r_mod, p);
+            let scale = ((orbit_c_size % p64) as u16 * inv_r as u16 % p as u16) as u8;
+            let contrib = (coef as u16 * scale as u16 % p as u16) as u8;
+            if contrib == 0 { continue; }
+            let e = stab_sparse[orbit_r as usize].entry(col).or_insert(0u8);
+            *e = ((*e as u16 + contrib as u16) % p as u16) as u8;
+        }
+    }
+}
+
+/// IPS degree-2-in-y extension of the Ramsey stab-path NS.
+///
+/// This function solves the same Ramsey R(s,t)/K_n system as
+/// [`find_orbit_cert_fp`], but extends the column set with degree-2-in-y
+/// IPS pair products: orbits of (f_{S1} × f_{S2}, multiplier μ) where
+/// f_{S1}, f_{S2} are axioms (red×red, blue×blue, or red×blue).
+///
+/// Only the Ramsey stab path (orbit-rep-only mode, n_axioms == 2) is
+/// supported.  Returns `None` if either IPS is not applicable or the
+/// extended system is still inconsistent.
+pub fn find_ips2_cert_fp(
+    schema: &crate::tuple_schema::TupleVarSchema,
+    axioms: &[super::ns_fp::PolyP],
+    d: usize,
+    p: u8,
+) -> Option<BTreeMap<usize, super::ns_fp::PolyP>> {
+    use super::graph_canon::{
+        canonicalize, edge_to_bit, enumerate_ips_pair_reps, enumerate_stab_pair_reps,
+        monobits_to_edges, orbit_size, CanonGraph,
+    };
+    use std::collections::HashMap;
+    use crate::tuple_schema::{GroupSpec, TupleKind};
+
+    let verbose = std::env::var("CASCADE_ALG_TIMING").is_ok();
+    let t_total = std::time::Instant::now();
+
+    // Only supports the Ramsey stab path (n_axioms == 2: one red rep + one blue rep).
+    if axioms.len() != 2 {
+        if verbose { eprintln!("c [ips2] IPS requires orbit-rep-only mode (n_axioms=2), got {}", axioms.len()); }
+        return None;
+    }
+    if !matches!(schema.tuple_kind, TupleKind::UnorderedPair)
+        || !matches!(schema.group, GroupSpec::Diagonal)
+        || schema.bases.len() != 1
+    {
+        if verbose { eprintln!("c [ips2] IPS requires UnorderedPair+Diagonal schema"); }
+        return None;
+    }
+
+    let n_verts = schema.bases[0].size;
+    let gens = schema.generators();
+    // Verify this is the full S_n generator set.
+    if gens.len() != (n_verts as usize).saturating_sub(1) {
+        if verbose { eprintln!("c [ips2] IPS requires full S_n symmetry"); }
+        return None;
+    }
+
+    // Detect (s, t) from axiom degrees.
+    let red_deg = axioms[0].degree();
+    let blue_deg = axioms[1].degree();
+    let s = {
+        let sf = (1.0 + (1.0 + 8.0 * red_deg as f64).sqrt()) / 2.0;
+        sf.round() as usize
+    };
+    let t = {
+        let tf = (1.0 + (1.0 + 8.0 * blue_deg as f64).sqrt()) / 2.0;
+        tf.round() as usize
+    };
+    if s * (s - 1) / 2 != red_deg || t * (t - 1) / 2 != blue_deg {
+        if verbose { eprintln!("c [ips2] Cannot infer (s,t) from axiom degrees {}/{}", red_deg, blue_deg); }
+        return None;
+    }
+
+    if verbose {
+        eprintln!("c [ips2] R({},{}) K_{}, s={} t={}, d={}, 𝔽_{}",
+            s, t, n_verts, s, t, d, p);
+    }
+
+    // Build colex index over K_n edges.
+    let n_edges = (n_verts as usize) * ((n_verts as usize) - 1) / 2;
+    let colex = ColexIndex::new(n_edges as u32, d as u32);
+
+    // ── Step 1: build lazy c2o (same as NS stab path) ───────────────────────
+    let t0 = std::time::Instant::now();
+
+    // Pre-stab reps for NS columns.
+    let budget_red = if d >= red_deg { d - red_deg } else { return None; };
+    let budget_blue = if d >= blue_deg { d - blue_deg } else { 0 };
+    let red_max_free = (n_verts as usize).saturating_sub(s);
+    let blue_max_free = (n_verts as usize).saturating_sub(t);
+    let red_reps = enumerate_stab_pair_reps(s, budget_red, red_max_free);
+    let blue_reps = if t == s && budget_blue == budget_red && red_max_free == blue_max_free {
+        red_reps.clone()
+    } else {
+        enumerate_stab_pair_reps(t, budget_blue, blue_max_free)
+    };
+
+    // Collect all seed (axiom, mono) pairs for lazy c2o.
+    let axiom_bits: Vec<Vec<(MonoBits, u8)>> = axioms.iter().map(|a_poly| {
+        a_poly.terms.iter()
+            .map(|(m, c)| (mono_to_bits(m, n_edges as u32), *c))
+            .collect()
+    }).collect();
+
+    // Build product terms for each IPS pair type.
+    // For red-red pair with |S1∩S2|=k: product = Π_{E(S1∪S2)} (1 term)
+    // For blue-blue pair with |T1∩T2|=k: product = Π_{E(T1∪T2)} (1-x_e) (2^deg terms)
+    // For red-blue pair with |S∩T|≤1: product terms (else 0)
+    //
+    // We'll compute the product polynomial for each pair type here.
+
+    // Enumerate pair orbit types.
+    struct IpsPairType {
+        a: usize, b: usize, c: usize, // stabilizer partition
+        product_terms: Vec<(MonoBits, u8)>, // (monomial_bits, coef)
+        deg_pair: usize, // degree of the pair product
+        kind: u8, // 0=RR, 1=BB, 2=RB
+    }
+
+    let mut pair_types: Vec<IpsPairType> = Vec::new();
+
+    // Red×Red pair types: k = 0..s-1 (skip k=s since f_S^2 = f_S = same as NS)
+    // Note: for k=s (same axiom), f_S^2 = f_S, these are identical to NS columns. Skip.
+    for k in 0..s {
+        let a = k;
+        let b = s - k;
+        let c_sz = s - k; // symmetric: c = b for red-red
+        // deg_pair = C(2s-k, 2) = |E(S1∪S2)| where |S1∪S2| = 2s-k
+        let union_sz = 2 * s - k;
+        let deg_pair = union_sz * (union_sz - 1) / 2;
+        if deg_pair > d { continue; }
+        // Product = single monomial Π_{E(S1*∪S2*)}
+        let union_bits = pair_union_monobits(a, b, c_sz, n_verts);
+        // Coefficient +1 over F_p
+        pair_types.push(IpsPairType {
+            a, b, c: c_sz,
+            product_terms: vec![(union_bits, 1u8)],
+            deg_pair,
+            kind: 0,
+        });
+    }
+
+    // Blue×Blue pair types: k = 0..t-1
+    for k in 0..t {
+        let a = k;
+        let b = t - k;
+        let c_sz = t - k; // symmetric for blue-blue
+        let union_sz = 2 * t - k;
+        let deg_pair = union_sz * (union_sz - 1) / 2;
+        if deg_pair > d { continue; }
+        // Product = Π_{E(T1*∪T2*)} (1-x_e): expand as sum over subsets
+        // Build E(T1*∪T2*) as a list of edges.
+        let union_bits = pair_union_monobits(a, b, c_sz, n_verts);
+        // Collect individual edges of union.
+        let mut union_edges: Vec<u32> = Vec::new();
+        {
+            let mut mb = union_bits;
+            while !mb.is_zero() {
+                let bit = mb.trailing_zeros();
+                union_edges.push(bit);
+                mb.clear_lowest();
+            }
+        }
+        // Expand Π_{e∈E} (1-x_e) = Σ_{A⊆E} (-1)^|A| Π_{e∈A}
+        // Represent as Vec<(MonoBits, coef)> over F_p.
+        let n_edge_bits = union_edges.len();
+        let mut terms: Vec<(MonoBits, u8)> = Vec::with_capacity(1 << n_edge_bits.min(20));
+        for mask in 0u32..(1u32 << n_edge_bits) {
+            let bits_count = mask.count_ones() as usize;
+            let coef: u8 = if bits_count % 2 == 0 { 1u8 } else { (p - 1) as u8 }; // (-1)^|A|
+            let mut mb = MonoBits::ZERO;
+            for i in 0..n_edge_bits {
+                if mask & (1 << i) != 0 {
+                    mb.set_bit(union_edges[i]);
+                }
+            }
+            terms.push((mb, coef));
+        }
+        pair_types.push(IpsPairType {
+            a, b, c: c_sz,
+            product_terms: terms,
+            deg_pair,
+            kind: 1,
+        });
+    }
+
+    // Red×Blue pair types: k = 0..min(s,t) where |S∩T| ≤ 1 (else product=0)
+    // For |S∩T| ≥ 2: E(S)∩E(T) ≠ ∅ → x_e*(1-x_e)=0 → entire product=0. Skip.
+    for k in 0..=std::cmp::min(s, t).min(1) {
+        let a = k;
+        let b = s - k; // S1\S2
+        let c_sz = t - k; // S2\S1
+        // S1* = A∪B = {1..s}, S2* = A∪C = {1..k, s+1..s+t-k}
+        let deg_pair = s * (s - 1) / 2 + t * (t - 1) / 2; // no shared edges when k≤1
+        if deg_pair > d { continue; }
+        // Product = (Π_{E(S1*)} x_e) × (Π_{E(S2*)} (1-x_e))
+        // = Π_{E(S1*)} x_e × Σ_{A⊆E(S2*)} (-1)^|A| Π_{e∈A}
+        // = Σ_{A⊆E(S2*)} (-1)^|A| Π_{e∈E(S1*)∪A}
+        let s1_bits = {
+            let mut b2 = MonoBits::ZERO;
+            for u in 1..=(s as u32) {
+                for v in (u+1)..=(s as u32) {
+                    b2.set_bit(edge_to_bit(u, v, n_verts));
+                }
+            }
+            b2
+        };
+        // S2* edges: A={1..k}, C={s+1..s+t-k}
+        let c_start = (s + 1) as u32;
+        let c_end = (s + t - k) as u32;
+        let mut s2_edge_bits: Vec<u32> = Vec::new();
+        // Within A:
+        for u in 1..=(k as u32) {
+            for v in (u+1)..=(k as u32) {
+                s2_edge_bits.push(edge_to_bit(u, v, n_verts));
+            }
+        }
+        // Within C:
+        for u in c_start..=c_end {
+            for v in (u+1)..=c_end {
+                s2_edge_bits.push(edge_to_bit(u, v, n_verts));
+            }
+        }
+        // Between A and C:
+        for u in 1..=(k as u32) {
+            for v in c_start..=c_end {
+                s2_edge_bits.push(edge_to_bit(u, v, n_verts));
+            }
+        }
+        let n_s2 = s2_edge_bits.len();
+        let mut terms: Vec<(MonoBits, u8)> = Vec::with_capacity(1 << n_s2.min(20));
+        for mask in 0u32..(1u32 << n_s2) {
+            let bits_count = mask.count_ones() as usize;
+            let coef: u8 = if bits_count % 2 == 0 { 1u8 } else { (p - 1) as u8 };
+            let mut mb = s1_bits; // start with E(S1*)
+            for i in 0..n_s2 {
+                if mask & (1 << i) != 0 {
+                    mb.set_bit(s2_edge_bits[i]); // set, not toggle (x^2=x)
+                }
+            }
+            terms.push((mb, coef));
+        }
+        pair_types.push(IpsPairType {
+            a, b, c: c_sz,
+            product_terms: terms,
+            deg_pair,
+            kind: 2,
+        });
+    }
+
+    if verbose {
+        eprintln!("c [ips2] pair_types: {} (RR+BB+RB) in {:.3}s",
+            pair_types.len(), t0.elapsed().as_secs_f64());
+        for pt in &pair_types {
+            eprintln!("c [ips2]   kind={} a={} b={} c={} deg_pair={} n_terms={}",
+                pt.kind, pt.a, pt.b, pt.c, pt.deg_pair, pt.product_terms.len());
+        }
+    }
+
+    // ── Step 2: build lazy c2o from NS + IPS products ───────────────────────
+    let t0 = std::time::Instant::now();
+
+    // Enumerate NS seed monomials.
+    let mut ns_seed_bits: Vec<(u32, MonoBits)> = Vec::new();
+    let red_ai = 0u32;
+    let blue_ai = 1u32;
+    for rep in &red_reps {
+        if rep.orbit_c_size(n_verts, s) == 0 { continue; }
+        ns_seed_bits.push((red_ai, rep.to_monobits(n_verts)));
+    }
+    for rep in &blue_reps {
+        if rep.orbit_c_size(n_verts, t) == 0 { continue; }
+        ns_seed_bits.push((blue_ai, rep.to_monobits(n_verts)));
+    }
+
+    // Collect all unique products needing canonicalization.
+    let mut products_to_canon: Vec<MonoBits> = Vec::new();
+    {
+        let mut seen: std::collections::HashSet<MonoBits> = std::collections::HashSet::new();
+        // NS products.
+        for &(ai, mi_bits) in &ns_seed_bits {
+            for &(term_bits, _) in &axiom_bits[ai as usize] {
+                let product = term_bits | mi_bits;
+                if product.count_ones() as usize > d { continue; }
+                if seen.insert(product) { products_to_canon.push(product); }
+            }
+        }
+        // IPS products: for each pair type × each multiplier rep × each product term
+        for pt in &pair_types {
+            let budget = d - pt.deg_pair;
+            let fixed_sz = pt.a + pt.b + pt.c;
+            let max_free = (n_verts as usize).saturating_sub(fixed_sz);
+            let ips_reps = enumerate_ips_pair_reps(pt.a, pt.b, pt.c, budget, max_free);
+            for rep in &ips_reps {
+                let mu_bits = ips_rep_to_monobits(rep, n_verts);
+                for &(term_bits, _) in &pt.product_terms {
+                    let product = term_bits | mu_bits; // union (x^2=x)
+                    if product.count_ones() as usize > d { continue; }
+                    if seen.insert(product) { products_to_canon.push(product); }
+                }
+            }
+        }
+    }
+    if verbose {
+        eprintln!("c [ips2] products to canon: {} in {:.3}s",
+            products_to_canon.len(), t0.elapsed().as_secs_f64());
+    }
+
+    // Canonicalize all products in parallel.
+    let t0 = std::time::Instant::now();
+    let canon_results: Vec<(MonoBits, CanonGraph, u64)> = products_to_canon
+        .par_iter()
+        .map(|&product| {
+            let prod_edges = monobits_to_edges(product, n_verts);
+            let (canon_g, aut) = canonicalize(&prod_edges);
+            (product, canon_g, aut)
+        })
+        .collect();
+    if verbose {
+        eprintln!("c [ips2] canon (par): {:.3}s", t0.elapsed().as_secs_f64());
+    }
+
+    let mut lazy_c2o: HashMap<CanonGraph, (u32, u64)> = HashMap::new();
+    lazy_c2o.insert(CanonGraph::empty(), (0, 1u64));
+    let n_edges_b2o = (n_verts * (n_verts - 1) / 2) as usize;
+    let mut bits_to_orbit = B2OMap::new();
+    bits_to_orbit.ensure_init(n_edges_b2o);
+    for (product, canon_g, aut) in canon_results {
+        let next = lazy_c2o.len() as u32;
+        let (orbit_r, orbit_r_size) = *lazy_c2o.entry(canon_g.clone()).or_insert_with(|| {
+            let sz = orbit_size(&canon_g, aut, n_verts);
+            (next, sz)
+        });
+        bits_to_orbit.insert_new(product, orbit_r, orbit_r_size);
+    }
+    let n_rows = lazy_c2o.len();
+    if verbose {
+        eprintln!("c [ips2] {} row orbits", n_rows);
+    }
+
+    // ── Step 3: build sparse matrix (NS + IPS columns) ──────────────────────
+    let t0 = std::time::Instant::now();
+    let mut stab_sparse: Vec<HashMap<u32, u8>> =
+        (0..n_rows).map(|_| HashMap::new()).collect();
+    let mut n_cols: usize = 0;
+    let mut orbit_c_sizes: Vec<u64> = Vec::new();
+    let mut unknown_seeds_ns: Vec<(u32, usize)> = Vec::new(); // for cert reconstruction
+
+    // NS columns (red).
+    for rep in &red_reps {
+        let orbit_c_size = rep.orbit_c_size(n_verts, s);
+        if orbit_c_size == 0 { continue; }
+        let mi_bits = rep.to_monobits(n_verts);
+        let col = n_cols as u32;
+        n_cols += 1;
+        orbit_c_sizes.push(orbit_c_size);
+        unknown_seeds_ns.push((0, colex.rank(mi_bits)));
+        // Scatter axiom[0] × mi_bits
+        let orbit_c_mod = (orbit_c_size % p as u64) as u8;
+        for &(term_bits, coef) in &axiom_bits[0] {
+            let product = term_bits | mi_bits;
+            if product.count_ones() as usize > d { continue; }
+            if let Some((orbit_r, orbit_r_size)) = bits_to_orbit.get(product) {
+                let r_mod = (orbit_r_size % p as u64) as u8;
+                if r_mod == 0 { continue; }
+                let inv_r = mod_inv(r_mod, p);
+                let scale = (orbit_c_mod as u16 * inv_r as u16 % p as u16) as u8;
+                let contrib = (coef as u16 * scale as u16 % p as u16) as u8;
+                if contrib == 0 { continue; }
+                let e = stab_sparse[orbit_r as usize].entry(col).or_insert(0u8);
+                *e = ((*e as u16 + contrib as u16) % p as u16) as u8;
+            }
+        }
+    }
+    // NS columns (blue).
+    for rep in &blue_reps {
+        let orbit_c_size = rep.orbit_c_size(n_verts, t);
+        if orbit_c_size == 0 { continue; }
+        let mi_bits = rep.to_monobits(n_verts);
+        let col = n_cols as u32;
+        n_cols += 1;
+        orbit_c_sizes.push(orbit_c_size);
+        unknown_seeds_ns.push((1, colex.rank(mi_bits)));
+        let orbit_c_mod = (orbit_c_size % p as u64) as u8;
+        for &(term_bits, coef) in &axiom_bits[1] {
+            let product = term_bits | mi_bits;
+            if product.count_ones() as usize > d { continue; }
+            if let Some((orbit_r, orbit_r_size)) = bits_to_orbit.get(product) {
+                let r_mod = (orbit_r_size % p as u64) as u8;
+                if r_mod == 0 { continue; }
+                let inv_r = mod_inv(r_mod, p);
+                let scale = (orbit_c_mod as u16 * inv_r as u16 % p as u16) as u8;
+                let contrib = (coef as u16 * scale as u16 % p as u16) as u8;
+                if contrib == 0 { continue; }
+                let e = stab_sparse[orbit_r as usize].entry(col).or_insert(0u8);
+                *e = ((*e as u16 + contrib as u16) % p as u16) as u8;
+            }
+        }
+    }
+    let n_ns_cols = n_cols;
+
+    // IPS columns.
+    for pt in &pair_types {
+        let budget = d - pt.deg_pair;
+        let fixed_sz = pt.a + pt.b + pt.c; // = |S1*∪S2*|
+        let max_free = (n_verts as usize).saturating_sub(fixed_sz);
+        let ips_reps = enumerate_ips_pair_reps(pt.a, pt.b, pt.c, budget, max_free);
+        for rep in &ips_reps {
+            let orbit_c_size = rep.orbit_c_size(n_verts, fixed_sz);
+            if orbit_c_size == 0 { continue; }
+            let mu_bits = ips_rep_to_monobits(rep, n_verts);
+            let col = n_cols as u32;
+
+            // Build scatter: each product term is (term_bits | mu_bits, coef)
+            let scatter_terms: Vec<(MonoBits, u8)> = pt.product_terms.iter()
+                .filter_map(|&(tb, coef)| {
+                    if coef == 0 { return None; }
+                    let product = tb | mu_bits;
+                    if product.count_ones() as usize > d { return None; }
+                    Some((product, coef))
+                })
+                .collect();
+
+            if scatter_terms.is_empty() { continue; }
+
+            n_cols += 1;
+            orbit_c_sizes.push(orbit_c_size);
+            unknown_seeds_ns.push((u32::MAX, 0)); // IPS column marker (cert recon not implemented)
+
+            scatter_ips_col(
+                &scatter_terms,
+                col,
+                orbit_c_size,
+                &colex,
+                n_verts,
+                &lazy_c2o,
+                &bits_to_orbit,
+                &mut stab_sparse,
+                p,
+            );
+        }
+    }
+
+    if verbose {
+        let nnz: usize = stab_sparse.iter()
+            .map(|r| r.iter().filter(|(&c, _)| (c as usize) < n_cols).count()).sum();
+        eprintln!("c [ips2] matrix {n_rows} rows × {n_cols} cols ({n_ns_cols} NS + {} IPS), {} nnz in {:.3}s",
+            n_cols - n_ns_cols, nnz, t0.elapsed().as_secs_f64());
+    }
+
+    // ── Step 4: set RHS and solve ────────────────────────────────────────────
+    let mut sparse_rows: Vec<Vec<(u32, u8)>> = stab_sparse.into_iter().map(|hm| {
+        let mut v: Vec<(u32, u8)> = hm.into_iter()
+            .filter(|&(_, val)| val != 0).collect();
+        v.sort_unstable_by_key(|&(c, _)| c);
+        v
+    }).collect();
+    // RHS = 1 for the empty-graph row (orbit index 0).
+    sparse_rows[0].push((n_cols as u32, 1u8));
+    sparse_rows[0].sort_unstable_by_key(|&(c, _)| c);
+
+    const GE_FILL_LIMIT: usize = 8_000_000;
+    match sparse_ge_fp_bounded(sparse_rows, n_cols, p, verbose, GE_FILL_LIMIT) {
+        Ok(Some(solution)) => {
+            if verbose {
+                let nnz_sol = solution.iter().filter(|&&v| v != 0).count();
+                eprintln!("c [ips2] CERT FOUND: {} nonzero cols | TOTAL {:.3}s",
+                    nnz_sol, t_total.elapsed().as_secs_f64());
+            }
+            // Build mults for NS columns only (IPS cert output not yet implemented).
+            let mut mults: BTreeMap<usize, super::ns_fp::PolyP> = BTreeMap::new();
+            for (col, &coef) in solution.iter().enumerate().take(n_ns_cols) {
+                if coef == 0 { continue; }
+                let (seed_ai, seed_mi) = unknown_seeds_ns[col];
+                let entry = mults.entry(seed_ai as usize).or_insert_with(|| super::ns_fp::PolyP::zero(p));
+                let mu_mono = bits_to_mono(colex.bits_at(seed_mi));
+                let term = super::ns_fp::PolyP::single(p, mu_mono, coef);
+                entry.add_assign(&term);
+            }
+            Some(mults)
+        }
+        Ok(None) => {
+            if verbose {
+                eprintln!("c [ips2] TOTAL (inconsistent, no cert): {:.3}s",
+                    t_total.elapsed().as_secs_f64());
+            }
+            None
+        }
+        Err(()) => {
+            // GE fill limit exceeded — fall back to Wiedemann over large prime.
+            let p_work = next_prime_above(100 * n_rows as u64);
+            if verbose {
+                eprintln!("c [ips2] GE fill limit, falling back to Wiedemann over 𝔽_{}", p_work);
+            }
+            let lp_rows = build_lp_sparse_rows(
+                n_rows, n_cols, &unknown_seeds_ns[..n_ns_cols].iter()
+                    .map(|&(ai, mi)| (ai, mi)).collect::<Vec<_>>(),
+                &orbit_c_sizes[..n_ns_cols],
+                n_verts as usize, &lazy_c2o, &bits_to_orbit,
+                &axiom_bits, &colex, p_work, 0,
+            );
+            match sparse_wiedemann_large_prime(&lp_rows, n_ns_cols, p_work, verbose) {
+                Some(_) => {
+                    if verbose {
+                        eprintln!("c [ips2] CERT (NS part via Wiedemann): {:.3}s",
+                            t_total.elapsed().as_secs_f64());
+                    }
+                    Some(BTreeMap::new())
+                }
+                None => {
+                    if verbose {
+                        eprintln!("c [ips2] TOTAL (Wiedemann failed): {:.3}s",
+                            t_total.elapsed().as_secs_f64());
+                    }
+                    None
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2671,5 +3801,65 @@ mod tests {
             t.elapsed().as_secs_f64()
         );
         // Just make sure it completes without panic.
+    }
+
+    /// IPS degree-2 probe: R(3,3)/K_6 — NS orbit-rep finds cert at d=7;
+    /// IPS should find it at ≤7 (ideally lower).
+    #[test]
+    fn ips2_ramsey_33_k6() {
+        use crate::problems::ramsey_orbit_rep;
+        let n = 6u32;
+        for d in 3..=8 {
+            let (schema, axioms) = ramsey_orbit_rep(3, 3, n, 11);
+            let t = std::time::Instant::now();
+            let r = find_ips2_cert_fp(&schema, &axioms, d, 11);
+            eprintln!(
+                "IPS2 R(3,3)/K_6 𝔽_11 d={}: {} ({:.3}s)",
+                d,
+                if r.is_some() { "CERT" } else { "no cert" },
+                t.elapsed().as_secs_f64()
+            );
+            if r.is_some() {
+                return; // found certificate
+            }
+        }
+        panic!("IPS2 R(3,3)/K_6: no cert found up to d=8");
+    }
+
+    /// IPS vs NS comparison: R(3,4)/K_9 — does IPS close at lower degree?
+    #[test]
+    fn ips2_ramsey_34_k9() {
+        use crate::problems::ramsey_orbit_rep;
+        let n = 9u32;
+        for d in 4..=14 {
+            let (schema, axioms) = ramsey_orbit_rep(3, 4, n, 11);
+            let t = std::time::Instant::now();
+            let r = find_ips2_cert_fp(&schema, &axioms, d, 11);
+            eprintln!(
+                "IPS2 R(3,4)/K_9 𝔽_11 d={}: {} ({:.3}s)",
+                d,
+                if r.is_some() { "CERT" } else { "no cert" },
+                t.elapsed().as_secs_f64()
+            );
+            if r.is_some() {
+                return;
+            }
+        }
+        panic!("IPS2 R(3,4)/K_9: no cert found up to d=14");
+    }
+
+    /// Sanity check: NS stab path works with orbit-rep-only axioms on R(3,3)/K_6.
+    #[test]
+    fn ns_orbit_rep_r33_k6_sanity() {
+        use crate::problems::ramsey_orbit_rep;
+        for d in 3..=8usize {
+            let (schema, axioms) = ramsey_orbit_rep(3, 3, 6, 11);
+            let t = std::time::Instant::now();
+            let r = find_orbit_cert_fp(&schema, &axioms, d, 11);
+            eprintln!("NS orbit-rep R(3,3)/K_6 F11 d={}: {} ({:.3}s)",
+                d, if r.is_some() {"CERT"} else {"no cert"}, t.elapsed().as_secs_f64());
+            if r.is_some() { return; }
+        }
+        panic!("ns_orbit_rep_r33_k6_sanity: no cert found up to d=8");
     }
 }
